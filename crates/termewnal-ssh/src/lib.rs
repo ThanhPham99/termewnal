@@ -1,6 +1,23 @@
-//! SSH, tunnel, and SFTP transport engine (stub crate for Ticket 01).
+//! SSH client, authentication, strict `known_hosts` verification, tunnel, and SFTP engine.
 
-use thiserror::Error;
+pub mod auth;
+pub mod client;
+pub mod error;
+pub mod known_hosts;
+pub mod session;
+
+pub use auth::{
+    AgentConnector, AuthOutcome, BoxFuture, BoxedAgentClient, HostKeyDecision, HostKeyPrompt,
+    InteractivePromptItem, KeyboardInteractiveChallenge, OsAgentConnector,
+    RejectAllInteractionHandler, SshInteractionHandler, authenticate_session,
+};
+pub use client::{SshClientHandler, SshConnectConfig, SshTransport};
+pub use error::SshError;
+pub use known_hosts::{
+    KnownHostStatus, default_known_hosts_path, fingerprint_sha256, record_known_host,
+    record_known_host_path, verify_known_host, verify_known_host_path,
+};
+pub use session::SshSession;
 
 /// Connection lifecycle state of an SSH `Transport`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -31,12 +48,4 @@ impl TransportStatus {
             Self::Reconnecting { .. } => "Reconnecting",
         }
     }
-}
-
-/// Errors returned by SSH `Transport`, `Tunnel`, and SFTP `Transfer` operations.
-#[derive(Debug, Error)]
-pub enum SshError {
-    /// Feature scheduled for a later implementation ticket.
-    #[error("SSH transport operation not implemented yet ({0})")]
-    NotImplemented(&'static str),
 }

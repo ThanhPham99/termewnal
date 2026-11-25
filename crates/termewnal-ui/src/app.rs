@@ -12,18 +12,20 @@ use iced::{
     window,
 };
 use termewnal_core::{
-    AppConfig, ConfigFileKind, ConfigPaths, ConfigWatchEvent, ConfigWatcher, ProfilesConfig,
-    TomlReloadError, VaultBackend, VaultSession, ensure_config_files,
+    AppConfig, ConfigFileKind, ConfigPaths, ConfigWatchEvent, ConfigWatcher, Profile,
+    ProfilesConfig, TomlReloadError, VaultBackend, VaultSession, ensure_config_files,
 };
 use termewnal_pty::{
-    PtyEvent, PtySession, PtySpawnConfig, ShellSpec, TerminalSnapshot, detect_default_shell,
+    PtyEvent, PtySession, PtySpawnConfig, ShellSpec, TerminalBuffer, TerminalSnapshot,
+    detect_default_shell,
 };
-use termewnal_ssh::TransportStatus;
+use termewnal_ssh::{SshSession, TransportStatus};
 use tracing::error;
 use zeroize::Zeroize;
 
 use crate::config_reload_ui::ConfigReloadUiState;
 use crate::split_view::{PaneFrame, ShortcutInterceptor, SplitView};
+use crate::ssh_ui::{SshTargetSpec, SshUiEvent, SshUiState, connect_ssh_task};
 use crate::terminal_widget::TerminalViewport;
 use crate::workspace::{
     ClosePaneOutcome, CycleDirection, FocusDirection, PaneId, SplitAxis, SplitId, SplitNode,
@@ -34,11 +36,24 @@ use crate::workspace::{
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(pub u64);
 
-/// Runtime state of an active local shell `Session`.
+enum SessionBacking {
+    Local {
+        pty: Arc<PtySession>,
+    },
+    Ssh {
+        spec: SshTargetSpec,
+        generation: u64,
+        active: Option<Arc<SshSession>>,
+        last_error: Option<String>,
+    },
+}
+
+/// Runtime state of an active local shell or SSH `Session`.
 pub struct LocalSession {
     id: SessionId,
     title: String,
-    pty: Arc<PtySession>,
+    backing: SessionBacking,
+    buffer: Arc<TerminalBuffer>,
     snapshot: Arc<TerminalSnapshot>,
     transport_status: TransportStatus,
     exited: Option<Option<i32>>,
@@ -55,9 +70,52 @@ impl LocalSession {
         &self.title
     }
 
-    /// Returns a shared handle to the backing [`PtySession`].
+    /// Returns `true` if this `Session` is an SSH session rather than a local shell.
+    pub fn is_ssh(&self) -> bool {
+        matches!(self.backing, SessionBacking::Ssh { .. })
+    }
+
+    /// Returns a shared handle to the backing [`PtySession`] for local shell sessions.
     pub fn pty(&self) -> &Arc<PtySession> {
-        &self.pty
+        self.try_pty()
+            .expect("pty() called on non-local SSH Session")
+    }
+
+    /// Returns `Some(&Arc<PtySession>)` for local shell sessions, or `None` for SSH sessions.
+    pub fn try_pty(&self) -> Option<&Arc<PtySession>> {
+        match &self.backing {
+            SessionBacking::Local { pty } => Some(pty),
+            SessionBacking::Ssh { .. } => None,
+        }
+    }
+
+    /// Returns the active [`SshSession`] handle if this SSH session is currently connected.
+    pub fn ssh_session(&self) -> Option<&Arc<SshSession>> {
+        match &self.backing {
+            SessionBacking::Ssh { active, .. } => active.as_ref(),
+            SessionBacking::Local { .. } => None,
+        }
+    }
+
+    /// Returns the current SSH connection attempt generation counter for SSH sessions.
+    pub fn ssh_generation(&self) -> Option<u64> {
+        match &self.backing {
+            SessionBacking::Ssh { generation, .. } => Some(*generation),
+            SessionBacking::Local { .. } => None,
+        }
+    }
+
+    /// Returns the [`SshTargetSpec`] for SSH sessions.
+    pub fn ssh_spec(&self) -> Option<&SshTargetSpec> {
+        match &self.backing {
+            SessionBacking::Ssh { spec, .. } => Some(spec),
+            SessionBacking::Local { .. } => None,
+        }
+    }
+
+    /// Returns the shared [`TerminalBuffer`] backing this `Session`.
+    pub fn buffer(&self) -> &Arc<TerminalBuffer> {
+        &self.buffer
     }
 
     /// Returns the most recent terminal grid snapshot.
@@ -133,6 +191,27 @@ pub enum Message {
     TogglePaneZoom,
     ToggleBroadcastInput,
     SetBroadcastInput(bool),
+    OpenSshProfile(Profile),
+    RestoreSshProfile(Profile),
+    QuickConnectSsh(SshTargetSpec),
+    ConnectSshSession(SessionId),
+    DisconnectSshSession(SessionId),
+    SshEvent {
+        session_id: SessionId,
+        event: SshUiEvent,
+    },
+    RespondHostKeyPrompt {
+        session_id: SessionId,
+        accept: bool,
+    },
+    SshAuthInputChanged {
+        session_id: SessionId,
+        index: usize,
+        value: String,
+    },
+    SubmitSshAuthPrompt(SessionId),
+    CancelSshAuthPrompt(SessionId),
+    DismissMitmAlert(SessionId),
 }
 
 /// Top-level Elm application state for Termewnal.
@@ -142,6 +221,7 @@ pub struct AppState {
     profiles: ProfilesConfig,
     vault: Arc<VaultSession>,
     reload_ui: ConfigReloadUiState,
+    ssh_ui: SshUiState,
     windows: BTreeSet<window::Id>,
     sessions: BTreeMap<SessionId, LocalSession>,
     workspace: Workspace,
@@ -202,6 +282,7 @@ impl AppState {
             profiles,
             vault,
             reload_ui: ConfigReloadUiState::default(),
+            ssh_ui: SshUiState::default(),
             windows: BTreeSet::new(),
             sessions: BTreeMap::new(),
             workspace: Workspace::new(),
@@ -235,14 +316,16 @@ impl AppState {
         let pty = Arc::new(
             PtySession::spawn(spawn_cfg).map_err(|err| format!("failed to spawn PTY: {err}"))?,
         );
-        let snapshot = Arc::new(pty.snapshot());
+        let buffer = Arc::clone(pty.buffer());
+        let snapshot = Arc::new(buffer.snapshot());
         let id = SessionId(self.next_session_id);
         self.next_session_id += 1;
 
         let session = LocalSession {
             id,
             title: shell.display_name,
-            pty,
+            backing: SessionBacking::Local { pty },
+            buffer,
             snapshot,
             transport_status: TransportStatus::Disconnected,
             exited: None,
@@ -252,9 +335,107 @@ impl AppState {
         Ok(id)
     }
 
+    /// Creates a new SSH `Session` tab from `spec`, connecting immediately when `auto_connect` is
+    /// `true` or waiting in `Disconnected` state until user action otherwise.
+    pub fn open_ssh_session(
+        &mut self,
+        spec: SshTargetSpec,
+        auto_connect: bool,
+    ) -> (SessionId, Task<Message>) {
+        let buffer = Arc::new(TerminalBuffer::new(
+            spec.connect_config.cols,
+            spec.connect_config.rows,
+            spec.connect_config.scrollback_lines,
+        ));
+        let snapshot = Arc::new(buffer.snapshot());
+        let id = SessionId(self.next_session_id);
+        self.next_session_id += 1;
+
+        let title = spec.title.clone();
+        let session = LocalSession {
+            id,
+            title: title.clone(),
+            backing: SessionBacking::Ssh {
+                spec,
+                generation: 0,
+                active: None,
+                last_error: None,
+            },
+            buffer,
+            snapshot,
+            transport_status: TransportStatus::Disconnected,
+            exited: None,
+        };
+        self.sessions.insert(id, session);
+        self.workspace.create_tab(id, Some(title));
+
+        if auto_connect {
+            let task = self.start_ssh_connect(id);
+            (id, task)
+        } else {
+            (id, Task::none())
+        }
+    }
+
+    fn start_ssh_connect(&mut self, session_id: SessionId) -> Task<Message> {
+        self.ssh_ui.clear_session_prompts(session_id);
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return Task::none();
+        };
+        let (cols, rows) = session.buffer.dimensions();
+        let buffer = Arc::clone(&session.buffer);
+        let SessionBacking::Ssh {
+            spec,
+            generation,
+            active,
+            last_error,
+        } = &mut session.backing
+        else {
+            return Task::none();
+        };
+
+        if let Some(prev) = active.take() {
+            prev.disconnect();
+        }
+        *generation = generation.wrapping_add(1);
+        *last_error = None;
+        spec.connect_config.cols = cols;
+        spec.connect_config.rows = rows;
+        session.transport_status = TransportStatus::Connecting;
+        session.exited = None;
+
+        connect_ssh_task(
+            session_id,
+            *generation,
+            spec.clone(),
+            buffer,
+            Arc::clone(&self.vault),
+        )
+    }
+
+    fn disconnect_ssh_session(&mut self, session_id: SessionId) {
+        self.ssh_ui.clear_session_prompts(session_id);
+        if let Some(session) = self.sessions.get_mut(&session_id)
+            && let SessionBacking::Ssh { active, .. } = &mut session.backing
+        {
+            if let Some(ssh) = active.take() {
+                ssh.disconnect();
+            }
+            session.transport_status = TransportStatus::Disconnected;
+        }
+    }
+
     fn remove_session(&mut self, session_id: SessionId) {
+        self.ssh_ui.clear_session_prompts(session_id);
         if let Some(session) = self.sessions.remove(&session_id) {
-            session.pty.terminate();
+            match session.backing {
+                SessionBacking::Local { pty } => pty.terminate(),
+                SessionBacking::Ssh { active, .. } => {
+                    if let Some(ssh) = active {
+                        ssh.disconnect();
+                    }
+                }
+            }
         }
     }
 
@@ -305,22 +486,52 @@ impl AppState {
             Message::TerminalInput { session_id, bytes } => {
                 let targets = self.workspace.input_targets_for_session(session_id);
                 let is_broadcast = targets.len() > 1;
+                let mut connect_ids = Vec::new();
                 for target_id in targets {
                     if let Some(session) = self.sessions.get(&target_id) {
                         if is_broadcast && session.exited.is_some() {
                             continue;
                         }
-                        if let Err(err) = session.pty.write_bytes(&bytes) {
-                            error!(
-                                session = target_id.0,
-                                error = %err,
-                                "failed to write PTY input"
-                            );
-                            self.last_error = Some(err.to_string());
+                        match &session.backing {
+                            SessionBacking::Local { pty } => {
+                                if let Err(err) = pty.write_bytes(&bytes) {
+                                    error!(
+                                        session = target_id.0,
+                                        error = %err,
+                                        "failed to write PTY input"
+                                    );
+                                    self.last_error = Some(err.to_string());
+                                }
+                            }
+                            SessionBacking::Ssh { active, .. } => {
+                                if let Some(ssh) = active {
+                                    if let Err(err) = ssh.write_bytes(&bytes) {
+                                        error!(
+                                            session = target_id.0,
+                                            error = %err,
+                                            "failed to write SSH input"
+                                        );
+                                        self.last_error = Some(err.to_string());
+                                    }
+                                } else if !is_broadcast
+                                    && session.transport_status == TransportStatus::Disconnected
+                                    && (bytes.contains(&b'\r') || bytes.contains(&b'\n'))
+                                {
+                                    connect_ids.push(target_id);
+                                }
+                            }
                         }
                     }
                 }
-                Task::none()
+                if connect_ids.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(
+                        connect_ids
+                            .into_iter()
+                            .map(|id| self.start_ssh_connect(id)),
+                    )
+                }
             }
             Message::ViewportResized {
                 session_id,
@@ -328,11 +539,26 @@ impl AppState {
                 rows,
             } => {
                 if let Some(session) = self.sessions.get_mut(&session_id) {
-                    if let Err(err) = session.pty.resize(cols, rows) {
-                        error!(session = session_id.0, error = %err, "failed to resize PTY");
-                        self.last_error = Some(err.to_string());
-                    } else {
-                        session.snapshot = Arc::new(session.pty.snapshot());
+                    match &session.backing {
+                        SessionBacking::Local { pty } => {
+                            if let Err(err) = pty.resize(cols, rows) {
+                                error!(session = session_id.0, error = %err, "failed to resize PTY");
+                                self.last_error = Some(err.to_string());
+                            } else {
+                                session.snapshot = Arc::new(session.buffer.snapshot());
+                            }
+                        }
+                        SessionBacking::Ssh { active, .. } => {
+                            if let Some(ssh) = active {
+                                if let Err(err) = ssh.resize(cols, rows) {
+                                    error!(session = session_id.0, error = %err, "failed to resize SSH");
+                                    self.last_error = Some(err.to_string());
+                                }
+                            } else {
+                                session.buffer.resize(cols, rows);
+                            }
+                            session.snapshot = Arc::new(session.buffer.snapshot());
+                        }
                     }
                 }
                 Task::none()
@@ -341,7 +567,7 @@ impl AppState {
                 if let Some(session) = self.sessions.get_mut(&session_id) {
                     match event {
                         PtyEvent::Output => {
-                            session.snapshot = Arc::new(session.pty.snapshot());
+                            session.snapshot = Arc::new(session.buffer.snapshot());
                         }
                         PtyEvent::Title(title) => {
                             if !title.is_empty() {
@@ -350,8 +576,12 @@ impl AppState {
                         }
                         PtyEvent::Bell => {}
                         PtyEvent::Exited(code) => {
-                            session.snapshot = Arc::new(session.pty.snapshot());
+                            session.snapshot = Arc::new(session.buffer.snapshot());
                             session.exited = Some(code);
+                            if let SessionBacking::Ssh { active, .. } = &mut session.backing {
+                                *active = None;
+                                session.transport_status = TransportStatus::Disconnected;
+                            }
                         }
                     }
                 }
@@ -537,16 +767,170 @@ impl AppState {
                 }
                 Task::none()
             }
+            Message::OpenSshProfile(profile) => {
+                match SshTargetSpec::from_profile(
+                    &profile,
+                    80,
+                    24,
+                    self.config.terminal.scrollback_lines,
+                ) {
+                    Ok(spec) => {
+                        let (_sid, task) = self.open_ssh_session(spec, true);
+                        task
+                    }
+                    Err(err) => {
+                        self.last_error = Some(err.to_string());
+                        Task::none()
+                    }
+                }
+            }
+            Message::RestoreSshProfile(profile) => {
+                match SshTargetSpec::from_profile(
+                    &profile,
+                    80,
+                    24,
+                    self.config.terminal.scrollback_lines,
+                ) {
+                    Ok(spec) => {
+                        let auto_connect = spec.auto_connect_on_startup;
+                        let (_sid, task) = self.open_ssh_session(spec, auto_connect);
+                        task
+                    }
+                    Err(err) => {
+                        self.last_error = Some(err.to_string());
+                        Task::none()
+                    }
+                }
+            }
+            Message::QuickConnectSsh(spec) => {
+                let (_sid, task) = self.open_ssh_session(spec, true);
+                task
+            }
+            Message::ConnectSshSession(session_id) => self.start_ssh_connect(session_id),
+            Message::DisconnectSshSession(session_id) => {
+                self.disconnect_ssh_session(session_id);
+                Task::none()
+            }
+            Message::SshEvent { session_id, event } => {
+                self.handle_ssh_event(session_id, event);
+                Task::none()
+            }
+            Message::RespondHostKeyPrompt { session_id, accept } => {
+                self.ssh_ui.respond_host_key(session_id, accept);
+                Task::none()
+            }
+            Message::SshAuthInputChanged {
+                session_id,
+                index,
+                value,
+            } => {
+                self.ssh_ui.set_auth_draft(session_id, index, value);
+                Task::none()
+            }
+            Message::SubmitSshAuthPrompt(session_id) => {
+                self.ssh_ui.submit_auth_prompt(session_id);
+                Task::none()
+            }
+            Message::CancelSshAuthPrompt(session_id) => {
+                self.ssh_ui.cancel_auth_prompt(session_id);
+                Task::none()
+            }
+            Message::DismissMitmAlert(session_id) => {
+                self.ssh_ui.dismiss_mitm_alert(session_id);
+                Task::none()
+            }
         }
     }
 
-    /// Renders the workspace tab strip, optional Broadcast Input / reload / Vault banners, and
-    /// active split panes.
+    fn handle_ssh_event(&mut self, session_id: SessionId, event: SshUiEvent) {
+        let Some(session) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        let buffer = Arc::clone(&session.buffer);
+        let SessionBacking::Ssh {
+            generation,
+            active,
+            last_error,
+            ..
+        } = &mut session.backing
+        else {
+            return;
+        };
+
+        let event_gen = match &event {
+            SshUiEvent::Connected { generation, .. }
+            | SshUiEvent::HostKeyPrompt { generation, .. }
+            | SshUiEvent::AuthPrompt { generation, .. }
+            | SshUiEvent::MitmBlocked { generation, .. }
+            | SshUiEvent::Disconnected { generation, .. } => *generation,
+        };
+        if event_gen != *generation {
+            return;
+        }
+
+        match event {
+            SshUiEvent::Connected { session: ssh, .. } => {
+                *active = Some(ssh);
+                *last_error = None;
+                session.transport_status = TransportStatus::Connected { latency_ms: None };
+                session.exited = None;
+                session.snapshot = Arc::new(buffer.snapshot());
+            }
+            SshUiEvent::HostKeyPrompt {
+                prompt, responder, ..
+            } => {
+                self.ssh_ui
+                    .push_host_key_prompt(session_id, prompt, responder);
+            }
+            SshUiEvent::AuthPrompt {
+                prompt, responder, ..
+            } => {
+                self.ssh_ui.push_auth_prompt(session_id, prompt, responder);
+            }
+            SshUiEvent::MitmBlocked { alert, .. } => {
+                *active = None;
+                session.transport_status = TransportStatus::Disconnected;
+                let msg = format!(
+                    "HOST KEY VERIFICATION FAILED for {}:{} (known_hosts line {}): expected {}, received {}",
+                    alert.host,
+                    alert.port,
+                    alert.line,
+                    alert.expected_fingerprint,
+                    alert.received_fingerprint
+                );
+                *last_error = Some(msg.clone());
+                self.last_error = Some(msg);
+                self.ssh_ui.record_mitm_alert(alert);
+            }
+            SshUiEvent::Disconnected { error, .. } => {
+                *active = None;
+                session.transport_status = TransportStatus::Disconnected;
+                self.ssh_ui.clear_session_prompts(session_id);
+                if let Some(err) = error {
+                    *last_error = Some(err.clone());
+                    self.last_error = Some(err);
+                }
+            }
+        }
+    }
+
+    /// Renders the workspace tab strip, optional Broadcast Input / reload / Vault / SSH banners,
+    /// and active split panes.
     pub fn view(&self, _window_id: window::Id) -> Element<'_, Message, Theme, iced::Renderer> {
         let mut root = column![self.render_tab_strip()].width(Length::Fill).height(Length::Fill);
 
         if let Some(banner_text) = self.broadcast_banner_text() {
             root = root.push(render_broadcast_banner(banner_text));
+        }
+
+        if let Some(mitm) = self.ssh_ui.view_mitm_alerts() {
+            root = root.push(mitm);
+        }
+        if let Some(tofu) = self.ssh_ui.view_tofu_modal() {
+            root = root.push(tofu);
+        }
+        if let Some(auth_prompt) = self.ssh_ui.view_auth_prompt() {
+            root = root.push(auth_prompt);
         }
 
         if let Some(toasts) = self.reload_ui.view_reload_toasts() {
@@ -763,12 +1147,33 @@ impl AppState {
         show_border: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
         let content = match self.sessions.get(&session_id) {
-            Some(session) => TerminalViewport::with_focus(
-                session.id,
-                Arc::clone(&session.snapshot),
-                self.config.terminal.font_size,
-                focused,
-            ),
+            Some(session) => {
+                let viewport = TerminalViewport::with_focus(
+                    session.id,
+                    Arc::clone(&session.snapshot),
+                    self.config.terminal.font_size,
+                    focused,
+                );
+                if let SessionBacking::Ssh {
+                    spec, last_error, ..
+                } = &session.backing
+                    && session.transport_status == TransportStatus::Disconnected
+                {
+                    let bar = SshUiState::view_disconnected_ssh_bar(
+                        session.id,
+                        &spec.connect_config.host,
+                        spec.connect_config.port,
+                        self.ssh_ui.mitm_alert(session.id).is_some(),
+                        last_error.as_deref(),
+                    );
+                    column![bar, viewport]
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    viewport
+                }
+            }
             None => container("Missing terminal session")
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -866,7 +1271,7 @@ impl AppState {
             Subscription::run_with(
                 PtySubKey {
                     session_id: session.id,
-                    pty: Arc::clone(&session.pty),
+                    buffer: Arc::clone(&session.buffer),
                 },
                 pty_event_stream,
             )
@@ -970,6 +1375,11 @@ impl AppState {
         ))
     }
 
+    /// Returns the SSH TOFU, MITM, and interactive auth prompt UI state.
+    pub fn ssh_ui(&self) -> &SshUiState {
+        &self.ssh_ui
+    }
+
     /// Returns an immutable reference to a runtime `Session` by `id`.
     pub fn session(&self, id: SessionId) -> Option<&LocalSession> {
         self.sessions.get(&id)
@@ -1029,7 +1439,7 @@ fn config_watch_stream(
 #[derive(Clone)]
 struct PtySubKey {
     session_id: SessionId,
-    pty: Arc<PtySession>,
+    buffer: Arc<TerminalBuffer>,
 }
 
 impl Hash for PtySubKey {
@@ -1042,9 +1452,9 @@ fn pty_event_stream(
     key: &PtySubKey,
 ) -> std::pin::Pin<Box<dyn Stream<Item = Message> + Send>> {
     let session_id = key.session_id;
-    let pty = Arc::clone(&key.pty);
+    let buffer = Arc::clone(&key.buffer);
     Box::pin(iced::stream::channel(64, async move |mut output| {
-        if let Some(mut rx) = pty.take_event_receiver() {
+        if let Some(mut rx) = buffer.take_event_receiver() {
             while let Some(event) = rx.recv().await {
                 if output
                     .send(Message::PtyEvent { session_id, event })

@@ -83,6 +83,28 @@ impl Profile {
             tunnels: Vec::new(),
         }
     }
+
+    /// Returns `true` if this `Profile` is configured to connect automatically on workspace restore.
+    pub fn auto_connect_on_startup(&self) -> bool {
+        match &self.target {
+            ProfileTarget::LocalShell { .. } => false,
+            ProfileTarget::Ssh {
+                auto_connect_on_startup,
+                ..
+            } => *auto_connect_on_startup,
+        }
+    }
+
+    /// Sets whether an SSH `Profile` connects automatically when restored on startup.
+    pub fn set_auto_connect_on_startup(&mut self, enabled: bool) {
+        if let ProfileTarget::Ssh {
+            auto_connect_on_startup,
+            ..
+        } = &mut self.target
+        {
+            *auto_connect_on_startup = enabled;
+        }
+    }
 }
 
 /// Connection target for a `Profile`.

@@ -1,20 +1,17 @@
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::term::cell::Flags as CellFlags;
-use alacritty_terminal::term::{Config as TermConfig, Term};
-use alacritty_terminal::vte::ansi::{
-    Color as TermColor, CursorShape, Processor, StdSyncHandler,
-};
+use alacritty_terminal::vte::ansi::{Color as TermColor, CursorShape};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
+use crate::buffer::TerminalBuffer;
 use crate::error::PtyError;
 use crate::shell::{ShellSpec, detect_default_shell};
 
@@ -151,34 +148,25 @@ impl TerminalSnapshot {
     }
 }
 
-#[derive(Clone)]
-struct TermEventProxy {
-    events_tx: mpsc::UnboundedSender<PtyEvent>,
-    writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
-}
+struct SharedPtyWriter(Arc<Mutex<Option<Box<dyn Write + Send>>>>);
 
-impl EventListener for TermEventProxy {
-    fn send_event(&self, event: TermEvent) {
-        match event {
-            TermEvent::Wakeup => {
-                let _ = self.events_tx.send(PtyEvent::Output);
-            }
-            TermEvent::Title(title) => {
-                let _ = self.events_tx.send(PtyEvent::Title(title));
-            }
-            TermEvent::Bell => {
-                let _ = self.events_tx.send(PtyEvent::Bell);
-            }
-            TermEvent::PtyWrite(response) => {
-                if let Ok(mut guard) = self.writer.lock()
-                    && let Some(writer) = guard.as_mut()
-                {
-                    let _ = writer.write_all(response.as_bytes());
-                    let _ = writer.flush();
-                }
-            }
-            _ => {}
+impl Write for SharedPtyWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Ok(mut guard) = self.0.lock()
+            && let Some(writer) = guard.as_mut()
+        {
+            return writer.write(buf);
         }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if let Ok(mut guard) = self.0.lock()
+            && let Some(writer) = guard.as_mut()
+        {
+            return writer.flush();
+        }
+        Ok(())
     }
 }
 
@@ -188,11 +176,7 @@ pub struct PtySession {
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
-    term: Arc<Mutex<Term<TermEventProxy>>>,
-    dimensions: Mutex<TermDimensions>,
-    update_signal: Arc<(Mutex<(u64, bool, Option<i32>)>, Condvar)>,
-    events_tx: mpsc::UnboundedSender<PtyEvent>,
-    events_rx: Mutex<Option<mpsc::UnboundedReceiver<PtyEvent>>>,
+    buffer: Arc<TerminalBuffer>,
 }
 
 impl PtySession {
@@ -240,37 +224,21 @@ impl PtySession {
 
         let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> =
             Arc::new(Mutex::new(Some(raw_writer)));
-        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        let buffer = Arc::new(TerminalBuffer::new(
+            dims.cols,
+            dims.rows,
+            config.scrollback_lines,
+        ));
+        buffer.set_write_sink(Some(Box::new(SharedPtyWriter(Arc::clone(&writer)))));
 
-        let proxy = TermEventProxy {
-            events_tx: events_tx.clone(),
-            writer: Arc::clone(&writer),
-        };
-        let term_config = TermConfig {
-            scrolling_history: config.scrollback_lines,
-            ..TermConfig::default()
-        };
-        let term = Arc::new(Mutex::new(Term::new(term_config, &dims, proxy)));
-        let update_signal = Arc::new((Mutex::new((0_u64, false, None)), Condvar::new()));
-
-        spawn_reader_thread(
-            reader,
-            child,
-            Arc::clone(&term),
-            Arc::clone(&update_signal),
-            events_tx.clone(),
-        );
+        spawn_reader_thread(reader, child, Arc::clone(&buffer));
 
         Ok(Self {
             shell: config.shell,
             master: Mutex::new(pair.master),
             writer,
             killer: Mutex::new(killer),
-            term,
-            dimensions: Mutex::new(dims),
-            update_signal,
-            events_tx,
-            events_rx: Mutex::new(Some(events_rx)),
+            buffer,
         })
     }
 
@@ -279,9 +247,14 @@ impl PtySession {
         &self.shell
     }
 
+    /// Returns the shared [`TerminalBuffer`] backing this session.
+    pub fn buffer(&self) -> &Arc<TerminalBuffer> {
+        &self.buffer
+    }
+
     /// Takes the async event receiver once for driving an external event loop or UI subscription.
     pub fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<PtyEvent>> {
-        self.events_rx.lock().ok()?.take()
+        self.buffer.take_event_receiver()
     }
 
     /// Writes raw keyboard or paste bytes to the PTY master.
@@ -295,18 +268,14 @@ impl PtySession {
 
     /// Returns the current `(cols, rows)` terminal dimensions.
     pub fn dimensions(&self) -> (u16, u16) {
-        let dims = *self.dimensions.lock().expect("dimensions mutex poisoned");
-        (dims.cols, dims.rows)
+        self.buffer.dimensions()
     }
 
     /// Resizes both the OS PTY device (`TIOCSWINSZ`) and the `alacritty_terminal` grid.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), PtyError> {
         let dims = TermDimensions::new(cols, rows);
-        {
-            let current = *self.dimensions.lock().expect("dimensions mutex poisoned");
-            if current == dims {
-                return Ok(());
-            }
+        if self.buffer.dimensions() == (dims.cols, dims.rows) {
+            return Ok(());
         }
 
         {
@@ -325,51 +294,21 @@ impl PtySession {
                 })?;
         }
 
-        {
-            let mut term = self.term.lock().expect("term mutex poisoned");
-            term.resize(dims);
-        }
-
-        *self.dimensions.lock().expect("dimensions mutex poisoned") = dims;
+        self.buffer.resize(dims.cols, dims.rows);
         Ok(())
     }
 
     /// Captures an immutable snapshot of the current visible grid and cursor.
     pub fn snapshot(&self) -> TerminalSnapshot {
-        let term = self.term.lock().expect("term mutex poisoned");
-        let dims = *self.dimensions.lock().expect("dimensions mutex poisoned");
-        snapshot_from_term(&term, dims)
+        self.buffer.snapshot()
     }
 
     /// Blocks up to `timeout` until `predicate(&snapshot)` evaluates to `true`.
-    pub fn wait_for_output<F>(&self, timeout: Duration, mut predicate: F) -> bool
+    pub fn wait_for_output<F>(&self, timeout: Duration, predicate: F) -> bool
     where
         F: FnMut(&TerminalSnapshot) -> bool,
     {
-        let deadline = Instant::now() + timeout;
-        let (lock, cvar) = &*self.update_signal;
-        let mut state = lock.lock().expect("signal mutex poisoned");
-
-        loop {
-            let snap = self.snapshot();
-            if predicate(&snap) {
-                return true;
-            }
-            if state.1 {
-                // Child exited; re-check one last time and exit wait immediately.
-                return predicate(&self.snapshot());
-            }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return false;
-            };
-            let (next_state, wait_res) = cvar
-                .wait_timeout(state, remaining)
-                .expect("signal condvar wait");
-            state = next_state;
-            if wait_res.timed_out() {
-                return predicate(&self.snapshot());
-            }
-        }
+        self.buffer.wait_for_output(timeout, predicate)
     }
 
     /// Sends a termination signal to the child process and closes the PTY writer.
@@ -380,7 +319,7 @@ impl PtySession {
         if let Ok(mut killer) = self.killer.lock() {
             let _ = killer.kill();
         }
-        let _ = self.events_tx.send(PtyEvent::Output);
+        self.buffer.notify_output();
     }
 }
 
@@ -393,14 +332,11 @@ impl Drop for PtySession {
 fn spawn_reader_thread(
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
-    term: Arc<Mutex<Term<TermEventProxy>>>,
-    update_signal: Arc<(Mutex<(u64, bool, Option<i32>)>, Condvar)>,
-    events_tx: mpsc::UnboundedSender<PtyEvent>,
+    buffer: Arc<TerminalBuffer>,
 ) {
     thread::Builder::new()
         .name("termewnal-pty-reader".to_string())
         .spawn(move || {
-            let mut processor: Processor<StdSyncHandler> = Processor::new();
             let mut buf = [0_u8; 8192];
 
             loop {
@@ -410,17 +346,7 @@ fn spawn_reader_thread(
                         break;
                     }
                     Ok(n) => {
-                        {
-                            let mut guard = term.lock().expect("term mutex poisoned");
-                            processor.advance(&mut *guard, &buf[..n]);
-                        }
-                        {
-                            let (lock, cvar) = &*update_signal;
-                            let mut state = lock.lock().expect("signal mutex poisoned");
-                            state.0 = state.0.wrapping_add(1);
-                            cvar.notify_all();
-                        }
-                        let _ = events_tx.send(PtyEvent::Output);
+                        buffer.feed_bytes(&buf[..n]);
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(err) => {
@@ -438,66 +364,7 @@ fn spawn_reader_thread(
                 }
             };
 
-            {
-                let (lock, cvar) = &*update_signal;
-                let mut state = lock.lock().expect("signal mutex poisoned");
-                state.1 = true;
-                state.2 = exit_code;
-                cvar.notify_all();
-            }
-            let _ = events_tx.send(PtyEvent::Exited(exit_code));
+            buffer.mark_exited(exit_code);
         })
         .expect("spawn PTY reader thread");
-}
-
-fn snapshot_from_term(term: &Term<TermEventProxy>, dims: TermDimensions) -> TerminalSnapshot {
-    let content = term.renderable_content();
-    let cols = dims.cols as usize;
-    let rows = dims.rows as usize;
-    let mut cells = vec![TerminalCell::default(); cols * rows];
-
-    for indexed in content.display_iter {
-        let row = indexed.point.line.0 + content.display_offset as i32;
-        let col = indexed.point.column.0;
-        if row >= 0 && (row as usize) < rows && col < cols {
-            let fg = resolve_override(indexed.cell.fg, content.colors);
-            let bg = resolve_override(indexed.cell.bg, content.colors);
-            cells[row as usize * cols + col] = TerminalCell {
-                c: indexed.cell.c,
-                fg,
-                bg,
-                flags: indexed.cell.flags,
-            };
-        }
-    }
-
-    let cursor_row = content.cursor.point.line.0 + content.display_offset as i32;
-    let cursor_col = content.cursor.point.column.0;
-    let cursor = if cursor_row >= 0 && (cursor_row as usize) < rows && cursor_col < cols {
-        Some(CursorSnapshot {
-            col: cursor_col,
-            row: cursor_row as usize,
-            shape: content.cursor.shape,
-        })
-    } else {
-        None
-    };
-
-    TerminalSnapshot {
-        cols: dims.cols,
-        rows: dims.rows,
-        cells,
-        cursor,
-    }
-}
-
-fn resolve_override(
-    color: TermColor,
-    overrides: &alacritty_terminal::term::color::Colors,
-) -> TermColor {
-    match color {
-        TermColor::Named(named) => overrides[named].map(TermColor::Spec).unwrap_or(color),
-        TermColor::Indexed(idx) => overrides[idx as usize].map(TermColor::Spec).unwrap_or(color),
-        TermColor::Spec(_) => color,
-    }
 }

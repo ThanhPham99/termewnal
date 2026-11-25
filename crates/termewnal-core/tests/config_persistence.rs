@@ -189,3 +189,42 @@ fn atomic_save_rotates_three_backups_and_evicts_oldest() {
         );
     }
 }
+
+#[test]
+fn ssh_profile_defaults_auto_connect_on_startup_to_false_and_preserves_true() {
+    let legacy_toml = r#"
+schema_version = 1
+
+[[profiles]]
+id = "ssh-1"
+name = "Bastion"
+
+[profiles.target]
+kind = "ssh"
+host = "bastion.example.com"
+username = "ops"
+"#;
+    let parsed: ProfilesConfig = toml::from_str(legacy_toml).expect("parse legacy SSH TOML");
+    assert_eq!(parsed.profiles.len(), 1);
+    assert!(!parsed.profiles[0].auto_connect_on_startup());
+
+    let mut profile = Profile::ssh(
+        "Auto Bastion",
+        "auto.example.com",
+        2222,
+        "deploy",
+        SshAuthMethod::Agent,
+    );
+    assert!(!profile.auto_connect_on_startup());
+    profile.set_auto_connect_on_startup(true);
+    assert!(profile.auto_connect_on_startup());
+
+    let roundtrip: ProfilesConfig =
+        toml::from_str(&toml::to_string_pretty(&ProfilesConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            profiles: vec![profile],
+        })
+        .unwrap())
+        .unwrap();
+    assert!(roundtrip.profiles[0].auto_connect_on_startup());
+}
