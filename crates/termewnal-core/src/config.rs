@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use directories::ProjectDirs;
+use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
@@ -29,6 +29,7 @@ pub struct ConfigPaths {
     data_local_dir: PathBuf,
     cache_dir: PathBuf,
     runtime_dir: Option<PathBuf>,
+    home_dir: Option<PathBuf>,
 }
 
 impl ConfigPaths {
@@ -36,11 +37,19 @@ impl ConfigPaths {
     pub fn detect_xdg() -> Result<Self, CoreError> {
         let proj = ProjectDirs::from("io", "termewnal", "Termewnal")
             .ok_or(CoreError::MissingXdgDirectories)?;
+        let home_dir = BaseDirs::new()
+            .map(|base| base.home_dir().to_path_buf())
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            });
         Ok(Self {
             config_dir: proj.config_dir().to_path_buf(),
             data_local_dir: proj.data_local_dir().to_path_buf(),
             cache_dir: proj.cache_dir().to_path_buf(),
             runtime_dir: proj.runtime_dir().map(Path::to_path_buf),
+            home_dir,
         })
     }
 
@@ -52,7 +61,26 @@ impl ConfigPaths {
             data_local_dir: root.join("data"),
             cache_dir: root.join("cache"),
             runtime_dir: Some(root.join("runtime")),
+            home_dir: Some(root.to_path_buf()),
         }
+    }
+
+    /// Optional user home directory used for read-only `~/.ssh/config` discovery.
+    pub fn home_dir(&self) -> Option<&Path> {
+        self.home_dir.as_deref()
+    }
+
+    /// Overrides the user home directory used for read-only `~/.ssh/config` discovery.
+    pub fn with_home_dir(mut self, home_dir: impl Into<PathBuf>) -> Self {
+        self.home_dir = Some(home_dir.into());
+        self
+    }
+
+    /// Path to the read-only OpenSSH config file (`<home>/.ssh/config`), if a home directory is known.
+    pub fn ssh_config_file(&self) -> Option<PathBuf> {
+        self.home_dir
+            .as_ref()
+            .map(|home| home.join(".ssh").join("config"))
     }
 
     /// Directory containing `config.toml`, `profiles.toml`, and their rotating backups.

@@ -4,8 +4,10 @@ pub mod config;
 pub mod error;
 pub mod hot_reload;
 pub mod layout;
+pub mod openssh_config;
 pub mod profile;
 mod storage;
+pub mod tabby_importer;
 pub mod theme;
 pub mod vault;
 
@@ -24,11 +26,20 @@ pub use layout::{
     LayoutSplitAxis, LayoutSplitNode, SessionDescriptor, TabLayout, WindowLayout, WorkspaceLayout,
     load_layout, save_layout,
 };
+pub use openssh_config::{
+    OpenSshConfigError, OpenSshHost, clone_openssh_host_to_profile, load_openssh_hosts_or_empty,
+    load_system_ssh_hosts, parse_openssh_config_file, save_cloned_openssh_profile,
+};
 pub use profile::{
     Profile, ProfileTarget, ProfilesConfig, SshAuthMethod, SshProfileConfig, TunnelDirection,
     TunnelRule, load_profiles, resolve_mux_attach_command, save_profiles,
 };
 pub use storage::{MAX_BACKUPS, backup_path};
+pub use tabby_importer::{
+    TabbyCredentialKind, TabbyCredentialRequirement, TabbyImportError, TabbyImportOutcome,
+    TabbyImportReport, TabbyVaultStatus, default_tabby_config_path, import_tabby_config_file,
+    import_tabby_config_file_into_profiles, import_tabby_into_profiles, parse_tabby_config_str,
+};
 pub use theme::{BuiltinTheme, RgbColor, ThemePalette};
 pub use vault::{
     ClockSample, DEFAULT_KEYRING_SERVICE, EncryptedVault, InMemorySecretStore, KeyringSecretStore,
