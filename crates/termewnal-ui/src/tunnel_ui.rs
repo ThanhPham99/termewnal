@@ -50,7 +50,7 @@ pub struct AdHocTunnelRule {
     pub session_id: Option<SessionId>,
 }
 
-/// State backing the modal form for defining a Local (`-L`) or Dynamic SOCKS5 (`-D`) `Tunnel`.
+/// State backing the modal form for defining a Local (`-L`), Remote (`-R`), or Dynamic SOCKS5 (`-D`) `Tunnel`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelCreateForm {
     pub open: bool,
@@ -105,13 +105,7 @@ impl TunnelCreateForm {
 
     /// Validates form inputs and constructs a [`TunnelRule`] (`allow_public_bind` starts `false`).
     pub fn build_rule(&self) -> Result<TunnelRule, String> {
-        let direction = match self.direction {
-            TunnelDirection::Local => TunnelDirection::Local,
-            TunnelDirection::Dynamic => TunnelDirection::Dynamic,
-            TunnelDirection::Remote => {
-                return Err("Remote (-R) tunnel creation is scheduled for a future update".to_string());
-            }
-        };
+        let direction = self.direction;
 
         let bind_host = {
             let trimmed = self.bind_host.trim();
@@ -130,10 +124,15 @@ impl TunnelCreateForm {
 
         let (target_host, target_port) = match direction {
             TunnelDirection::Dynamic => (None, None),
-            TunnelDirection::Local => {
+            TunnelDirection::Local | TunnelDirection::Remote => {
+                let dir_label = if direction == TunnelDirection::Local {
+                    "Local (-L)"
+                } else {
+                    "Remote (-R)"
+                };
                 let th = self.target_host.trim();
                 if th.is_empty() {
-                    return Err("Target host is required for Local (-L) tunnels".to_string());
+                    return Err(format!("Target host is required for {dir_label} tunnels"));
                 }
                 let tp: u16 = self
                     .target_port
@@ -146,7 +145,6 @@ impl TunnelCreateForm {
                     })?;
                 (Some(th.to_string()), Some(tp))
             }
-            TunnelDirection::Remote => unreachable!(),
         };
 
         let hold_grace_secs = {
@@ -168,8 +166,8 @@ impl TunnelCreateForm {
             if trimmed.is_empty() {
                 let prefix = match direction {
                     TunnelDirection::Local => "Local",
-                    TunnelDirection::Dynamic => "SOCKS5",
                     TunnelDirection::Remote => "Remote",
+                    TunnelDirection::Dynamic => "SOCKS5",
                 };
                 format!("{prefix} {bind_host}:{bind_port}")
             } else {
@@ -183,7 +181,10 @@ impl TunnelCreateForm {
                 let (th, tp) = target_host.zip(target_port).expect("validated local target");
                 TunnelRule::local(name, bind_port, th, tp)
             }
-            TunnelDirection::Remote => unreachable!(),
+            TunnelDirection::Remote => {
+                let (th, tp) = target_host.zip(target_port).expect("validated remote target");
+                TunnelRule::remote(name, bind_port, th, tp)
+            }
         };
         rule.bind_host = bind_host;
         rule.standalone = self.standalone;
@@ -347,6 +348,8 @@ impl TunnelUiState {
 
         let form = &self.create_form;
         let is_local = form.direction == TunnelDirection::Local;
+        let is_remote = form.direction == TunnelDirection::Remote;
+        let is_dynamic = form.direction == TunnelDirection::Dynamic;
 
         let dir_row = row![
             text("Direction:").size(12),
@@ -358,9 +361,17 @@ impl TunnelUiState {
                     button::secondary
                 })
                 .on_press(Message::TunnelFormDirectionChanged(TunnelDirection::Local)),
+            button(text("Remote (-R)").size(12))
+                .padding([4, 10])
+                .style(if is_remote {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+                .on_press(Message::TunnelFormDirectionChanged(TunnelDirection::Remote)),
             button(text("Dynamic SOCKS5 (-D)").size(12))
                 .padding([4, 10])
-                .style(if !is_local {
+                .style(if is_dynamic {
                     button::primary
                 } else {
                     button::secondary
@@ -424,6 +435,11 @@ impl TunnelUiState {
         .spacing(8)
         .align_y(Alignment::Center);
 
+        let bind_label = if is_remote {
+            "Remote Bind:"
+        } else {
+            "Bind Host:"
+        };
         let mut fields = column![
             text("New Port Forwarding Tunnel").size(16),
             dir_row,
@@ -440,7 +456,7 @@ impl TunnelUiState {
             .spacing(8)
             .align_y(Alignment::Center),
             row![
-                text("Bind Host:").size(12).width(Length::Fixed(95.0)),
+                text(bind_label).size(12).width(Length::Fixed(95.0)),
                 text_input("127.0.0.1", &form.bind_host)
                     .id(tunnel_bind_host_input_id())
                     .on_input(Message::TunnelFormBindHostChanged)
@@ -459,10 +475,15 @@ impl TunnelUiState {
         ]
         .spacing(8);
 
-        if is_local {
+        if is_local || is_remote {
+            let target_label = if is_remote {
+                "Local Target:"
+            } else {
+                "Target Host:"
+            };
             fields = fields.push(
                 row![
-                    text("Target Host:").size(12).width(Length::Fixed(95.0)),
+                    text(target_label).size(12).width(Length::Fixed(95.0)),
                     text_input("127.0.0.1", &form.target_host)
                         .id(tunnel_target_host_input_id())
                         .on_input(Message::TunnelFormTargetHostChanged)
@@ -658,6 +679,10 @@ pub fn build_active_tunnel_entries(
         let bind_addr = snap
             .bound_addr
             .map(|a| a.to_string())
+            .or_else(|| {
+                snap.remote_bound_port
+                    .map(|p| format!("{}:{p}", snap.bind_host))
+            })
             .unwrap_or_else(|| format!("{}:{}", snap.bind_host, snap.bind_port));
         let target_addr = format_target_addr(
             snap.direction,
@@ -765,6 +790,15 @@ fn map_tunnel_state(state: &TunnelState) -> TunnelRuntimeState {
         TunnelState::Active => TunnelRuntimeState::Active,
         TunnelState::Holding => TunnelRuntimeState::Holding,
         TunnelState::Reconnecting => TunnelRuntimeState::Reconnecting,
+        TunnelState::Retrying {
+            attempt,
+            next_retry_secs,
+            reason,
+        } => TunnelRuntimeState::Retrying {
+            attempt: *attempt,
+            next_retry_secs: *next_retry_secs,
+            reason: reason.clone(),
+        },
         TunnelState::Error(msg) => TunnelRuntimeState::Error(msg.clone()),
     }
 }

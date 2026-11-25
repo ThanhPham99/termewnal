@@ -1,7 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iced::window;
@@ -13,7 +13,7 @@ use termewnal_core::{
     VaultConfig, load_profiles, save_profiles,
     vault::{EncryptedVault, InMemorySecretStore, SecretStore, VaultSession},
 };
-use termewnal_ssh::{record_known_host_path};
+use termewnal_ssh::{RemoteForwardBackoffConfig, TunnelState, record_known_host_path};
 use termewnal_ui::command_palette::PaletteAction;
 use termewnal_ui::sidebar::{SidebarSection, TunnelRuntimeState};
 use termewnal_ui::status_bar::StatusBarAction;
@@ -24,8 +24,17 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UiRemoteEvent {
+    CancelTcpIpForward(u32),
+    TransportClosed,
+}
+
 struct UiTunnelSrvState {
     shell_opens: AtomicUsize,
+    stale_ports: Mutex<HashSet<u16>>,
+    active_remote_listeners: Mutex<HashMap<u16, oneshot::Sender<()>>>,
+    events: Mutex<Vec<UiRemoteEvent>>,
 }
 
 struct UiTunnelSrvHandler {
@@ -115,6 +124,90 @@ impl server::Handler for UiTunnelSrvHandler {
         });
         Ok(())
     }
+
+    async fn tcpip_forward(
+        &mut self,
+        address: &str,
+        port: &mut u32,
+        session: &mut server::Session,
+    ) -> Result<bool, Self::Error> {
+        let requested_port = *port;
+        let requested_u16 = u16::try_from(requested_port).unwrap_or(0);
+        if requested_u16 > 0 && self.state.stale_ports.lock().unwrap().contains(&requested_u16) {
+            return Ok(false);
+        }
+
+        let Ok(listener) = TcpListener::bind(("127.0.0.1", requested_u16)).await else {
+            return Ok(false);
+        };
+        let bound_port = listener.local_addr().unwrap().port();
+        if requested_port == 0 {
+            *port = u32::from(bound_port);
+        }
+
+        let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+        self.state
+            .active_remote_listeners
+            .lock()
+            .unwrap()
+            .insert(bound_port, shutdown_tx);
+
+        let handle = session.handle();
+        let addr = address.to_string();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut shutdown_rx => break,
+                    accepted = listener.accept() => {
+                        let Ok((mut tcp, peer)) = accepted else { break; };
+                        let h = handle.clone();
+                        let a = addr.clone();
+                        tokio::spawn(async move {
+                            let Ok(ch) = h
+                                .channel_open_forwarded_tcpip(
+                                    a,
+                                    u32::from(bound_port),
+                                    peer.ip().to_string(),
+                                    u32::from(peer.port()),
+                                )
+                                .await
+                            else {
+                                return;
+                            };
+                            let mut ssh_stream = ch.into_stream();
+                            let _ = tokio::io::copy_bidirectional(&mut tcp, &mut ssh_stream).await;
+                        });
+                    }
+                }
+            }
+        });
+
+        Ok(true)
+    }
+
+    async fn cancel_tcpip_forward(
+        &mut self,
+        _address: &str,
+        port: u32,
+        _session: &mut server::Session,
+    ) -> Result<bool, Self::Error> {
+        let port_u16 = u16::try_from(port).unwrap_or(0);
+        if let Some(tx) = self
+            .state
+            .active_remote_listeners
+            .lock()
+            .unwrap()
+            .remove(&port_u16)
+        {
+            let _ = tx.send(());
+        }
+        self.state
+            .events
+            .lock()
+            .unwrap()
+            .push(UiRemoteEvent::CancelTcpIpForward(port));
+        Ok(true)
+    }
 }
 
 struct TestSshServer {
@@ -146,6 +239,9 @@ async fn spawn_ssh_server() -> TestSshServer {
 
     let state = Arc::new(UiTunnelSrvState {
         shell_opens: AtomicUsize::new(0),
+        stale_ports: Mutex::new(HashSet::new()),
+        active_remote_listeners: Mutex::new(HashMap::new()),
+        events: Mutex::new(Vec::new()),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -163,10 +259,13 @@ async fn spawn_ssh_server() -> TestSshServer {
                     let st = Arc::clone(&srv_state);
                     tokio::spawn(async move {
                         let handler = UiTunnelSrvHandler {
-                            state: st,
+                            state: Arc::clone(&st),
                             channels: HashMap::new(),
                         };
-                        let _ = server::run_stream(cfg, stream, handler).await;
+                        if let Ok(running) = server::run_stream(cfg, stream, handler).await {
+                            let _ = running.await;
+                        }
+                        st.events.lock().unwrap().push(UiRemoteEvent::TransportClosed);
                     });
                 }
             }
@@ -591,5 +690,282 @@ async fn tunnel_form_validates_inputs_prompts_zero_bind_and_reconnect_tunnels_sk
     assert_eq!(
         state.sidebar().active_tunnels()[0].state,
         TunnelRuntimeState::Stopped
+    );
+}
+
+#[tokio::test]
+async fn creating_standalone_remote_tunnel_allows_remote_zero_bind_forwards_and_cancels_on_quit() {
+    let temp = TempDir::new().unwrap();
+    let paths = ConfigPaths::from_root(temp.path());
+    let (echo_addr, _echo_stop) = spawn_echo_server().await;
+    let ssh_srv = spawn_ssh_server().await;
+
+    let (_, vault, known_hosts) =
+        seed_ssh_profile_with_vault(&paths, ssh_srv.addr, &ssh_srv.host_pubkey, Vec::new());
+
+    let mut state = super::common::boot_test_app_with_vault(paths.clone(), vault).unwrap();
+    state.set_known_hosts_path(known_hosts);
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    // Create a Standalone Remote (-R) tunnel with remote bind 0.0.0.0:0 -> local echo target.
+    // Must NOT trigger the local 0.0.0.0 LAN exposure guard!
+    let _ = state.update(Message::OpenTunnelCreateModal);
+    let _ = state.update(Message::TunnelFormDirectionChanged(TunnelDirection::Remote));
+    let _ = state.update(Message::TunnelFormNameChanged("Webhook Reverse".to_string()));
+    let _ = state.update(Message::TunnelFormProfileSelected(Some(
+        "prof-tunnel-bastion".to_string(),
+    )));
+    let _ = state.update(Message::TunnelFormBindHostChanged("0.0.0.0".to_string()));
+    let _ = state.update(Message::TunnelFormBindPortChanged("0".to_string()));
+    let _ = state.update(Message::TunnelFormTargetHostChanged("127.0.0.1".to_string()));
+    let _ = state.update(Message::TunnelFormTargetPortChanged(
+        echo_addr.port().to_string(),
+    ));
+    let _ = state.update(Message::TunnelFormStandaloneToggled(true));
+    drop(state.view(win));
+    let _ = state.update(Message::SubmitTunnelCreate);
+
+    assert!(!state.tunnel_ui().create_form().open);
+    assert!(
+        state.tunnel_ui().pending_public_bind_warning().is_none(),
+        "remote (-R) 0.0.0.0 bind must not be blocked by local 0.0.0.0 bind guard"
+    );
+
+    let mut sub = state.tunnel_manager().subscribe();
+    let snap = tokio::time::timeout(Duration::from_secs(5), async {
+        sub.wait_for(|s| {
+            s.active_standalone_count == 1
+                && s.active_count == 1
+                && s.tunnels[0].remote_bound_port.is_some_and(|p| p > 0)
+        })
+        .await
+        .unwrap()
+        .clone()
+    })
+    .await
+    .expect("standalone remote tunnel reaches Active");
+
+    let tunnel_id = snap.tunnels[0].id.clone();
+    let remote_port = snap.tunnels[0].remote_bound_port.unwrap();
+    assert_eq!(ssh_srv.state.shell_opens.load(Ordering::SeqCst), 0);
+
+    let _ = state.update(Message::TunnelManagerUpdated(snap));
+    assert_eq!(state.sidebar().active_tunnels()[0].direction, TunnelDirection::Remote);
+    assert_eq!(state.sidebar().active_tunnels()[0].state, TunnelRuntimeState::Active);
+    assert_eq!(state.status_bar_snapshot().tunnels_text(), "Tunnels: 1 active");
+
+    // Verify real forwarded-tcpip traffic flows from remote server listener to local echo target.
+    {
+        let mut c = TcpStream::connect(("127.0.0.1", remote_port)).await.unwrap();
+        c.write_all(b"ui-remote-ok").await.unwrap();
+        let mut buf = [0u8; 12];
+        c.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ui-remote-ok");
+    }
+
+    // Manual ToggleTunnel stops cleanly (cancels tcpip_forward before transport close) and restarts cleanly.
+    let _ = state.update(Message::ToggleTunnel(tunnel_id.clone()));
+    let _ = state.update(Message::TunnelManagerUpdated(
+        state.tunnel_manager().snapshot(),
+    ));
+    assert_eq!(
+        state.sidebar().active_tunnels()[0].state,
+        TunnelRuntimeState::Stopped
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let evs = ssh_srv.state.events.lock().unwrap().clone();
+            if evs.contains(&UiRemoteEvent::TransportClosed) {
+                break evs;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("manual stop cancels remote forward and closes standalone transport");
+    assert_eq!(
+        ssh_srv.state.events.lock().unwrap().clone(),
+        vec![
+            UiRemoteEvent::CancelTcpIpForward(u32::from(remote_port)),
+            UiRemoteEvent::TransportClosed,
+        ]
+    );
+
+    ssh_srv.state.events.lock().unwrap().clear();
+    let _ = state.update(Message::ToggleTunnel(tunnel_id));
+    let restarted_snap = tokio::time::timeout(Duration::from_secs(5), async {
+        sub.wait_for(|s| {
+            s.active_standalone_count == 1
+                && s.active_count == 1
+                && s.tunnels[0].remote_bound_port.is_some_and(|p| p > 0)
+        })
+        .await
+        .unwrap()
+        .clone()
+    })
+    .await
+    .expect("re-toggled standalone remote tunnel reaches Active");
+    let restarted_port = restarted_snap.tunnels[0].remote_bound_port.unwrap();
+    let _ = state.update(Message::TunnelManagerUpdated(restarted_snap));
+
+    // CloseGuardStopAndQuit must send cancel_tcpip_forward BEFORE disconnecting transport.
+    let _ = state.update(Message::CloseRequested(win));
+    assert!(matches!(state.close_guard(), CloseGuardState::Confirming { active_standalone_tunnels: 1, .. }));
+    let _ = state.update(Message::CloseGuardStopAndQuit);
+    assert_eq!(state.tunnel_manager().snapshot().active_standalone_count, 0);
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let evs = ssh_srv.state.events.lock().unwrap().clone();
+            if evs.contains(&UiRemoteEvent::TransportClosed) {
+                break evs;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("server records transport close on quit");
+
+    let evs = ssh_srv.state.events.lock().unwrap().clone();
+    assert_eq!(
+        evs,
+        vec![
+            UiRemoteEvent::CancelTcpIpForward(u32::from(restarted_port)),
+            UiRemoteEvent::TransportClosed,
+        ]
+    );
+
+    let saved = load_profiles(&paths).unwrap();
+    assert_eq!(saved.profiles[0].tunnels[0].direction, TunnelDirection::Remote);
+}
+
+#[tokio::test]
+async fn session_remote_tunnel_surfaces_request_denied_retry_in_ui_and_cancels_on_pane_close() {
+    let temp = TempDir::new().unwrap();
+    let paths = ConfigPaths::from_root(temp.path());
+    let (echo_addr, _echo_stop) = spawn_echo_server().await;
+    let ssh_srv = spawn_ssh_server().await;
+
+    let reserve = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let remote_port = reserve.local_addr().unwrap().port();
+    drop(reserve);
+
+    // Hold port stale initially so initial session connect gets RequestDenied.
+    ssh_srv.state.stale_ports.lock().unwrap().insert(remote_port);
+
+    let mut rule = TunnelRule::remote("Session Hook", remote_port, "127.0.0.1", echo_addr.port());
+    rule.id = "tun-remote-sess".to_string();
+    rule.standalone = false;
+
+    let (profile, vault, known_hosts) =
+        seed_ssh_profile_with_vault(&paths, ssh_srv.addr, &ssh_srv.host_pubkey, vec![rule]);
+
+    let mut state = super::common::boot_test_app_with_vault(paths, Arc::clone(&vault)).unwrap();
+    state.set_known_hosts_path(known_hosts.clone());
+    state.tunnel_manager().set_remote_backoff(RemoteForwardBackoffConfig {
+        min: Duration::from_millis(70),
+        max: Duration::from_millis(200),
+    });
+
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+    let _ = state.update(Message::OpenSshProfile(profile.clone()));
+    let ssh_sid = state.active_session_id().unwrap();
+    let gen_id = state.ssh_session(ssh_sid).unwrap().ssh_generation();
+    let buffer = Arc::clone(state.ssh_session(ssh_sid).unwrap().buffer());
+
+    let spec = SshTargetSpec::from_profile(&profile, 80, 24, 1000)
+        .unwrap()
+        .with_known_hosts_path(known_hosts);
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    tokio::spawn(drive_ssh_connect(ssh_sid, gen_id, spec, buffer, vault, ev_tx));
+
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), ev_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let connected = matches!(ev, SshUiEvent::Connected { .. });
+        let _ = state.update(Message::SshEvent {
+            session_id: ssh_sid,
+            event: ev,
+        });
+        if connected {
+            break;
+        }
+    }
+
+    // Session-bound Remote (-R) tunnel auto-starts and enters Retrying on RequestDenied!
+    let mut sub = state.tunnel_manager().subscribe();
+    let retry_snap = tokio::time::timeout(Duration::from_secs(5), async {
+        sub.wait_for(|s| {
+            s.retrying_count == 1
+                && s.error_count == 0
+                && s.tunnels
+                    .iter()
+                    .any(|t| matches!(t.state, TunnelState::Retrying { attempt: 1, .. }))
+        })
+        .await
+        .unwrap()
+        .clone()
+    })
+    .await
+    .expect("session remote tunnel surfaces Retrying state");
+
+    let _ = state.update(Message::TunnelManagerUpdated(retry_snap));
+    assert!(matches!(
+        &state.sidebar().active_tunnels()[0].state,
+        TunnelRuntimeState::Retrying { attempt: 1, reason, .. } if reason.contains("RequestDenied")
+    ));
+    assert_eq!(
+        state.status_bar_snapshot().tunnels_text(),
+        "Tunnels: 0 active, 1 retrying"
+    );
+
+    // Open Sidebar and build view while Retrying to verify badges & Reconnect controls render cleanly.
+    let _ = state.update(Message::StatusBarAction(StatusBarAction::ToggleTunnelsView));
+    drop(state.view(win));
+
+    // Release stale port and click StatusBarAction::ReconnectTunnels -> recovers immediately without dropping SSH session!
+    ssh_srv.state.stale_ports.lock().unwrap().remove(&remote_port);
+    let _ = state.update(Message::StatusBarAction(StatusBarAction::ReconnectTunnels));
+
+    let active_snap = tokio::time::timeout(Duration::from_secs(5), async {
+        sub.wait_for(|s| s.active_count == 1 && s.retrying_count == 0)
+            .await
+            .unwrap()
+            .clone()
+    })
+    .await
+    .expect("remote tunnel recovers to Active");
+
+    let _ = state.update(Message::TunnelManagerUpdated(active_snap));
+    assert_eq!(state.status_bar_snapshot().tunnels_text(), "Tunnels: 1 active");
+
+    // Closing the SSH tab/pane cancels tcpip_forward BEFORE disconnecting the Session Transport!
+    let _ = state.update(Message::CloseFocusedPane);
+    assert!(state.tunnel_manager().snapshot().tunnels.is_empty());
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let evs = ssh_srv.state.events.lock().unwrap().clone();
+            if evs.contains(&UiRemoteEvent::TransportClosed) {
+                break evs;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    })
+    .await
+    .expect("server records session transport close");
+
+    let evs = ssh_srv.state.events.lock().unwrap().clone();
+    assert_eq!(
+        evs,
+        vec![
+            UiRemoteEvent::CancelTcpIpForward(u32::from(remote_port)),
+            UiRemoteEvent::TransportClosed,
+        ]
     );
 }

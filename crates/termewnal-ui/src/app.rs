@@ -725,6 +725,7 @@ pub enum Message {
     ReconnectTunnel(String),
     ReconnectAllTunnels,
     TunnelManagerUpdated(TunnelManagerSnapshot),
+    FinalizeExit,
 }
 
 struct WindowState {
@@ -1322,17 +1323,18 @@ impl AppState {
 
     fn disconnect_ssh_session(&mut self, session_id: SessionId) {
         self.ssh_ui.clear_session_prompts(session_id);
+        let (_, tunnel_cleanup) = self
+            .tunnel_manager
+            .stop_session_tunnels_with_barrier(session_id.0);
         if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) {
             self.sftp_manager.clear_primary_transport(&slot.sftp_key());
-            if let Some(sup) = slot.supervisor.take() {
-                sup.disconnect();
-                slot.active = None;
-            } else if let Some(ssh) = slot.active.take() {
-                ssh.disconnect();
-            }
+            let sup = slot.supervisor.take();
+            let active = slot.active.take();
+            spawn_ssh_disconnect_after(tunnel_cleanup, sup, active);
             slot.transport_status = TransportStatus::Disconnected;
             slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
         }
+        self.sync_tunnel_telemetry();
     }
 
     fn probe_and_reconnect_all(&mut self) -> Task<Message> {
@@ -1806,17 +1808,15 @@ impl AppState {
 
     fn remove_session(&mut self, session_id: SessionId) {
         self.ssh_ui.clear_session_prompts(session_id);
-        self.tunnel_manager.stop_session_tunnels(session_id.0);
+        let (_, tunnel_cleanup) = self
+            .tunnel_manager
+            .stop_session_tunnels_with_barrier(session_id.0);
         self.tunnel_ui.prune_session(session_id);
         match self.sessions.remove(&session_id) {
             Some(SessionEntry::Local(session)) => session.pty.terminate(),
             Some(SessionEntry::Ssh(slot)) => {
                 self.sftp_manager.clear_primary_transport(&slot.sftp_key());
-                if let Some(sup) = slot.supervisor {
-                    sup.disconnect();
-                } else if let Some(ssh) = slot.active {
-                    ssh.disconnect();
-                }
+                spawn_ssh_disconnect_after(tunnel_cleanup, slot.supervisor, slot.active);
             }
             Some(SessionEntry::Remote(_)) | None => {}
         }
@@ -2198,7 +2198,21 @@ impl AppState {
                         self.retired_final_window = removed_win.map(|w| (id, w));
                         self.lifecycle = DaemonLifecycle::Exiting;
                         self.ipc_handle.take();
-                        iced::exit()
+                        let tunnels_cleanup = self.tunnel_manager.stop_all_with_barrier();
+                        self.sync_tunnel_telemetry();
+                        let mut ssh_handles = Vec::new();
+                        for entry in self.sessions.values_mut() {
+                            if let SessionEntry::Ssh(slot) = entry {
+                                self.sftp_manager.clear_primary_transport(&slot.sftp_key());
+                                if slot.supervisor.is_some() || slot.active.is_some() {
+                                    ssh_handles.push((slot.supervisor.take(), slot.active.take()));
+                                }
+                            }
+                        }
+                        spawn_teardown_and_exit(async move {
+                            tunnels_cleanup.await;
+                            disconnect_ssh_handles(ssh_handles);
+                        })
                     }
                 } else {
                     if let Some(win_state) = removed_win {
@@ -2230,15 +2244,33 @@ impl AppState {
                 self.lifecycle = DaemonLifecycle::Exiting;
                 self.transfer_queue.cancel_all();
                 self.sync_transfer_telemetry();
-                self.tunnel_manager.stop_all();
+                let tunnels_cleanup = self.tunnel_manager.stop_all_with_barrier();
                 self.sync_tunnel_telemetry();
                 self.background_work_source.stop_all();
                 self.ipc_handle.take();
                 self.retired_final_window = None;
                 let session_ids: Vec<SessionId> = self.sessions.keys().copied().collect();
+                let mut ssh_handles = Vec::new();
                 for sid in session_ids {
-                    self.remove_session(sid);
+                    self.ssh_ui.clear_session_prompts(sid);
+                    self.tunnel_ui.prune_session(sid);
+                    match self.sessions.remove(&sid) {
+                        Some(SessionEntry::Local(session)) => session.pty.terminate(),
+                        Some(SessionEntry::Ssh(slot)) => {
+                            self.sftp_manager.clear_primary_transport(&slot.sftp_key());
+                            if slot.supervisor.is_some() || slot.active.is_some() {
+                                ssh_handles.push((slot.supervisor, slot.active));
+                            }
+                        }
+                        Some(SessionEntry::Remote(_)) | None => {}
+                    }
                 }
+                spawn_teardown_and_exit(async move {
+                    tunnels_cleanup.await;
+                    disconnect_ssh_handles(ssh_handles);
+                })
+            }
+            Message::FinalizeExit => {
                 let mut tasks: Vec<Task<Message>> =
                     self.windows.iter().copied().map(window::close).collect();
                 tasks.push(iced::exit());
@@ -3229,7 +3261,7 @@ impl AppState {
                 form.validation_error = None;
                 if dir == TunnelDirection::Dynamic && form.bind_port == "5432" {
                     form.bind_port = "1080".to_string();
-                } else if dir == TunnelDirection::Local && form.bind_port == "1080" {
+                } else if dir != TunnelDirection::Dynamic && form.bind_port == "1080" {
                     form.bind_port = "5432".to_string();
                 }
                 Task::none()
@@ -5122,6 +5154,10 @@ impl AppState {
     fn reconnect_tunnel(&mut self, tunnel_id: &str) {
         let snap = self.tunnel_manager.snapshot();
         if let Some(existing) = snap.tunnels.iter().find(|t| t.id == tunnel_id) {
+            if matches!(existing.state, termewnal_ssh::TunnelState::Retrying { .. }) {
+                let _ = self.tunnel_manager.reconnect_tunnel(tunnel_id);
+                return;
+            }
             if existing.standalone {
                 if existing.state.is_running() {
                     let _ = self.tunnel_manager.reconnect_tunnel(tunnel_id);
@@ -5140,6 +5176,9 @@ impl AppState {
         let mut sessions_to_reconnect = BTreeSet::new();
         for t in &snap.tunnels {
             match (&t.state, t.standalone, t.session_id) {
+                (termewnal_ssh::TunnelState::Retrying { .. }, _, _) => {
+                    let _ = self.tunnel_manager.reconnect_tunnel(&t.id);
+                }
                 (
                     termewnal_ssh::TunnelState::Starting
                     | termewnal_ssh::TunnelState::Active
@@ -5191,7 +5230,6 @@ impl AppState {
         let mut tasks = Vec::new();
         for rule in rules {
             if rule.standalone
-                || rule.direction == TunnelDirection::Remote
                 || rule.requires_public_bind_opt_in()
                 || self.tunnel_ui.is_manually_stopped(&rule.id)
             {
@@ -5336,6 +5374,56 @@ impl AppState {
             return Some(slot.spec.clone());
         }
         None
+    }
+}
+
+fn disconnect_ssh_handles(
+    ssh_handles: Vec<(Option<ConnectionSupervisor>, Option<Arc<SshSession>>)>,
+) {
+    for (sup, ssh) in ssh_handles {
+        if let Some(s) = sup {
+            s.disconnect();
+        } else if let Some(a) = ssh {
+            a.disconnect();
+        }
+    }
+}
+
+fn spawn_ssh_disconnect_after(
+    tunnel_cleanup: impl std::future::Future<Output = ()> + Send + 'static,
+    supervisor: Option<ConnectionSupervisor>,
+    active: Option<Arc<SshSession>>,
+) {
+    if supervisor.is_none() && active.is_none() {
+        return;
+    }
+    let fut = async move {
+        tunnel_cleanup.await;
+        disconnect_ssh_handles(vec![(supervisor, active)]);
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(fut);
+    }
+}
+
+fn spawn_teardown_and_exit(
+    teardown_fut: impl std::future::Future<Output = ()> + Send + 'static,
+) -> Task<Message> {
+    let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
+    let run = async move {
+        teardown_fut.await;
+        let _ = done_tx.send_replace(true);
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(run);
+        Task::perform(
+            async move {
+                let _ = done_rx.wait_for(|&done| done).await;
+            },
+            |()| Message::FinalizeExit,
+        )
+    } else {
+        Task::perform(run, |()| Message::FinalizeExit)
     }
 }
 

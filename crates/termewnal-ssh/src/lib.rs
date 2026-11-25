@@ -17,7 +17,10 @@ pub use auth::{
     InteractivePromptItem, KeyboardInteractiveChallenge, OsAgentConnector,
     RejectAllInteractionHandler, SshInteractionHandler, authenticate_session,
 };
-pub use client::{SshClientHandler, SshConnectConfig, SshTransport, TcpKeepaliveSettings};
+pub use client::{
+    ForwardedTcpIpRequest, RemoteForwardRegistration, SshClientHandler, SshConnectConfig,
+    SshTransport, TcpKeepaliveSettings,
+};
 pub use error::SshError;
 pub use known_hosts::{
     KnownHostStatus, default_known_hosts_path, fingerprint_sha256, record_known_host,
@@ -48,8 +51,8 @@ pub use transfer::{
     UploadPlanOptions, UploadTargetPlan, disambiguate_filename, part_path_for,
 };
 pub use tunnel::{
-    DEFAULT_TUNNEL_HOLD_GRACE, StandaloneTransportSpec, TunnelManager, TunnelManagerSnapshot,
-    TunnelSnapshot, TunnelState,
+    DEFAULT_TUNNEL_HOLD_GRACE, RemoteForwardBackoffConfig, StandaloneTransportSpec, TunnelManager,
+    TunnelManagerSnapshot, TunnelSnapshot, TunnelState,
 };
 
 /// Connection lifecycle state of an SSH `Transport`.

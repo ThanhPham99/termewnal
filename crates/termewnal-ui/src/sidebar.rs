@@ -98,6 +98,11 @@ pub enum TunnelRuntimeState {
     Active,
     Holding,
     Reconnecting,
+    Retrying {
+        attempt: u32,
+        next_retry_secs: u64,
+        reason: String,
+    },
     Error(String),
 }
 
@@ -110,7 +115,20 @@ impl TunnelRuntimeState {
             Self::Active => "Active",
             Self::Holding => "Holding",
             Self::Reconnecting => "Reconnecting",
+            Self::Retrying { .. } => "Retrying",
             Self::Error(_) => "Error",
+        }
+    }
+
+    /// Returns a concise status badge string including attempt & countdown when retrying.
+    pub fn status_badge(&self) -> String {
+        match self {
+            Self::Retrying {
+                attempt,
+                next_retry_secs,
+                ..
+            } => format!("Retrying #{attempt} ({next_retry_secs}s)"),
+            _ => self.label().to_string(),
         }
     }
 }
@@ -689,12 +707,14 @@ fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, i
                 | TunnelRuntimeState::Active
                 | TunnelRuntimeState::Holding
                 | TunnelRuntimeState::Reconnecting
+                | TunnelRuntimeState::Retrying { .. }
         );
         let state_color = match &tunnel.state {
             TunnelRuntimeState::Active => Color::from_rgb8(74, 222, 128),
-            TunnelRuntimeState::Holding | TunnelRuntimeState::Reconnecting | TunnelRuntimeState::Starting => {
-                Color::from_rgb8(251, 191, 36)
-            }
+            TunnelRuntimeState::Holding
+            | TunnelRuntimeState::Reconnecting
+            | TunnelRuntimeState::Retrying { .. }
+            | TunnelRuntimeState::Starting => Color::from_rgb8(251, 191, 36),
             TunnelRuntimeState::Error(_) => Color::from_rgb8(248, 113, 113),
             TunnelRuntimeState::Stopped => Color::from_rgb8(148, 163, 184),
         };
@@ -710,7 +730,7 @@ fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, i
         let mut action_row = row![
             text(format!("[{dir}] {}", tunnel.name)).size(12),
             space::horizontal(),
-            text(tunnel.state.label()).size(11).color(state_color),
+            text(tunnel.state.status_badge()).size(11).color(state_color),
             toggle_btn,
         ]
         .spacing(4)
@@ -721,6 +741,7 @@ fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, i
             TunnelRuntimeState::Active
                 | TunnelRuntimeState::Holding
                 | TunnelRuntimeState::Reconnecting
+                | TunnelRuntimeState::Retrying { .. }
                 | TunnelRuntimeState::Error(_)
         ) {
             action_row = action_row.push(
@@ -739,12 +760,22 @@ fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, i
         ]
         .spacing(2);
 
-        if let TunnelRuntimeState::Error(err) = &tunnel.state {
-            item = item.push(
-                text(err.as_str())
-                    .size(10)
-                    .color(Color::from_rgb8(248, 113, 113)),
-            );
+        match &tunnel.state {
+            TunnelRuntimeState::Retrying { reason, .. } => {
+                item = item.push(
+                    text(reason.as_str())
+                        .size(10)
+                        .color(Color::from_rgb8(251, 191, 36)),
+                );
+            }
+            TunnelRuntimeState::Error(err) => {
+                item = item.push(
+                    text(err.as_str())
+                        .size(10)
+                        .color(Color::from_rgb8(248, 113, 113)),
+                );
+            }
+            _ => {}
         }
 
         col = col.push(container(item).padding([4, 8]).width(Length::Fill));

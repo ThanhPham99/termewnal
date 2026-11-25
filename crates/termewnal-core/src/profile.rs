@@ -394,6 +394,27 @@ impl TunnelRule {
         }
     }
 
+    /// Creates a new Remote (`-R`) `TunnelRule` defaulting to `127.0.0.1` remote bind host.
+    pub fn remote(
+        name: impl Into<String>,
+        remote_bind_port: u16,
+        target_host: impl Into<String>,
+        target_port: u16,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            direction: TunnelDirection::Remote,
+            bind_host: default_bind_host(),
+            bind_port: remote_bind_port,
+            target_host: Some(target_host.into()),
+            target_port: Some(target_port),
+            standalone: false,
+            allow_public_bind: false,
+            hold_grace_secs: None,
+        }
+    }
+
     /// Creates a new Dynamic SOCKS5 (`-D`) `TunnelRule` defaulting to `127.0.0.1` loopback bind.
     pub fn dynamic_socks5(name: impl Into<String>, bind_port: u16) -> Self {
         Self {
@@ -428,9 +449,18 @@ impl TunnelRule {
         )
     }
 
-    /// Returns `true` when binding this rule would expose a non-loopback address without opt-in.
+    /// Returns `true` when binding a Local (`-L`) or Dynamic (`-D`) `Tunnel` listener would expose
+    /// a non-loopback local address without explicit opt-in.
+    ///
+    /// Remote (`-R`) `Tunnel`s bind on the remote SSH server and dial local `target_host:target_port`,
+    /// so they do not expose local listeners to the LAN.
     pub fn requires_public_bind_opt_in(&self) -> bool {
-        !self.allow_public_bind && is_public_bind_host(self.effective_bind_host())
+        match self.direction {
+            TunnelDirection::Local | TunnelDirection::Dynamic => {
+                !self.allow_public_bind && is_public_bind_host(self.effective_bind_host())
+            }
+            TunnelDirection::Remote => false,
+        }
     }
 }
 

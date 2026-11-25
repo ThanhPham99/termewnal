@@ -4,6 +4,8 @@ mod connection_supervisor;
 mod known_hosts;
 #[path = "suite/proxy_jump.rs"]
 mod proxy_jump;
+#[path = "suite/remote_tunnels.rs"]
+mod remote_tunnels;
 #[path = "suite/sftp_and_transfers.rs"]
 mod sftp_and_transfers;
 #[path = "suite/sftp_resilience_and_conflicts.rs"]

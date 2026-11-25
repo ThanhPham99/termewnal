@@ -1,11 +1,13 @@
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rand::RngExt;
-use russh::Channel;
+use russh::{Channel, ChannelOpenFailure};
 use russh::client::Msg as ClientMsg;
 use termewnal_core::{
     DEFAULT_TUNNEL_HOLD_GRACE_SECS, TunnelDirection, TunnelRule, vault::SecretStore,
@@ -18,11 +20,14 @@ use tracing::{debug, warn};
 
 use crate::TransportStatus;
 use crate::auth::{AgentConnector, SshInteractionHandler};
-use crate::client::{SshConnectConfig, SshTransport};
+use crate::client::{
+    ForwardedTcpIpRequest, RemoteForwardRegistration, SshConnectConfig, SshTransport,
+};
 use crate::error::SshError;
 use crate::supervisor::{
-    DefaultTransportConnector, SupervisorConfig, SystemTimeSource, TimeSource, TransportConnector,
-    TransportReadySnapshot, compute_reconnect_backoff,
+    DEFAULT_BACKOFF_MAX, DEFAULT_BACKOFF_MIN, DefaultTransportConnector, SupervisorConfig,
+    SystemTimeSource, TimeSource, TransportConnector, TransportReadySnapshot,
+    compute_reconnect_backoff,
 };
 
 /// Default grace timeout (`10s`) while holding local TCP client sockets during `Transport` recovery.
@@ -31,8 +36,25 @@ pub const DEFAULT_TUNNEL_HOLD_GRACE: Duration =
 
 const SOCKS5_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 const STANDALONE_LIVENESS_POLL: Duration = Duration::from_millis(50);
+const CANCEL_TCPIP_FORWARD_TIMEOUT: Duration = Duration::from_secs(3);
 
 static NEXT_TUNNEL_MANAGER_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Exponential backoff bounds for Remote (`-R`) `tcpip_forward` `RequestDenied` retries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoteForwardBackoffConfig {
+    pub min: Duration,
+    pub max: Duration,
+}
+
+impl Default for RemoteForwardBackoffConfig {
+    fn default() -> Self {
+        Self {
+            min: DEFAULT_BACKOFF_MIN,
+            max: DEFAULT_BACKOFF_MAX,
+        }
+    }
+}
 
 /// Runtime lifecycle state of a managed SSH `Tunnel`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +64,11 @@ pub enum TunnelState {
     Active,
     Holding,
     Reconnecting,
+    Retrying {
+        attempt: u32,
+        next_retry_secs: u64,
+        reason: String,
+    },
     Error(String),
 }
 
@@ -50,7 +77,11 @@ impl TunnelState {
     pub fn is_running(&self) -> bool {
         matches!(
             self,
-            Self::Starting | Self::Active | Self::Holding | Self::Reconnecting
+            Self::Starting
+                | Self::Active
+                | Self::Holding
+                | Self::Reconnecting
+                | Self::Retrying { .. }
         )
     }
 
@@ -62,6 +93,7 @@ impl TunnelState {
             Self::Active => "Active",
             Self::Holding => "Holding",
             Self::Reconnecting => "Reconnecting",
+            Self::Retrying { .. } => "Retrying",
             Self::Error(_) => "Error",
         }
     }
@@ -78,6 +110,7 @@ pub struct TunnelSnapshot {
     pub bind_host: String,
     pub bind_port: u16,
     pub bound_addr: Option<SocketAddr>,
+    pub remote_bound_port: Option<u16>,
     pub target_host: Option<String>,
     pub target_port: Option<u16>,
     pub standalone: bool,
@@ -96,6 +129,7 @@ pub struct TunnelManagerSnapshot {
     pub active_count: usize,
     pub holding_count: usize,
     pub reconnecting_count: usize,
+    pub retrying_count: usize,
     pub error_count: usize,
     pub active_standalone_count: usize,
 }
@@ -152,6 +186,12 @@ enum TunnelForwardMode {
         target_host: String,
         target_port: u16,
     },
+    Remote {
+        remote_bind_addr: String,
+        remote_bind_port: u16,
+        target_host: String,
+        target_port: u16,
+    },
     DynamicSocks5,
 }
 
@@ -181,33 +221,22 @@ fn validate_tunnel_rule(rule: &TunnelRule) -> Result<ValidatedRule, SshError> {
 
     let mode = match rule.direction {
         TunnelDirection::Local => {
-            let target_host = rule
-                .target_host
-                .as_deref()
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| SshError::TunnelConfig {
-                    tunnel_name: rule.name.clone(),
-                    reason: "local tunnel requires a non-empty target_host".to_string(),
-                })?
-                .to_string();
-            let target_port = rule.target_port.filter(|&p| p > 0).ok_or_else(|| {
-                SshError::TunnelConfig {
-                    tunnel_name: rule.name.clone(),
-                    reason: "local tunnel requires a non-zero target_port".to_string(),
-                }
-            })?;
+            let (target_host, target_port) = validate_target_host_port(rule, "local tunnel")?;
             TunnelForwardMode::Local {
                 target_host,
                 target_port,
             }
         }
-        TunnelDirection::Dynamic => TunnelForwardMode::DynamicSocks5,
         TunnelDirection::Remote => {
-            return Err(SshError::NotImplemented(
-                "remote port forwarding (-R) is scheduled for Ticket 12",
-            ));
+            let (target_host, target_port) = validate_target_host_port(rule, "remote tunnel")?;
+            TunnelForwardMode::Remote {
+                remote_bind_addr: bind_host_socket.clone(),
+                remote_bind_port: rule.bind_port,
+                target_host,
+                target_port,
+            }
         }
+        TunnelDirection::Dynamic => TunnelForwardMode::DynamicSocks5,
     };
 
     let hold_grace = rule.effective_hold_grace();
@@ -224,6 +253,33 @@ fn validate_tunnel_rule(rule: &TunnelRule) -> Result<ValidatedRule, SshError> {
     })
 }
 
+fn validate_target_host_port(rule: &TunnelRule, kind_label: &str) -> Result<(String, u16), SshError> {
+    let target_host = rule
+        .target_host
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| SshError::TunnelConfig {
+            tunnel_name: rule.name.clone(),
+            reason: format!("{kind_label} requires a non-empty target_host"),
+        })?
+        .to_string();
+    let target_port = rule.target_port.filter(|&p| p > 0).ok_or_else(|| {
+        SshError::TunnelConfig {
+            tunnel_name: rule.name.clone(),
+            reason: format!("{kind_label} requires a non-zero target_port"),
+        }
+    })?;
+    Ok((target_host, target_port))
+}
+
+#[derive(Debug, Clone)]
+struct RetryTelemetry {
+    attempt: u32,
+    next_retry_secs: u64,
+    reason: String,
+}
+
 enum StandaloneCmd {
     ReconnectNow,
     Stop,
@@ -232,20 +288,33 @@ enum StandaloneCmd {
 struct ManagedTunnel {
     snapshot: TunnelSnapshot,
     transport_status: TransportStatus,
+    remote_bound: bool,
+    retrying: Option<RetryTelemetry>,
     fatal_error: Option<String>,
     task_gen: u64,
     stop_tx: Option<watch::Sender<bool>>,
+    retry_now_tx: Option<mpsc::UnboundedSender<()>>,
     standalone_cmd_tx: Option<mpsc::UnboundedSender<StandaloneCmd>>,
+    tunnel_done_rx: Option<watch::Receiver<bool>>,
+    driver_done_rx: Option<watch::Receiver<bool>>,
 }
 
 struct TunnelManagerInner {
     instance_id: u64,
     next_gen: AtomicU64,
+    remote_backoff: Mutex<RemoteForwardBackoffConfig>,
     registry: Mutex<BTreeMap<String, ManagedTunnel>>,
     snapshot_tx: watch::Sender<TunnelManagerSnapshot>,
 }
 
 impl TunnelManagerInner {
+    fn remote_backoff(&self) -> RemoteForwardBackoffConfig {
+        *self
+            .remote_backoff
+            .lock()
+            .expect("remote backoff mutex poisoned")
+    }
+
     fn publish(&self, registry: &BTreeMap<String, ManagedTunnel>) {
         let mut snap = TunnelManagerSnapshot::default();
         for entry in registry.values() {
@@ -254,6 +323,7 @@ impl TunnelManagerInner {
                 TunnelState::Active => snap.active_count += 1,
                 TunnelState::Holding => snap.holding_count += 1,
                 TunnelState::Reconnecting => snap.reconnecting_count += 1,
+                TunnelState::Retrying { .. } => snap.retrying_count += 1,
                 TunnelState::Error(_) => snap.error_count += 1,
                 TunnelState::Stopped | TunnelState::Starting => {}
             }
@@ -279,8 +349,9 @@ impl TunnelManagerInner {
     }
 }
 
-/// Manages Local (`-L`) and Dynamic SOCKS5 (`-D`) `Tunnel` lifecycles (both `Session`-bound
-/// and `Standalone`), preserving local TCP listeners across transient `Transport` drops.
+/// Manages Local (`-L`), Remote (`-R`), and Dynamic SOCKS5 (`-D`) `Tunnel` lifecycles (both
+/// `Session`-bound and `Standalone`), preserving local TCP listeners across transient `Transport`
+/// drops and retrying Remote `RequestDenied` failures with exponential backoff.
 #[derive(Clone)]
 pub struct TunnelManager {
     inner: Arc<TunnelManagerInner>,
@@ -293,17 +364,32 @@ impl Default for TunnelManager {
 }
 
 impl TunnelManager {
-    /// Creates an empty [`TunnelManager`].
+    /// Creates an empty [`TunnelManager`] with default Remote (`-R`) `RequestDenied` backoff (`1s..=30s`).
     pub fn new() -> Self {
+        Self::with_remote_backoff(RemoteForwardBackoffConfig::default())
+    }
+
+    /// Creates an empty [`TunnelManager`] with explicit Remote (`-R`) `RequestDenied` backoff bounds.
+    pub fn with_remote_backoff(remote_backoff: RemoteForwardBackoffConfig) -> Self {
         let (snapshot_tx, _) = watch::channel(TunnelManagerSnapshot::default());
         Self {
             inner: Arc::new(TunnelManagerInner {
                 instance_id: NEXT_TUNNEL_MANAGER_ID.fetch_add(1, Ordering::Relaxed),
                 next_gen: AtomicU64::new(1),
+                remote_backoff: Mutex::new(remote_backoff),
                 registry: Mutex::new(BTreeMap::new()),
                 snapshot_tx,
             }),
         }
+    }
+
+    /// Updates Remote (`-R`) `RequestDenied` exponential backoff bounds (useful in tests and config reloads).
+    pub fn set_remote_backoff(&self, remote_backoff: RemoteForwardBackoffConfig) {
+        *self
+            .inner
+            .remote_backoff
+            .lock()
+            .expect("remote backoff mutex poisoned") = remote_backoff;
     }
 
     /// Returns a process-unique instance identifier for subscription stream keys.
@@ -321,11 +407,12 @@ impl TunnelManager {
         self.inner.snapshot_tx.borrow().clone()
     }
 
-    /// Starts a `Session`-bound `Local` (`-L`) or `Dynamic` (`-D`) `Tunnel` attached to
-    /// `ready_rx` (typically [`ConnectionSupervisor::subscribe_ready`]).
+    /// Starts a `Session`-bound `Local` (`-L`), `Remote` (`-R`), or `Dynamic` (`-D`) `Tunnel`
+    /// attached to `ready_rx` (typically [`ConnectionSupervisor::subscribe_ready`]).
     ///
-    /// Keeps the local `TcpListener` bound across transient `Transport` drops and holds incoming
-    /// client sockets up to `rule.effective_hold_grace()` (`10s` by default).
+    /// Keeps local `TcpListener`s bound across transient `Transport` drops (with `10s` default hold
+    /// grace) and handles Remote (`-R`) `tcpip_forward`, `forwarded-tcpip` proxying,
+    /// `RequestDenied` exponential backoff, and graceful `cancel_tcpip_forward` teardown.
     pub async fn start_session_tunnel(
         &self,
         session_id: u64,
@@ -334,24 +421,23 @@ impl TunnelManager {
         ready_rx: watch::Receiver<TransportReadySnapshot>,
     ) -> Result<SocketAddr, SshError> {
         let validated = validate_tunnel_rule(&rule)?;
-        let listener =
-            TcpListener::bind((validated.bind_host_socket.as_str(), rule.bind_port)).await?;
-        let bound_addr = listener.local_addr()?;
-
-        self.spawn_listener_tunnel(
+        let task_gen = self.inner.next_gen.fetch_add(1, Ordering::Relaxed);
+        self.spawn_validated_tunnel(
+            task_gen,
             Some(session_id),
             profile_id,
             rule,
             validated,
-            listener,
-            bound_addr,
             ready_rx,
             None,
+            None,
+            None,
         )
+        .await
     }
 
-    /// Starts a `Standalone` background `Local` (`-L`) or `Dynamic` (`-D`) `Tunnel` owning its
-    /// own headless `Transport` supervisor loop without allocating a remote PTY shell.
+    /// Starts a `Standalone` background `Local` (`-L`), `Remote` (`-R`), or `Dynamic` (`-D`)
+    /// `Tunnel` owning its own headless `Transport` supervisor loop without allocating a PTY shell.
     pub async fn start_standalone_tunnel(
         &self,
         profile_id: Option<String>,
@@ -360,9 +446,6 @@ impl TunnelManager {
     ) -> Result<SocketAddr, SshError> {
         rule.standalone = true;
         let validated = validate_tunnel_rule(&rule)?;
-        let listener =
-            TcpListener::bind((validated.bind_host_socket.as_str(), rule.bind_port)).await?;
-        let bound_addr = listener.local_addr()?;
 
         let (ready_tx, ready_rx) = watch::channel(TransportReadySnapshot {
             epoch: 0,
@@ -370,6 +453,9 @@ impl TunnelManager {
             transport: None,
         });
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let (tunnel_done_tx, tunnel_done_rx) = watch::channel(false);
+        let (driver_done_tx, driver_done_rx) = watch::channel(false);
 
         let task_gen = self.inner.next_gen.fetch_add(1, Ordering::Relaxed);
         let tunnel_id = rule.id.clone();
@@ -380,29 +466,34 @@ impl TunnelManager {
             spec,
             ready_tx,
             cmd_rx,
+            stop_tx: stop_tx.clone(),
+            tunnel_done_rx: tunnel_done_rx.clone(),
+            driver_done_tx,
             inner: Arc::clone(&self.inner),
             epoch: 0,
             has_connected_once: false,
             last_error: None,
         };
 
-        let addr = self.spawn_listener_tunnel_with_gen(
-            task_gen,
-            None,
-            profile_id,
-            rule,
-            validated,
-            listener,
-            bound_addr,
-            ready_rx,
-            Some(cmd_tx),
-        )?;
+        let addr = self
+            .spawn_validated_tunnel(
+                task_gen,
+                None,
+                profile_id,
+                rule,
+                validated,
+                ready_rx,
+                Some(cmd_tx),
+                Some((stop_tx, stop_rx, tunnel_done_tx, tunnel_done_rx)),
+                Some(driver_done_rx),
+            )
+            .await?;
 
         tokio::spawn(driver.run());
         Ok(addr)
     }
 
-    /// Requests an immediate reconnect on a `Standalone` `Tunnel`.
+    /// Requests an immediate reconnect (or immediate `tcpip_forward` retry when `Retrying`) on a `Tunnel`.
     pub fn reconnect_tunnel(&self, tunnel_id: &str) -> Result<(), SshError> {
         let guard = self.inner.registry.lock().expect("tunnel registry poisoned");
         let Some(entry) = guard.get(tunnel_id) else {
@@ -411,6 +502,12 @@ impl TunnelManager {
                 reason: "tunnel is not active".to_string(),
             });
         };
+        if matches!(entry.snapshot.state, TunnelState::Retrying { .. })
+            && let Some(retry_tx) = &entry.retry_now_tx
+        {
+            let _ = retry_tx.send(());
+            return Ok(());
+        }
         if let Some(tx) = &entry.standalone_cmd_tx {
             let _ = tx.send(StandaloneCmd::ReconnectNow);
             Ok(())
@@ -422,19 +519,56 @@ impl TunnelManager {
         }
     }
 
-    /// Stops a single running `Tunnel`, immediately closing its local listener and held clients.
+    /// Stops a single running `Tunnel` synchronously in registry state and initiates async teardown.
     pub fn stop_tunnel(&self, tunnel_id: &str) -> bool {
+        let (found, wait_rx) = self.stop_tunnel_internal(tunnel_id);
+        drop(wait_rx);
+        found
+    }
+
+    /// Stops a single running `Tunnel` and awaits graceful `cancel_tcpip_forward` and transport teardown.
+    pub async fn stop_tunnel_async(&self, tunnel_id: &str) -> bool {
+        let (found, wait_rx) = self.stop_tunnel_internal(tunnel_id);
+        await_done_receivers(wait_rx).await;
+        found
+    }
+
+    fn stop_tunnel_internal(&self, tunnel_id: &str) -> (bool, Vec<watch::Receiver<bool>>) {
         let mut guard = self.inner.registry.lock().expect("tunnel registry poisoned");
         let Some(entry) = guard.get_mut(tunnel_id) else {
-            return false;
+            return (false, Vec::new());
         };
-        stop_managed_entry(entry);
+        let receivers = stop_managed_entry(entry);
         self.inner.publish(&guard);
-        true
+        (true, receivers)
     }
 
     /// Stops and removes all `Session`-bound (non-`Standalone`) `Tunnel`s attached to `session_id`.
     pub fn stop_session_tunnels(&self, session_id: u64) -> usize {
+        let (count, receivers) = self.stop_session_tunnels_internal(session_id);
+        drop(receivers);
+        count
+    }
+
+    /// Stops and removes all `Session`-bound `Tunnel`s for `session_id` and returns a future that
+    /// resolves once all `cancel_tcpip_forward` calls have completed.
+    pub fn stop_session_tunnels_with_barrier(
+        &self,
+        session_id: u64,
+    ) -> (usize, Pin<Box<dyn Future<Output = ()> + Send>>) {
+        let (count, receivers) = self.stop_session_tunnels_internal(session_id);
+        (count, Box::pin(await_done_receivers(receivers)))
+    }
+
+    /// Stops and removes all `Session`-bound `Tunnel`s for `session_id` and awaits graceful
+    /// `cancel_tcpip_forward` teardown before returning.
+    pub async fn stop_session_tunnels_async(&self, session_id: u64) -> usize {
+        let (count, receivers) = self.stop_session_tunnels_internal(session_id);
+        await_done_receivers(receivers).await;
+        count
+    }
+
+    fn stop_session_tunnels_internal(&self, session_id: u64) -> (usize, Vec<watch::Receiver<bool>>) {
         let mut guard = self.inner.registry.lock().expect("tunnel registry poisoned");
         let matching_ids: Vec<String> = guard
             .iter()
@@ -444,24 +578,45 @@ impl TunnelManager {
             })
             .collect();
         let count = matching_ids.len();
+        let mut receivers = Vec::new();
         for id in matching_ids {
             if let Some(mut entry) = guard.remove(&id) {
-                stop_managed_entry(&mut entry);
+                receivers.extend(stop_managed_entry(&mut entry));
             }
         }
         if count > 0 {
             self.inner.publish(&guard);
         }
-        count
+        (count, receivers)
     }
 
-    /// Stops every active `Tunnel` (both `Session`-bound and `Standalone`).
+    /// Stops every active `Tunnel` (both `Session`-bound and `Standalone`) synchronously in registry state.
     pub fn stop_all(&self) {
+        let receivers = self.stop_all_internal();
+        drop(receivers);
+    }
+
+    /// Stops every active `Tunnel` and returns a future resolving after all `cancel_tcpip_forward`
+    /// and standalone `Transport` teardowns complete.
+    pub fn stop_all_with_barrier(&self) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let receivers = self.stop_all_internal();
+        Box::pin(await_done_receivers(receivers))
+    }
+
+    /// Stops every active `Tunnel` and awaits all `cancel_tcpip_forward` and transport teardowns.
+    pub async fn stop_all_async(&self) {
+        let receivers = self.stop_all_internal();
+        await_done_receivers(receivers).await;
+    }
+
+    fn stop_all_internal(&self) -> Vec<watch::Receiver<bool>> {
         let mut guard = self.inner.registry.lock().expect("tunnel registry poisoned");
+        let mut receivers = Vec::new();
         for entry in guard.values_mut() {
-            stop_managed_entry(entry);
+            receivers.extend(stop_managed_entry(entry));
         }
         self.inner.publish(&guard);
+        receivers
     }
 
     /// Records a failed `Tunnel` start attempt (e.g. `EADDRINUSE` or rejected bind) in snapshot telemetry.
@@ -485,6 +640,7 @@ impl TunnelManager {
             bind_host: rule.effective_bind_host().to_string(),
             bind_port: rule.bind_port,
             bound_addr: None,
+            remote_bound_port: None,
             target_host: rule.target_host.clone(),
             target_port: rule.target_port,
             standalone: rule.standalone,
@@ -498,148 +654,265 @@ impl TunnelManager {
 
         let mut guard = self.inner.registry.lock().expect("tunnel registry poisoned");
         if let Some(prev) = guard.get_mut(&rule.id) {
-            stop_managed_entry(prev);
+            let _ = stop_managed_entry(prev);
         }
         guard.insert(
             rule.id.clone(),
             ManagedTunnel {
                 snapshot,
                 transport_status: TransportStatus::Disconnected,
+                remote_bound: false,
+                retrying: None,
                 fatal_error: Some(error),
                 task_gen,
                 stop_tx: None,
+                retry_now_tx: None,
                 standalone_cmd_tx: None,
+                tunnel_done_rx: None,
+                driver_done_rx: None,
             },
         );
         self.inner.publish(&guard);
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_listener_tunnel(
-        &self,
-        session_id: Option<u64>,
-        profile_id: Option<String>,
-        rule: TunnelRule,
-        validated: ValidatedRule,
-        listener: TcpListener,
-        bound_addr: SocketAddr,
-        ready_rx: watch::Receiver<TransportReadySnapshot>,
-        standalone_cmd_tx: Option<mpsc::UnboundedSender<StandaloneCmd>>,
-    ) -> Result<SocketAddr, SshError> {
-        let task_gen = self.inner.next_gen.fetch_add(1, Ordering::Relaxed);
-        self.spawn_listener_tunnel_with_gen(
-            task_gen,
-            session_id,
-            profile_id,
-            rule,
-            validated,
-            listener,
-            bound_addr,
-            ready_rx,
-            standalone_cmd_tx,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn spawn_listener_tunnel_with_gen(
+    #[allow(clippy::too_many_arguments, clippy::type_complexity)]
+    async fn spawn_validated_tunnel(
         &self,
         task_gen: u64,
         session_id: Option<u64>,
         profile_id: Option<String>,
         rule: TunnelRule,
         validated: ValidatedRule,
-        listener: TcpListener,
-        bound_addr: SocketAddr,
         ready_rx: watch::Receiver<TransportReadySnapshot>,
         standalone_cmd_tx: Option<mpsc::UnboundedSender<StandaloneCmd>>,
+        stop_pair: Option<(
+            watch::Sender<bool>,
+            watch::Receiver<bool>,
+            watch::Sender<bool>,
+            watch::Receiver<bool>,
+        )>,
+        driver_done_rx: Option<watch::Receiver<bool>>,
     ) -> Result<SocketAddr, SshError> {
-        let (stop_tx, stop_rx) = watch::channel(false);
+        let (stop_tx, stop_rx, tunnel_done_tx, tunnel_done_rx) = stop_pair.unwrap_or_else(|| {
+            let (stx, srx) = watch::channel(false);
+            let (dtx, drx) = watch::channel(false);
+            (stx, srx, dtx, drx)
+        });
         let initial_status = ready_rx.borrow().status.clone();
-        let initial_state = compute_tunnel_state(&initial_status, 0, None);
+        let initial_state = compute_tunnel_state(
+            rule.direction,
+            &initial_status,
+            0,
+            false,
+            None,
+            None,
+        );
         let tunnel_id = rule.id.clone();
 
-        let snapshot = TunnelSnapshot {
-            id: tunnel_id.clone(),
-            name: rule.name.clone(),
-            profile_id,
-            session_id,
-            direction: rule.direction,
-            bind_host: validated.bind_host_raw,
-            bind_port: rule.bind_port,
-            bound_addr: Some(bound_addr),
-            target_host: rule.target_host.clone(),
-            target_port: rule.target_port,
-            standalone: rule.standalone,
-            allow_public_bind: rule.allow_public_bind,
-            hold_grace_secs: validated.hold_grace_secs,
-            state: initial_state,
-            held_clients: 0,
-            active_connections: 0,
-            last_error: None,
-        };
+        match validated.mode {
+            TunnelForwardMode::Local { .. } | TunnelForwardMode::DynamicSocks5 => {
+                let listener =
+                    TcpListener::bind((validated.bind_host_socket.as_str(), rule.bind_port))
+                        .await?;
+                let bound_addr = listener.local_addr()?;
 
-        {
-            let mut guard = self.inner.registry.lock().expect("tunnel registry poisoned");
-            if let Some(prev) = guard.get_mut(&tunnel_id) {
-                stop_managed_entry(prev);
-            }
-            guard.insert(
-                tunnel_id.clone(),
-                ManagedTunnel {
-                    snapshot,
-                    transport_status: initial_status,
-                    fatal_error: None,
+                let snapshot = TunnelSnapshot {
+                    id: tunnel_id.clone(),
+                    name: rule.name.clone(),
+                    profile_id,
+                    session_id,
+                    direction: rule.direction,
+                    bind_host: validated.bind_host_raw,
+                    bind_port: rule.bind_port,
+                    bound_addr: Some(bound_addr),
+                    remote_bound_port: None,
+                    target_host: rule.target_host.clone(),
+                    target_port: rule.target_port,
+                    standalone: rule.standalone,
+                    allow_public_bind: rule.allow_public_bind,
+                    hold_grace_secs: validated.hold_grace_secs,
+                    state: initial_state,
+                    held_clients: 0,
+                    active_connections: 0,
+                    last_error: None,
+                };
+
+                self.insert_managed_tunnel(
+                    tunnel_id.clone(),
+                    ManagedTunnel {
+                        snapshot,
+                        transport_status: initial_status,
+                        remote_bound: false,
+                        retrying: None,
+                        fatal_error: None,
+                        task_gen,
+                        stop_tx: Some(stop_tx),
+                        retry_now_tx: None,
+                        standalone_cmd_tx,
+                        tunnel_done_rx: Some(tunnel_done_rx),
+                        driver_done_rx,
+                    },
+                );
+
+                tokio::spawn(run_listener_tunnel(
+                    Arc::clone(&self.inner),
+                    tunnel_id,
                     task_gen,
-                    stop_tx: Some(stop_tx),
-                    standalone_cmd_tx,
-                },
-            );
-            self.inner.publish(&guard);
+                    validated.mode,
+                    validated.hold_grace,
+                    listener,
+                    ready_rx,
+                    stop_rx,
+                    tunnel_done_tx,
+                ));
+
+                Ok(bound_addr)
+            }
+            TunnelForwardMode::Remote {
+                remote_bind_addr,
+                remote_bind_port,
+                target_host,
+                target_port,
+            } => {
+                let placeholder_addr = parse_remote_socket_addr(&remote_bind_addr, remote_bind_port)
+                    .unwrap_or_else(|| {
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), remote_bind_port)
+                    });
+                let (retry_now_tx, retry_now_rx) = mpsc::unbounded_channel();
+
+                let snapshot = TunnelSnapshot {
+                    id: tunnel_id.clone(),
+                    name: rule.name.clone(),
+                    profile_id,
+                    session_id,
+                    direction: rule.direction,
+                    bind_host: validated.bind_host_raw,
+                    bind_port: rule.bind_port,
+                    bound_addr: None,
+                    remote_bound_port: None,
+                    target_host: Some(target_host.clone()),
+                    target_port: Some(target_port),
+                    standalone: rule.standalone,
+                    allow_public_bind: rule.allow_public_bind,
+                    hold_grace_secs: validated.hold_grace_secs,
+                    state: initial_state,
+                    held_clients: 0,
+                    active_connections: 0,
+                    last_error: None,
+                };
+
+                self.insert_managed_tunnel(
+                    tunnel_id.clone(),
+                    ManagedTunnel {
+                        snapshot,
+                        transport_status: initial_status,
+                        remote_bound: false,
+                        retrying: None,
+                        fatal_error: None,
+                        task_gen,
+                        stop_tx: Some(stop_tx),
+                        retry_now_tx: Some(retry_now_tx),
+                        standalone_cmd_tx,
+                        tunnel_done_rx: Some(tunnel_done_rx),
+                        driver_done_rx,
+                    },
+                );
+
+                tokio::spawn(run_remote_tunnel(
+                    Arc::clone(&self.inner),
+                    tunnel_id,
+                    task_gen,
+                    remote_bind_addr,
+                    remote_bind_port,
+                    target_host,
+                    target_port,
+                    ready_rx,
+                    stop_rx,
+                    retry_now_rx,
+                    tunnel_done_tx,
+                ));
+
+                Ok(placeholder_addr)
+            }
         }
+    }
 
-        tokio::spawn(run_listener_tunnel(
-            Arc::clone(&self.inner),
-            tunnel_id,
-            task_gen,
-            validated.mode,
-            validated.hold_grace,
-            listener,
-            ready_rx,
-            stop_rx,
-        ));
-
-        Ok(bound_addr)
+    fn insert_managed_tunnel(&self, tunnel_id: String, entry: ManagedTunnel) {
+        let mut guard = self.inner.registry.lock().expect("tunnel registry poisoned");
+        if let Some(prev) = guard.get_mut(&tunnel_id) {
+            let _ = stop_managed_entry(prev);
+        }
+        guard.insert(tunnel_id, entry);
+        self.inner.publish(&guard);
     }
 }
 
-fn stop_managed_entry(entry: &mut ManagedTunnel) {
+async fn await_done_receivers(receivers: Vec<watch::Receiver<bool>>) {
+    for mut rx in receivers {
+        let _ = tokio::time::timeout(
+            CANCEL_TCPIP_FORWARD_TIMEOUT + Duration::from_secs(1),
+            rx.wait_for(|&done| done),
+        )
+        .await;
+    }
+}
+
+fn stop_managed_entry(entry: &mut ManagedTunnel) -> Vec<watch::Receiver<bool>> {
     if let Some(stop_tx) = entry.stop_tx.take() {
         let _ = stop_tx.send(true);
     }
     if let Some(cmd_tx) = entry.standalone_cmd_tx.take() {
         let _ = cmd_tx.send(StandaloneCmd::Stop);
     }
+    entry.retry_now_tx.take();
+    entry.remote_bound = false;
+    entry.retrying = None;
     entry.snapshot.bound_addr = None;
+    entry.snapshot.remote_bound_port = None;
     entry.snapshot.held_clients = 0;
     entry.snapshot.active_connections = 0;
     if entry.fatal_error.is_none() {
         entry.snapshot.state = TunnelState::Stopped;
     }
+    let mut waiters = Vec::new();
+    if let Some(rx) = entry.tunnel_done_rx.take() {
+        waiters.push(rx);
+    }
+    if let Some(rx) = entry.driver_done_rx.take() {
+        waiters.push(rx);
+    }
+    waiters
 }
 
 fn compute_tunnel_state(
+    direction: TunnelDirection,
     transport_status: &TransportStatus,
     held_clients: usize,
+    remote_bound: bool,
+    retrying: Option<&RetryTelemetry>,
     fatal_error: Option<&str>,
 ) -> TunnelState {
     if let Some(err) = fatal_error {
         return TunnelState::Error(err.to_string());
     }
+    if let Some(retry) = retrying {
+        return TunnelState::Retrying {
+            attempt: retry.attempt,
+            next_retry_secs: retry.next_retry_secs,
+            reason: retry.reason.clone(),
+        };
+    }
     if held_clients > 0 {
         return TunnelState::Holding;
     }
     match transport_status {
-        TransportStatus::Connected { .. } => TunnelState::Active,
+        TransportStatus::Connected { .. } => {
+            if direction == TunnelDirection::Remote && !remote_bound {
+                TunnelState::Starting
+            } else {
+                TunnelState::Active
+            }
+        }
         TransportStatus::Degraded { .. } | TransportStatus::Reconnecting { .. } => {
             TunnelState::Reconnecting
         }
@@ -649,11 +922,30 @@ fn compute_tunnel_state(
 }
 
 fn refresh_entry_state(entry: &mut ManagedTunnel) {
+    if !matches!(entry.transport_status, TransportStatus::Connected { .. }) {
+        entry.remote_bound = false;
+        entry.retrying = None;
+        if entry.snapshot.direction == TunnelDirection::Remote {
+            entry.snapshot.bound_addr = None;
+            entry.snapshot.remote_bound_port = None;
+        }
+    }
     entry.snapshot.state = compute_tunnel_state(
+        entry.snapshot.direction,
         &entry.transport_status,
         entry.snapshot.held_clients,
+        entry.remote_bound,
+        entry.retrying.as_ref(),
         entry.fatal_error.as_deref(),
     );
+}
+
+struct DoneSignal(watch::Sender<bool>);
+
+impl Drop for DoneSignal {
+    fn drop(&mut self) {
+        let _ = self.0.send_replace(true);
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -666,7 +958,9 @@ async fn run_listener_tunnel(
     listener: TcpListener,
     mut ready_rx: watch::Receiver<TransportReadySnapshot>,
     mut stop_rx: watch::Receiver<bool>,
+    tunnel_done_tx: watch::Sender<bool>,
 ) {
+    let _done = DoneSignal(tunnel_done_tx);
     loop {
         if *stop_rx.borrow_and_update() {
             break;
@@ -739,10 +1033,549 @@ async fn run_listener_tunnel(
         entry.snapshot.bound_addr = None;
         entry.snapshot.held_clients = 0;
         entry.snapshot.active_connections = 0;
+        entry.snapshot.state = if entry.fatal_error.is_none() {
+            TunnelState::Stopped
+        } else {
+            entry.snapshot.state.clone()
+        };
+    });
+}
+
+fn parse_remote_socket_addr(bind_addr: &str, port: u16) -> Option<SocketAddr> {
+    let trimmed = bind_addr
+        .trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(bind_addr.trim());
+    let ip = match trimmed {
+        "" | "*" => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        s if s.eq_ignore_ascii_case("localhost") => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        s => s.parse::<IpAddr>().ok()?,
+    };
+    Some(SocketAddr::new(ip, port))
+}
+
+fn ceil_secs(duration: Duration) -> u64 {
+    if duration.is_zero() {
+        0
+    } else {
+        duration.as_millis().div_ceil(1000) as u64
+    }
+}
+
+struct ActiveRemoteForward {
+    transport: Arc<SshTransport>,
+    bind_address: String,
+    bound_port: u32,
+    registration: Option<RemoteForwardRegistration>,
+    inbound_rx: mpsc::UnboundedReceiver<ForwardedTcpIpRequest>,
+}
+
+enum RemoteBindOutcome {
+    Bound(ActiveRemoteForward),
+    RequestDenied,
+    TransportError(String),
+    StopRequested,
+}
+
+enum ActivePumpExit {
+    Continue(ActiveRemoteForward),
+    Rebind,
+    Stop(ActiveRemoteForward),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pump_active_remote_forward(
+    inner: &Arc<TunnelManagerInner>,
+    tunnel_id: &str,
+    task_gen: u64,
+    target_host: &str,
+    target_port: u16,
+    mut act: ActiveRemoteForward,
+    ready_rx: &mut watch::Receiver<TransportReadySnapshot>,
+    stop_rx: &mut watch::Receiver<bool>,
+    retry_now_rx: &mut mpsc::UnboundedReceiver<()>,
+) -> ActivePumpExit {
+    tokio::select! {
+        _ = stop_rx.changed() => {
+            if *stop_rx.borrow_and_update() {
+                return ActivePumpExit::Stop(act);
+            }
+        }
+        changed = ready_rx.changed() => {
+            if changed.is_err() {
+                return ActivePumpExit::Stop(act);
+            }
+        }
+        _ = retry_now_rx.recv() => {}
+        maybe_req = act.inbound_rx.recv() => {
+            match maybe_req {
+                Some(req) => {
+                    let proxy_inner = Arc::clone(inner);
+                    let proxy_id = tunnel_id.to_string();
+                    let proxy_host = target_host.to_string();
+                    let proxy_stop = stop_rx.clone();
+                    tokio::spawn(async move {
+                        handle_remote_forwarded_stream(
+                            proxy_inner,
+                            proxy_id,
+                            task_gen,
+                            proxy_host,
+                            target_port,
+                            req,
+                            proxy_stop,
+                        )
+                        .await;
+                    });
+                }
+                None => {
+                    drop(act.registration.take());
+                    inner.update_entry(tunnel_id, task_gen, |entry| {
+                        entry.remote_bound = false;
+                        entry.snapshot.bound_addr = None;
+                        entry.snapshot.remote_bound_port = None;
+                        refresh_entry_state(entry);
+                    });
+                    return ActivePumpExit::Rebind;
+                }
+            }
+        }
+    }
+    ActivePumpExit::Continue(act)
+}
+
+enum RetryWaitExit {
+    RetryNow,
+    Reevaluate,
+    Stop,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn wait_remote_retry_backoff(
+    inner: &TunnelManagerInner,
+    tunnel_id: &str,
+    task_gen: u64,
+    retry_attempt: u32,
+    reason_str: &str,
+    deadline: TokioInstant,
+    ready_rx: &mut watch::Receiver<TransportReadySnapshot>,
+    stop_rx: &mut watch::Receiver<bool>,
+    retry_now_rx: &mut mpsc::UnboundedReceiver<()>,
+) -> RetryWaitExit {
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    tick.tick().await;
+
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => return RetryWaitExit::RetryNow,
+            _ = tick.tick() => {
+                let rem = deadline.saturating_duration_since(TokioInstant::now());
+                let rem_secs = ceil_secs(rem);
+                inner.update_entry(tunnel_id, task_gen, |entry| {
+                    entry.retrying = Some(RetryTelemetry {
+                        attempt: retry_attempt,
+                        next_retry_secs: rem_secs,
+                        reason: reason_str.to_string(),
+                    });
+                    refresh_entry_state(entry);
+                });
+            }
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow_and_update() {
+                    return RetryWaitExit::Stop;
+                }
+            }
+            changed = ready_rx.changed() => {
+                if changed.is_err() {
+                    return RetryWaitExit::Stop;
+                }
+                return RetryWaitExit::Reevaluate;
+            }
+            cmd = retry_now_rx.recv() => {
+                if cmd.is_some() {
+                    return RetryWaitExit::RetryNow;
+                }
+                return RetryWaitExit::Reevaluate;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_remote_tunnel(
+    inner: Arc<TunnelManagerInner>,
+    tunnel_id: String,
+    task_gen: u64,
+    remote_bind_addr: String,
+    remote_bind_port: u16,
+    target_host: String,
+    target_port: u16,
+    mut ready_rx: watch::Receiver<TransportReadySnapshot>,
+    mut stop_rx: watch::Receiver<bool>,
+    mut retry_now_rx: mpsc::UnboundedReceiver<()>,
+    tunnel_done_tx: watch::Sender<bool>,
+) {
+    let _done = DoneSignal(tunnel_done_tx);
+    let mut active: Option<ActiveRemoteForward> = None;
+    let mut failed_transport: Option<Arc<SshTransport>> = None;
+    let mut retry_attempt: u32 = 0;
+    let mut next_retry_deadline: Option<TokioInstant> = None;
+    let mut retry_reason: Option<String> = None;
+
+    loop {
+        if *stop_rx.borrow_and_update() {
+            break;
+        }
+
+        let snap = ready_rx.borrow_and_update().clone();
+        if matches!(snap.status, TransportStatus::Disconnected) {
+            break;
+        }
+
+        if let Some(mut act) = active.take() {
+            let still_same_connected = snap.is_connected()
+                && snap
+                    .transport
+                    .as_ref()
+                    .is_some_and(|t| Arc::ptr_eq(t, &act.transport) && !t.is_closed());
+
+            if !still_same_connected {
+                drop(act.registration.take());
+                retry_attempt = 0;
+                next_retry_deadline = None;
+                retry_reason = None;
+                inner.update_entry(&tunnel_id, task_gen, |entry| {
+                    entry.transport_status = snap.status.clone();
+                    entry.remote_bound = false;
+                    entry.retrying = None;
+                    entry.snapshot.bound_addr = None;
+                    entry.snapshot.remote_bound_port = None;
+                    refresh_entry_state(entry);
+                });
+                continue;
+            }
+
+            match pump_active_remote_forward(
+                &inner,
+                &tunnel_id,
+                task_gen,
+                &target_host,
+                target_port,
+                act,
+                &mut ready_rx,
+                &mut stop_rx,
+                &mut retry_now_rx,
+            )
+            .await
+            {
+                ActivePumpExit::Continue(act) => active = Some(act),
+                ActivePumpExit::Rebind => {}
+                ActivePumpExit::Stop(act) => {
+                    active = Some(act);
+                    break;
+                }
+            }
+            continue;
+        }
+
+        let connected_transport = if snap.is_connected() {
+            snap.transport.as_ref().filter(|tr| {
+                !tr.is_closed() && failed_transport.as_ref().is_none_or(|ft| !Arc::ptr_eq(ft, tr))
+            })
+        } else {
+            None
+        };
+
+        let Some(transport) = connected_transport.cloned() else {
+            retry_attempt = 0;
+            next_retry_deadline = None;
+            retry_reason = None;
+            inner.update_entry(&tunnel_id, task_gen, |entry| {
+                entry.transport_status = snap.status.clone();
+                entry.remote_bound = false;
+                entry.retrying = None;
+                entry.snapshot.bound_addr = None;
+                entry.snapshot.remote_bound_port = None;
+                refresh_entry_state(entry);
+            });
+
+            tokio::select! {
+                _ = stop_rx.changed() => {
+                    if *stop_rx.borrow_and_update() {
+                        break;
+                    }
+                }
+                changed = ready_rx.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                }
+                _ = retry_now_rx.recv() => {}
+            }
+            continue;
+        };
+
+        if let Some(deadline) = next_retry_deadline
+            && TokioInstant::now() < deadline
+        {
+            let reason_str = retry_reason
+                .as_deref()
+                .unwrap_or("remote port forward denied (RequestDenied)");
+            match wait_remote_retry_backoff(
+                &inner,
+                &tunnel_id,
+                task_gen,
+                retry_attempt,
+                reason_str,
+                deadline,
+                &mut ready_rx,
+                &mut stop_rx,
+                &mut retry_now_rx,
+            )
+            .await
+            {
+                RetryWaitExit::RetryNow => {
+                    next_retry_deadline = None;
+                    continue;
+                }
+                RetryWaitExit::Reevaluate => continue,
+                RetryWaitExit::Stop => break,
+            }
+        }
+
+        match try_bind_remote_forward(
+            transport,
+            &remote_bind_addr,
+            remote_bind_port,
+            &mut stop_rx,
+        )
+        .await
+        {
+            RemoteBindOutcome::Bound(bound) => {
+                retry_attempt = 0;
+                next_retry_deadline = None;
+                retry_reason = None;
+                failed_transport = None;
+                let port_u16 = u16::try_from(bound.bound_port).ok();
+                let parsed_addr =
+                    port_u16.and_then(|p| parse_remote_socket_addr(&bound.bind_address, p));
+                inner.update_entry(&tunnel_id, task_gen, |entry| {
+                    entry.transport_status = snap.status.clone();
+                    entry.remote_bound = true;
+                    entry.retrying = None;
+                    entry.fatal_error = None;
+                    entry.snapshot.last_error = None;
+                    entry.snapshot.remote_bound_port = port_u16;
+                    entry.snapshot.bound_addr = parsed_addr;
+                    refresh_entry_state(entry);
+                });
+                active = Some(bound);
+            }
+            RemoteBindOutcome::RequestDenied => {
+                retry_attempt = retry_attempt.saturating_add(1).max(1);
+                let backoff = inner.remote_backoff();
+                let jitter: f64 = rand::rng().random();
+                let delay =
+                    compute_reconnect_backoff(retry_attempt, backoff.min, backoff.max, jitter);
+                next_retry_deadline = Some(TokioInstant::now() + delay);
+                let reason = format!(
+                    "remote port {remote_bind_addr}:{remote_bind_port} forward denied (RequestDenied)"
+                );
+                retry_reason = Some(reason.clone());
+                let secs = ceil_secs(delay);
+                inner.update_entry(&tunnel_id, task_gen, |entry| {
+                    entry.transport_status = snap.status.clone();
+                    entry.remote_bound = false;
+                    entry.snapshot.remote_bound_port = None;
+                    entry.snapshot.bound_addr = None;
+                    entry.snapshot.last_error = Some(reason.clone());
+                    entry.retrying = Some(RetryTelemetry {
+                        attempt: retry_attempt,
+                        next_retry_secs: secs,
+                        reason,
+                    });
+                    refresh_entry_state(entry);
+                });
+            }
+            RemoteBindOutcome::TransportError(err_msg) => {
+                failed_transport = snap.transport.clone();
+                retry_attempt = 0;
+                next_retry_deadline = None;
+                retry_reason = None;
+                inner.update_entry(&tunnel_id, task_gen, |entry| {
+                    entry.transport_status = snap.status.clone();
+                    entry.remote_bound = false;
+                    entry.retrying = None;
+                    entry.snapshot.remote_bound_port = None;
+                    entry.snapshot.bound_addr = None;
+                    entry.snapshot.last_error = Some(err_msg);
+                    refresh_entry_state(entry);
+                });
+            }
+            RemoteBindOutcome::StopRequested => {
+                break;
+            }
+        }
+    }
+
+    if let Some(mut act) = active.take() {
+        drop(act.registration.take());
+        if !act.transport.is_closed() {
+            let _ = tokio::time::timeout(
+                CANCEL_TCPIP_FORWARD_TIMEOUT,
+                act.transport
+                    .handle()
+                    .cancel_tcpip_forward(act.bind_address.as_str(), act.bound_port),
+            )
+            .await;
+        }
+    }
+
+    inner.update_entry(&tunnel_id, task_gen, |entry| {
+        if let Some(cmd_tx) = entry.standalone_cmd_tx.take() {
+            let _ = cmd_tx.send(StandaloneCmd::Stop);
+        }
+        entry.stop_tx.take();
+        entry.retry_now_tx.take();
+        entry.remote_bound = false;
+        entry.retrying = None;
+        entry.snapshot.bound_addr = None;
+        entry.snapshot.remote_bound_port = None;
+        entry.snapshot.held_clients = 0;
+        entry.snapshot.active_connections = 0;
         if entry.fatal_error.is_none() {
             entry.snapshot.state = TunnelState::Stopped;
         }
     });
+}
+
+async fn try_bind_remote_forward(
+    transport: Arc<SshTransport>,
+    remote_bind_addr: &str,
+    remote_bind_port: u16,
+    stop_rx: &mut watch::Receiver<bool>,
+) -> RemoteBindOutcome {
+    let req_port = u32::from(remote_bind_port);
+    let (reg, inbound_rx) = transport.register_remote_forward(remote_bind_addr, req_port);
+    let fwd_transport = Arc::clone(&transport);
+    let fwd_fut = fwd_transport
+        .handle()
+        .tcpip_forward(remote_bind_addr, req_port);
+    tokio::pin!(fwd_fut);
+
+    let fwd_res = loop {
+        tokio::select! {
+            res = &mut fwd_fut => break Some(res),
+            _ = stop_rx.changed() => {
+                if *stop_rx.borrow_and_update() {
+                    break None;
+                }
+            }
+        }
+    };
+
+    let Some(res) = fwd_res else {
+        // Stopped while `tcpip_forward` was in flight: if it succeeded on the server, cancel cleanly!
+        drop(reg);
+        if !transport.is_closed()
+            && let Ok(Ok(returned_port)) =
+                tokio::time::timeout(Duration::from_millis(500), fwd_fut).await
+        {
+            let effective_port = resolve_bound_remote_port(req_port, returned_port);
+            if effective_port > 0 {
+                let _ = tokio::time::timeout(
+                    CANCEL_TCPIP_FORWARD_TIMEOUT,
+                    transport
+                        .handle()
+                        .cancel_tcpip_forward(remote_bind_addr, effective_port),
+                )
+                .await;
+            }
+        }
+        return RemoteBindOutcome::StopRequested;
+    };
+
+    match res {
+        Ok(returned_port) => {
+            let effective_port = resolve_bound_remote_port(req_port, returned_port);
+            if effective_port == 0 {
+                return RemoteBindOutcome::TransportError(
+                    "SSH server returned port 0 for remote forward".to_string(),
+                );
+            }
+            reg.set_port(effective_port);
+            RemoteBindOutcome::Bound(ActiveRemoteForward {
+                transport,
+                bind_address: remote_bind_addr.to_string(),
+                bound_port: effective_port,
+                registration: Some(reg),
+                inbound_rx,
+            })
+        }
+        Err(russh::Error::RequestDenied) => RemoteBindOutcome::RequestDenied,
+        Err(err) => RemoteBindOutcome::TransportError(err.to_string()),
+    }
+}
+
+fn resolve_bound_remote_port(requested_port: u32, returned_port: u32) -> u32 {
+    if requested_port == 0 {
+        returned_port
+    } else if returned_port == 0 {
+        requested_port
+    } else {
+        returned_port
+    }
+}
+
+async fn handle_remote_forwarded_stream(
+    inner: Arc<TunnelManagerInner>,
+    tunnel_id: String,
+    task_gen: u64,
+    target_host: String,
+    target_port: u16,
+    req: ForwardedTcpIpRequest,
+    mut stop_rx: watch::Receiver<bool>,
+) {
+    if *stop_rx.borrow_and_update() {
+        req.reply
+            .reject(ChannelOpenFailure::AdministrativelyProhibited)
+            .await;
+        return;
+    }
+
+    let mut local_tcp = match TcpStream::connect((target_host.as_str(), target_port)).await {
+        Ok(stream) => stream,
+        Err(err) => {
+            debug!(
+                tunnel_id = %tunnel_id,
+                target = %format!("{target_host}:{target_port}"),
+                error = %err,
+                "remote tunnel failed connecting to local target"
+            );
+            req.reply.reject(ChannelOpenFailure::ConnectFailed).await;
+            return;
+        }
+    };
+    let _ = local_tcp.set_nodelay(true);
+
+    req.reply.accept().await;
+    let _conn_guard = ActiveConnGuard::acquire(inner, tunnel_id, task_gen);
+    let mut ssh_stream = req.channel.into_stream();
+
+    tokio::select! {
+        res = tokio::io::copy_bidirectional(&mut local_tcp, &mut ssh_stream) => {
+            if let Err(err) = res {
+                debug!(error = %err, "remote tunnel stream closed");
+            }
+        }
+        _ = stop_rx.changed() => {
+            if *stop_rx.borrow_and_update() {
+                drop(ssh_stream);
+                reset_local_client(local_tcp).await;
+            }
+        }
+    }
 }
 
 struct HeldGuard {
@@ -902,6 +1735,10 @@ async fn handle_local_client(
                 }
                 Err(DirectOpenError::TransportReset) => Err(DirectOpenError::TransportReset),
             }
+        }
+        TunnelForwardMode::Remote { .. } => {
+            reset_local_client(local_tcp).await;
+            return;
         }
     };
 
@@ -1139,6 +1976,9 @@ struct StandaloneTransportDriver {
     spec: StandaloneTransportSpec,
     ready_tx: watch::Sender<TransportReadySnapshot>,
     cmd_rx: mpsc::UnboundedReceiver<StandaloneCmd>,
+    stop_tx: watch::Sender<bool>,
+    tunnel_done_rx: watch::Receiver<bool>,
+    driver_done_tx: watch::Sender<bool>,
     inner: Arc<TunnelManagerInner>,
     epoch: u64,
     has_connected_once: bool,
@@ -1147,6 +1987,7 @@ struct StandaloneTransportDriver {
 
 impl StandaloneTransportDriver {
     async fn run(mut self) {
+        let _done = DoneSignal(self.driver_done_tx.clone());
         let mut attempt: u32 = 0;
 
         loop {
@@ -1194,6 +2035,18 @@ impl StandaloneTransportDriver {
         self.publish_ready(TransportStatus::Disconnected, None, self.last_error.clone());
     }
 
+    async fn shutdown_tunnel_then_transport(&mut self, transport: Option<&Arc<SshTransport>>) {
+        let _ = self.stop_tx.send(true);
+        let _ = tokio::time::timeout(
+            CANCEL_TCPIP_FORWARD_TIMEOUT + Duration::from_secs(1),
+            self.tunnel_done_rx.wait_for(|&done| done),
+        )
+        .await;
+        if let Some(tr) = transport {
+            let _ = tr.close().await;
+        }
+    }
+
     async fn connect_with_cancel(&mut self) -> StandaloneConnectOutcome {
         let ka = if self.spec.supervisor_config.tcp_keepalive
             && !self.spec.supervisor_config.keepalive_interval.is_zero()
@@ -1225,7 +2078,10 @@ impl StandaloneTransportDriver {
                 }
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
-                        Some(StandaloneCmd::Stop) | None => return StandaloneConnectOutcome::Stop,
+                        Some(StandaloneCmd::Stop) | None => {
+                            self.shutdown_tunnel_then_transport(None).await;
+                            return StandaloneConnectOutcome::Stop;
+                        }
                         Some(StandaloneCmd::ReconnectNow) => {}
                     }
                 }
@@ -1310,7 +2166,7 @@ impl StandaloneTransportDriver {
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
                         Some(StandaloneCmd::Stop) | None => {
-                            let _ = transport.close().await;
+                            self.shutdown_tunnel_then_transport(Some(&transport)).await;
                             return StandaloneMonitorExit::Stop;
                         }
                         Some(StandaloneCmd::ReconnectNow) => {
@@ -1364,7 +2220,10 @@ impl StandaloneTransportDriver {
                 cmd = self.cmd_rx.recv() => {
                     match cmd {
                         Some(StandaloneCmd::ReconnectNow) => return true,
-                        Some(StandaloneCmd::Stop) | None => return false,
+                        Some(StandaloneCmd::Stop) | None => {
+                            self.shutdown_tunnel_then_transport(None).await;
+                            return false;
+                        }
                     }
                 }
             }
