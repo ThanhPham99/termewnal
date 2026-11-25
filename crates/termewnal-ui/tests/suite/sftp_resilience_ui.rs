@@ -799,3 +799,56 @@ async fn slice6_part_fallback_notice_and_config_hot_reload_propagate_to_queue() 
     let _ = state.update(Message::ConfigFilesChanged(vec![ConfigFileKind::AppConfig]));
     assert_eq!(state.transfer_queue().transfer_config(), cfg.transfer);
 }
+
+#[tokio::test]
+async fn slice6_sftp_download_rejects_path_traversal_file_and_dir_names_with_browser_error() {
+    let temp = TempDir::new().unwrap();
+    let remote_root = temp.path().join("remote");
+    let dl_dir = temp.path().join("downloads");
+    fs::create_dir_all(&remote_root).unwrap();
+    fs::create_dir_all(&dl_dir).unwrap();
+    fs::write(remote_root.join("secret.txt"), b"secret").unwrap();
+
+    let (addr, host_pubkey, _srv_state, _shutdown) =
+        spawn_ui_resilience_server(remote_root).await;
+    let (mut state, _win, _sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
+    state.set_sftp_download_dir(dl_dir.clone());
+
+    for bad_name in [
+        "../escape.txt",
+        "/tmp/abs_escape.txt",
+        "sub/nested.txt",
+        r"bad\win.txt",
+        "bad\0null.txt",
+        ".",
+        "..",
+        "",
+    ] {
+        let _ = state.update(Message::SftpDownloadFile {
+            remote_path: "/secret.txt".to_string(),
+            file_name: bad_name.to_string(),
+        });
+        assert!(
+            state.sftp_drawer().browser_error().is_some(),
+            "file download `{bad_name:?}` must surface browser error"
+        );
+        assert!(state.transfer_queue().snapshot().transfers.is_empty());
+
+        let _ = state.update(Message::SftpNavigateTo("/".to_string()));
+        assert!(state.sftp_drawer().browser_error().is_none());
+
+        let _ = state.update(Message::SftpDownloadDir {
+            remote_path: "/evil_dir".to_string(),
+            dir_name: bad_name.to_string(),
+        });
+        assert!(
+            state.sftp_drawer().browser_error().is_some(),
+            "dir download `{bad_name:?}` must surface browser error"
+        );
+        assert!(state.transfer_queue().snapshot().transfers.is_empty());
+
+        let _ = state.update(Message::SftpNavigateTo("/".to_string()));
+    }
+
+    assert!(!temp.path().join("escape.txt").exists());
+}

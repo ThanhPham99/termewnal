@@ -681,7 +681,9 @@ async fn multihop_proxy_jump_chain_authenticates_per_hop_enforces_known_hosts_an
     // Explicit reverse teardown closes C -> B -> A cleanly.
     chain.teardown_reverse().await;
     drop(session);
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    wait_for_zero(&srv_a.state.active_sessions, "srv_a teardown").await;
+    wait_for_zero(&srv_b.state.active_sessions, "srv_b teardown").await;
+    wait_for_zero(&srv_c.state.active_sessions, "srv_c teardown").await;
 
     let logged = events.lock().unwrap().clone();
     assert!(logged.contains(&"connect:A".to_string()));
@@ -705,9 +707,8 @@ async fn multihop_proxy_jump_chain_authenticates_per_hop_enforces_known_hosts_an
         .err()
         .expect("wrong Target C key must fail");
     assert!(matches!(err, SshError::AuthenticationFailed { .. }));
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    assert_eq!(srv_a.state.active_sessions.load(Ordering::SeqCst), 0);
-    assert_eq!(srv_b.state.active_sessions.load(Ordering::SeqCst), 0);
+    wait_for_zero(&srv_a.state.active_sessions, "srv_a auth failure").await;
+    wait_for_zero(&srv_b.state.active_sessions, "srv_b auth failure").await;
 
     // 3. MITM mismatch on intermediate Jump B is strictly blocked and tears down Bastion A.
     let rogue_b = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
@@ -733,8 +734,22 @@ async fn multihop_proxy_jump_chain_authenticates_per_hop_enforces_known_hosts_an
         ),
         "expected HostKeyMismatch for Jump B, got {mitm_err:?}"
     );
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    assert_eq!(srv_a.state.active_sessions.load(Ordering::SeqCst), 0);
+    wait_for_zero(&srv_a.state.active_sessions, "srv_a MITM abort").await;
+}
+
+async fn wait_for_zero(counter: &AtomicUsize, label: &str) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while counter.load(Ordering::SeqCst) != 0 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{label}: expected counter to reach 0, still {}",
+            counter.load(Ordering::SeqCst)
+        )
+    });
 }
 
 struct ChainFaultProxy {

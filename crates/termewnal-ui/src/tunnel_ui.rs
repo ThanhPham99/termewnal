@@ -340,6 +340,7 @@ impl TunnelUiState {
     pub fn view_create_modal<'a>(
         &'a self,
         profiles: &'a [Profile],
+        adhoc_ssh_sessions: &[(SessionId, String)],
         palette: &ThemePalette,
     ) -> Option<Element<'a, Message, Theme, iced::Renderer>> {
         if !self.create_form.open {
@@ -388,30 +389,71 @@ impl TunnelUiState {
             .filter(|p| matches!(p.target, ProfileTarget::Ssh { .. }))
             .collect();
 
-        let mut profile_row = row![text("SSH Target:").size(12)]
-            .spacing(6)
-            .align_y(Alignment::Center);
-        if ssh_profiles.is_empty() {
-            profile_row = profile_row.push(
-                text("Active SSH Session")
-                    .size(12)
-                    .color(Color::from_rgb8(148, 163, 184)),
+        let mut target_buttons: Vec<Element<'a, Message, Theme, iced::Renderer>> = Vec::new();
+        for prof in ssh_profiles {
+            let selected = form.profile_id.as_deref() == Some(prof.id.as_str());
+            target_buttons.push(
+                button(text(&prof.name).size(11))
+                    .padding([3, 8])
+                    .style(if selected {
+                        button::primary
+                    } else {
+                        button::subtle
+                    })
+                    .on_press(Message::TunnelFormProfileSelected(Some(prof.id.clone())))
+                    .into(),
             );
-        } else {
-            for prof in ssh_profiles.into_iter().take(4) {
-                let selected = form.profile_id.as_deref() == Some(prof.id.as_str());
-                profile_row = profile_row.push(
-                    button(text(&prof.name).size(11))
-                        .padding([3, 8])
-                        .style(if selected {
-                            button::primary
-                        } else {
-                            button::subtle
-                        })
-                        .on_press(Message::TunnelFormProfileSelected(Some(prof.id.clone()))),
-                );
-            }
         }
+        for (sid, label) in adhoc_ssh_sessions {
+            let selected = form.profile_id.is_none() && form.session_id == Some(*sid);
+            target_buttons.push(
+                button(text(format!("Session: {label}")).size(11))
+                    .padding([3, 8])
+                    .style(if selected {
+                        button::primary
+                    } else {
+                        button::subtle
+                    })
+                    .on_press(Message::TunnelFormSessionSelected(*sid))
+                    .into(),
+            );
+        }
+
+        let target_picker: Element<'a, Message, Theme, iced::Renderer> =
+            if target_buttons.is_empty() {
+                text("No SSH Profile or active SSH Session")
+                    .size(12)
+                    .color(Color::from_rgb8(148, 163, 184))
+                    .into()
+            } else {
+                let mut rows_col = column![].spacing(4);
+                let mut current_row = row![].spacing(6).align_y(Alignment::Center);
+                let mut count_in_row = 0usize;
+                for btn in target_buttons {
+                    current_row = current_row.push(btn);
+                    count_in_row += 1;
+                    if count_in_row == 3 {
+                        rows_col = rows_col.push(current_row);
+                        current_row = row![].spacing(6).align_y(Alignment::Center);
+                        count_in_row = 0;
+                    }
+                }
+                if count_in_row > 0 {
+                    rows_col = rows_col.push(current_row);
+                }
+                if profiles.len() + adhoc_ssh_sessions.len() > 6 {
+                    scrollable(rows_col).height(Length::Fixed(76.0)).into()
+                } else {
+                    rows_col.into()
+                }
+            };
+
+        let profile_row = row![
+            text("SSH Target:").size(12).width(Length::Fixed(95.0)),
+            target_picker,
+        ]
+        .spacing(8)
+        .align_y(Alignment::Start);
 
         let scope_row = row![
             text("Lifecycle:").size(12),
@@ -441,7 +483,7 @@ impl TunnelUiState {
             "Bind Host:"
         };
         let mut fields = column![
-            text("New Port Forwarding Tunnel").size(16),
+            text("New SSH Tunnel").size(16),
             dir_row,
             profile_row,
             scope_row,

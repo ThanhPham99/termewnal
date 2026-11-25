@@ -470,7 +470,13 @@ async fn creating_and_toggling_standalone_socks5_tunnel_updates_sidebar_status_b
         state.sidebar().active_tunnels()[0].state,
         TunnelRuntimeState::Stopped
     );
-    assert!(TcpStream::connect(socks_addr).await.is_err());
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while TcpStream::connect(socks_addr).await.is_ok() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stopped SOCKS5 listener must stop accepting connections");
 
     // Re-toggle via Sidebar 1-click ToggleTunnel -> starts back up, then Stop & Quit cleans up!
     let _ = state.update(Message::ToggleTunnel(tunnel_id));
@@ -968,4 +974,231 @@ async fn session_remote_tunnel_surfaces_request_denied_retry_in_ui_and_cancels_o
             UiRemoteEvent::TransportClosed,
         ]
     );
+}
+
+#[tokio::test]
+async fn reconnect_tunnel_reconnect_all_and_new_tab_return_scheduled_tasks() {
+    let temp = TempDir::new().unwrap();
+    let paths = ConfigPaths::from_root(temp.path());
+    let ssh_srv = spawn_ssh_server().await;
+
+    let mut rule = TunnelRule::local("Session DB", 0, "127.0.0.1", 5432);
+    rule.id = "tun-task-ret".to_string();
+    rule.standalone = false;
+
+    let (profile, vault, known_hosts) =
+        seed_ssh_profile_with_vault(&paths, ssh_srv.addr, &ssh_srv.host_pubkey, vec![rule.clone()]);
+
+    let mut state = super::common::boot_test_app_with_vault(paths, vault).unwrap();
+    state.set_known_hosts_path(known_hosts);
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    // Message::NewTab must return the task produced by open_tab_in_window (not discard it as Task::none()).
+    let new_tab_task = state.update(Message::NewTab);
+    assert!(
+        new_tab_task.units() >= 1,
+        "Message::NewTab must return non-empty Task (got {} units)",
+        new_tab_task.units()
+    );
+
+    // Open an SSH session (Disconnected, no supervisor yet) and record a session-bound tunnel Error entry.
+    let _ = state.update(Message::RestoreSshProfile(profile.clone()));
+    let ssh_sid = state.active_session_id().unwrap();
+    assert_eq!(
+        state.ssh_session(ssh_sid).unwrap().transport_status(),
+        &termewnal_ssh::TransportStatus::Disconnected
+    );
+    state.tunnel_manager().record_start_error(
+        Some(ssh_sid.0),
+        Some(profile.id.clone()),
+        &rule,
+        "session disconnected".to_string(),
+    );
+
+    // ReconnectTunnel on a session-bound tunnel whose session has no supervisor must return connect_ssh_task.
+    let single_task = state.update(Message::ReconnectTunnel(rule.id.clone()));
+    assert!(
+        single_task.units() >= 1,
+        "ReconnectTunnel must return reconnect_ssh_session Task (got {} units)",
+        single_task.units()
+    );
+
+    // Reset session back to Disconnected and verify ReconnectAllTunnels + StatusBarAction::ReconnectTunnels batch tasks.
+    let _ = state.update(Message::DisconnectSshSession(ssh_sid));
+    state.tunnel_manager().record_start_error(
+        Some(ssh_sid.0),
+        Some(profile.id.clone()),
+        &rule,
+        "session disconnected".to_string(),
+    );
+    let all_task = state.update(Message::ReconnectAllTunnels);
+    assert!(
+        all_task.units() >= 1,
+        "ReconnectAllTunnels must return batched Tasks (got {} units)",
+        all_task.units()
+    );
+
+    let _ = state.update(Message::DisconnectSshSession(ssh_sid));
+    state.tunnel_manager().record_start_error(
+        Some(ssh_sid.0),
+        Some(profile.id),
+        &rule,
+        "session disconnected".to_string(),
+    );
+    let sb_task = state.update(Message::StatusBarAction(StatusBarAction::ReconnectTunnels));
+    assert!(
+        sb_task.units() >= 1,
+        "StatusBarAction::ReconnectTunnels must return batched Tasks (got {} units)",
+        sb_task.units()
+    );
+}
+
+#[tokio::test]
+async fn tunnel_create_modal_supports_six_plus_profiles_adhoc_ssh_sessions_and_persistent_adhoc_zero_bind_opt_in() {
+    let temp = TempDir::new().unwrap();
+    let paths = ConfigPaths::from_root(temp.path());
+    let (echo_addr, _echo_stop) = spawn_echo_server().await;
+    let ssh_srv = spawn_ssh_server().await;
+
+    let known_hosts = temp.path().join("known_hosts");
+    record_known_host_path("127.0.0.1", ssh_srv.addr.port(), &ssh_srv.host_pubkey, &known_hosts)
+        .unwrap();
+
+    let mut cfg = ProfilesConfig::default();
+    for idx in 1..=6 {
+        let mut p = Profile::ssh(
+            format!("SSH Target {idx}"),
+            "127.0.0.1",
+            ssh_srv.addr.port(),
+            "ops",
+            SshAuthMethod::Password {
+                vault_secret_ref: Some("ssh/tunnel-ui".to_string()),
+            },
+        );
+        p.id = format!("ssh-{idx}");
+        cfg.profiles.push(p);
+    }
+    save_profiles(&paths, &cfg).unwrap();
+
+    let vault = Arc::new(VaultSession::new(
+        VaultConfig {
+            backend: VaultBackend::Keyring,
+            auto_lock_minutes: 30,
+        },
+        Arc::new(InMemorySecretStore::new()),
+        EncryptedVault::open(paths.vault_file()),
+    ));
+    vault.set_secret("ssh/tunnel-ui", "tunnel-pw").unwrap();
+
+    let mut state = super::common::boot_test_app_with_vault(paths, Arc::clone(&vault)).unwrap();
+    state.set_known_hosts_path(known_hosts.clone());
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    // Open an ad-hoc Quick Connect SSH session (profile_id == None) using a Password spec and drive to Connected.
+    let mut qc_profile = Profile::ssh(
+        "Quick Tunnel Host",
+        "127.0.0.1",
+        ssh_srv.addr.port(),
+        "ops",
+        SshAuthMethod::Password {
+            vault_secret_ref: Some("ssh/tunnel-ui".to_string()),
+        },
+    );
+    qc_profile.id = "tmp".to_string();
+    let mut qc_spec = SshTargetSpec::from_profile(&qc_profile, 80, 24, 1000)
+        .unwrap()
+        .with_known_hosts_path(known_hosts);
+    qc_spec.profile_id = None;
+    let _ = state.update(Message::QuickConnectSsh(qc_spec.clone()));
+    let qc_sid = state.active_session_id().unwrap();
+    let gen_id = state.ssh_session(qc_sid).unwrap().ssh_generation();
+    let buffer = Arc::clone(state.ssh_session(qc_sid).unwrap().buffer());
+
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    tokio::spawn(drive_ssh_connect(qc_sid, gen_id, qc_spec, buffer, vault, ev_tx));
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), ev_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let connected = matches!(ev, SshUiEvent::Connected { .. });
+        let _ = state.update(Message::SshEvent {
+            session_id: qc_sid,
+            event: ev,
+        });
+        if connected {
+            break;
+        }
+    }
+
+    // Opening TunnelCreateModal while focused on a non-profile SSH session must NOT hijack profile_id with ssh-1!
+    let _ = state.update(Message::OpenTunnelCreateModal);
+    assert_eq!(state.tunnel_ui().create_form().session_id, Some(qc_sid));
+    assert_eq!(state.tunnel_ui().create_form().profile_id, None);
+    drop(state.view(win));
+
+    // Selecting the 6th saved SSH profile works without 4-item truncation and clears stale session_id.
+    let _ = state.update(Message::TunnelFormProfileSelected(Some("ssh-6".to_string())));
+    assert_eq!(
+        state.tunnel_ui().create_form().profile_id.as_deref(),
+        Some("ssh-6")
+    );
+    assert_eq!(state.tunnel_ui().create_form().session_id, None);
+
+    // Selecting the ad-hoc non-profile SSH session clears profile_id and targets qc_sid.
+    let _ = state.update(Message::TunnelFormSessionSelected(qc_sid));
+    assert_eq!(state.tunnel_ui().create_form().session_id, Some(qc_sid));
+    assert_eq!(state.tunnel_ui().create_form().profile_id, None);
+
+    // Create an ad-hoc 0.0.0.0 tunnel on qc_sid -> prompts once, persists allow_public_bind = true on AdHocTunnelRule.
+    let _ = state.update(Message::TunnelFormNameChanged("AdHoc Public".to_string()));
+    let _ = state.update(Message::TunnelFormBindHostChanged("0.0.0.0".to_string()));
+    let _ = state.update(Message::TunnelFormBindPortChanged("0".to_string()));
+    let _ = state.update(Message::TunnelFormTargetHostChanged("127.0.0.1".to_string()));
+    let _ = state.update(Message::TunnelFormTargetPortChanged(
+        echo_addr.port().to_string(),
+    ));
+    let _ = state.update(Message::SubmitTunnelCreate);
+
+    assert!(state.profiles().profiles.iter().all(|p| p.tunnels.is_empty()));
+    assert_eq!(state.tunnel_ui().ad_hoc_tunnels().len(), 1);
+    let adhoc_id = state.tunnel_ui().ad_hoc_tunnels()[0].rule.id.clone();
+    assert!(state.tunnel_ui().pending_public_bind_warning().is_some());
+
+    let _ = state.update(Message::TunnelPublicBindConfirm);
+    assert!(state.tunnel_ui().pending_public_bind_warning().is_none());
+    assert!(state.tunnel_ui().ad_hoc_tunnels()[0].rule.allow_public_bind);
+
+    let mut sub = state.tunnel_manager().subscribe();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        sub.wait_for(|s| s.active_count == 1).await.unwrap();
+    })
+    .await
+    .expect("ad-hoc 0.0.0.0 tunnel starts");
+
+    // Stop and re-toggle the opted-in ad-hoc 0.0.0.0 tunnel -> must NOT re-prompt!
+    let _ = state.update(Message::ToggleTunnel(adhoc_id.clone()));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        sub.wait_for(|s| s.tunnels.is_empty() || s.active_count == 0)
+            .await
+            .unwrap();
+    })
+    .await
+    .unwrap();
+
+    let _ = state.update(Message::ToggleTunnel(adhoc_id));
+    assert!(
+        state.tunnel_ui().pending_public_bind_warning().is_none(),
+        "re-toggling opted-in ad-hoc 0.0.0.0 tunnel must not re-prompt"
+    );
+    tokio::time::timeout(Duration::from_secs(5), async {
+        sub.wait_for(|s| s.active_count == 1).await.unwrap();
+    })
+    .await
+    .expect("ad-hoc 0.0.0.0 tunnel restarts without re-prompt");
+
+    state.tunnel_manager().stop_all();
+    let _ = state.update(Message::DisconnectSshSession(qc_sid));
 }

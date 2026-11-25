@@ -899,9 +899,21 @@ async fn held_client_resets_cleanly_on_grace_expiry_or_reconnect_cancel() {
     );
 
     // Now test Case B: connect to cancel_addr (10s grace) and immediately cancel reconnect.
+    let mut tun_sub = manager.subscribe();
     let mut cancel_client = TcpStream::connect(cancel_addr).await.unwrap();
     cancel_client.write_all(b"will-cancel").await.unwrap();
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        tun_sub
+            .wait_for(|s| {
+                s.tunnels
+                    .iter()
+                    .any(|t| t.id == cancel_rule.id && t.held_clients >= 1)
+            })
+            .await
+            .unwrap();
+    })
+    .await
+    .expect("held client must enter Holding state before cancel");
 
     let cancel_started = Instant::now();
     sup.cancel_reconnect();

@@ -496,25 +496,38 @@ pub fn import_tabby_into_profiles(
             continue;
         };
         let stored = match secret_store {
-            Some(store) => store.set_secret(&secret_ref, secret.as_str()).is_ok(),
+            Some(store) => match store.set_secret(&secret_ref, secret.as_str()) {
+                Ok(()) => true,
+                Err(VaultError::Locked) => false,
+                Err(err) => return Err(TabbyImportError::Vault(err)),
+            },
             None => false,
         };
         if !stored {
-            let target_display = match &profile.target {
+            let (target_display, kind) = match &profile.target {
                 ProfileTarget::Ssh {
                     host,
                     port,
                     username,
+                    auth,
                     ..
-                } => format!("{username}@{host}:{port}"),
-                ProfileTarget::LocalShell { .. } => profile.name.clone(),
+                } => {
+                    let kind = match auth {
+                        SshAuthMethod::PublicKey { .. } => TabbyCredentialKind::KeyPassphrase,
+                        _ => TabbyCredentialKind::Password,
+                    };
+                    (format!("{username}@{host}:{port}"), kind)
+                }
+                ProfileTarget::LocalShell { .. } => {
+                    (profile.name.clone(), TabbyCredentialKind::Password)
+                }
             };
             missing_credentials.push(TabbyCredentialRequirement {
                 profile_id: profile.id.clone(),
                 profile_name: profile.name.clone(),
                 target_display,
                 secret_ref,
-                kind: TabbyCredentialKind::Password,
+                kind,
             });
         }
     }

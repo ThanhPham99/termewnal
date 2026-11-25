@@ -34,7 +34,7 @@ pub use sftp::{
     DEFAULT_SFTP_REQUEST_TIMEOUT_SECS, ProfileTransportKey, RemoteDirEntry, RemoteEntryKind,
     RemoteListing, SftpChannelRole, SftpEndpoint, SftpManager, SftpStatusNotice, SftpTransportMode,
     TransferTransportPool, join_remote_path, open_sftp_session, parent_remote_path,
-    pipelined_sftp_client_config,
+    pipelined_sftp_client_config, validate_remote_entry_name,
 };
 pub use supervisor::{
     ConnectionSupervisor, DEFAULT_BACKOFF_MAX, DEFAULT_BACKOFF_MIN, DEFAULT_WAKE_PROBE_TIMEOUT,

@@ -321,11 +321,11 @@ pub enum SshAuthMethod {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TunnelDirection {
-    /// Local port forward (`-L`).
+    /// Local `Tunnel` (`-L`).
     Local,
-    /// Remote port forward (`-R`).
+    /// Remote `Tunnel` (`-R`).
     Remote,
-    /// Dynamic SOCKS5 proxy forward (`-D`).
+    /// Dynamic SOCKS5 `Tunnel` (`-D`).
     Dynamic,
 }
 

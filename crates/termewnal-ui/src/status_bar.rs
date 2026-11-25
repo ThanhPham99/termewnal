@@ -82,6 +82,7 @@ pub enum StatusBarAction {
     ToggleTunnelsView,
     ReconnectTunnels,
     ToggleTransferDrawer,
+    LockVault,
 }
 
 /// Persistent state backing extensible Status Bar slots (`Tunnel` and `Transfer` hooks).
@@ -132,6 +133,7 @@ pub struct StatusBarSnapshot {
     pub transfers: TransferSummaryHook,
     pub sidebar_open: bool,
     pub transfer_drawer_open: bool,
+    pub vault_unlocked: bool,
     pub last_error: Option<String>,
 }
 
@@ -396,27 +398,36 @@ pub fn render_status_bar(
         );
     }
 
-    right = right
-        .push(
-            button(text(snapshot.transfers_text()).size(11))
-                .padding([2, 7])
-                .style(if snapshot.transfer_drawer_open {
-                    button::primary
-                } else {
-                    button::subtle
-                })
-                .on_press(Message::StatusBarAction(
-                    StatusBarAction::ToggleTransferDrawer,
-                )),
-        )
-        .push(
-            button(text("Ctrl+K").size(11))
+    right = right.push(
+        button(text(snapshot.transfers_text()).size(11))
+            .padding([2, 7])
+            .style(if snapshot.transfer_drawer_open {
+                button::primary
+            } else {
+                button::subtle
+            })
+            .on_press(Message::StatusBarAction(
+                StatusBarAction::ToggleTransferDrawer,
+            )),
+    );
+
+    if snapshot.vault_unlocked {
+        right = right.push(
+            button(text("Lock Vault").size(11))
                 .padding([2, 7])
                 .style(button::subtle)
-                .on_press(Message::StatusBarAction(
-                    StatusBarAction::OpenCommandPalette,
-                )),
+                .on_press(Message::StatusBarAction(StatusBarAction::LockVault)),
         );
+    }
+
+    right = right.push(
+        button(text("Ctrl+K").size(11))
+            .padding([2, 7])
+            .style(button::subtle)
+            .on_press(Message::StatusBarAction(
+                StatusBarAction::OpenCommandPalette,
+            )),
+    );
 
     let bar = row![left, space::horizontal(), right]
         .spacing(10)

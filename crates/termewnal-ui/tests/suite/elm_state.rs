@@ -12,6 +12,8 @@ use termewnal_core::{
     },
 };
 use termewnal_pty::PtyEvent;
+use termewnal_ui::command_palette::PaletteAction;
+use termewnal_ui::status_bar::StatusBarAction;
 use termewnal_ui::{
     AppState, CycleDirection, FocusDirection, Message, SplitAxis, SplitNode, TabId,
     key_event_to_bytes, shortcut_for_key_event,
@@ -362,6 +364,95 @@ fn update_vault_unlock_manual_lock_and_idle_auto_lock_tick_manage_session_secret
         state.vault().get_secret("ssh/key"),
         Err(VaultError::Locked)
     ));
+}
+
+#[test]
+fn manual_vault_lock_triggers_exposed_in_command_palette_and_status_bar_when_encrypted_vault_unlocked() {
+    // 1. Keyring backend never exposes manual Lock Vault controls.
+    let keyring_temp = TempDir::new().expect("create keyring temp root");
+    let keyring_state =
+        super::common::boot_test_app(ConfigPaths::from_root(keyring_temp.path())).unwrap();
+    assert!(!keyring_state.status_bar_snapshot().vault_unlocked);
+    assert!(
+        !keyring_state
+            .command_palette_items()
+            .iter()
+            .any(|item| item.action == PaletteAction::LockVault)
+    );
+
+    // 2. EncryptedFile backend hides Lock Vault while locked, exposes it once unlocked.
+    let temp = TempDir::new().expect("create encrypted temp root");
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut cfg = AppConfig::default();
+    #[cfg(unix)]
+    if std::path::Path::new("/bin/sh").exists() {
+        cfg.terminal.shell = Some("/bin/sh".to_string());
+    }
+    cfg.vault = VaultConfig {
+        backend: VaultBackend::EncryptedFile,
+        auto_lock_minutes: 30,
+    };
+    save_config(&paths, &cfg).expect("save EncryptedFile config");
+
+    let vault = Arc::new(VaultSession::new(
+        cfg.vault.clone(),
+        Arc::new(InMemorySecretStore::new()),
+        EncryptedVault::open(paths.vault_file()),
+    ));
+    let mut state = AppState::boot_with_paths_and_vault(paths, vault).unwrap();
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    assert!(state.vault().requires_unlock());
+    assert!(!state.status_bar_snapshot().vault_unlocked);
+    assert!(
+        !state
+            .command_palette_items()
+            .iter()
+            .any(|item| item.action == PaletteAction::LockVault)
+    );
+
+    let _ = state.update(Message::VaultInitializeSubmitted(
+        "vault-pass-99".to_string(),
+    ));
+    state
+        .vault()
+        .set_secret("ssh/prod", "secret-val")
+        .expect("store secret");
+
+    assert!(!state.vault().requires_unlock());
+    assert!(state.status_bar_snapshot().vault_unlocked);
+    assert!(
+        state
+            .command_palette_items()
+            .iter()
+            .any(|item| item.title == "Lock Vault" && item.action == PaletteAction::LockVault)
+    );
+    drop(state.view(win));
+
+    // Trigger Lock Vault via Command Palette -> locks Vault and hides lock trigger.
+    let _ = state.update(Message::OpenCommandPalette);
+    let _ = state.update(Message::CommandPaletteQueryChanged("Lock Vault".to_string()));
+    let _ = state.update(Message::CommandPaletteConfirm);
+    assert!(state.vault().requires_unlock());
+    assert!(!state.status_bar_snapshot().vault_unlocked);
+    assert!(matches!(
+        state.vault().get_secret("ssh/prod"),
+        Err(VaultError::Locked)
+    ));
+    assert!(
+        !state
+            .command_palette_items()
+            .iter()
+            .any(|item| item.action == PaletteAction::LockVault)
+    );
+
+    // Unlock again and trigger Lock Vault via Status Bar button action.
+    let _ = state.update(Message::VaultUnlockSubmitted("vault-pass-99".to_string()));
+    assert!(state.status_bar_snapshot().vault_unlocked);
+    let _ = state.update(Message::StatusBarAction(StatusBarAction::LockVault));
+    assert!(state.vault().requires_unlock());
+    assert!(!state.status_bar_snapshot().vault_unlocked);
 }
 
 #[test]

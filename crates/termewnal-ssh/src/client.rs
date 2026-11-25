@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use russh::client;
 use russh::keys::PublicKeyOrCertificate;
-use russh::{Channel, ChannelOpenFailure, Disconnect};
+use russh::{Channel, ChannelMsg, ChannelOpenFailure, Disconnect};
 use socket2::{SockRef, TcpKeepalive};
 use termewnal_core::{
     DEFAULT_KEEPALIVE_INTERVAL_SECS, OpenSshHost, Profile, ProfileTarget, SshAuthMethod,
@@ -744,5 +744,60 @@ fn apply_tcp_keepalive(tcp: &TcpStream, settings: TcpKeepaliveSettings) {
 
     if let Err(err) = SockRef::from(tcp).set_tcp_keepalive(&keepalive) {
         debug!(error = %err, "failed to apply SO_KEEPALIVE/TCP_KEEPALIVE parameters");
+    }
+}
+
+pub(crate) fn ceil_secs(duration: Duration) -> u64 {
+    if duration.is_zero() {
+        0
+    } else {
+        duration.as_millis().div_ceil(1000) as u64
+    }
+}
+
+pub(crate) trait ChannelWait: Send {
+    fn wait_msg(&mut self) -> impl std::future::Future<Output = Option<ChannelMsg>> + Send;
+}
+
+impl ChannelWait for Channel<client::Msg> {
+    fn wait_msg(&mut self) -> impl std::future::Future<Output = Option<ChannelMsg>> + Send {
+        self.wait()
+    }
+}
+
+impl ChannelWait for russh::ChannelReadHalf {
+    fn wait_msg(&mut self) -> impl std::future::Future<Output = Option<ChannelMsg>> + Send {
+        self.wait()
+    }
+}
+
+pub(crate) async fn await_channel_reply<C, F>(
+    channel: &mut C,
+    stage: &str,
+    mut on_data: F,
+) -> Result<(), SshError>
+where
+    C: ChannelWait + ?Sized,
+    F: FnMut(&[u8]),
+{
+    loop {
+        match channel.wait_msg().await {
+            Some(ChannelMsg::Success) => return Ok(()),
+            Some(ChannelMsg::Failure) => {
+                return Err(SshError::Channel(format!(
+                    "{stage} rejected by remote server"
+                )));
+            }
+            Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
+                on_data(&data);
+            }
+            Some(ChannelMsg::WindowAdjusted { .. }) => {}
+            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                return Err(SshError::Channel(format!(
+                    "channel closed while awaiting {stage} reply"
+                )));
+            }
+            Some(_) => {}
+        }
     }
 }
