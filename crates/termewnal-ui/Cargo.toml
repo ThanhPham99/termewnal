@@ -1,0 +1,15 @@
+[package]
+name = "termewnal-ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+iced.workspace = true
+termewnal-core = { path = "../termewnal-core" }
+termewnal-pty = { path = "../termewnal-pty" }
+termewnal-ssh = { path = "../termewnal-ssh" }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
