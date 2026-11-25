@@ -51,7 +51,9 @@ struct FaultServerState {
     deny_open_exact: Mutex<BTreeSet<String>>,
     deny_rename_paths: Mutex<BTreeSet<String>>,
     deny_rename_status: Mutex<StatusCode>,
+    deny_setstat_paths: Mutex<BTreeSet<String>>,
     reject_rename_if_target_exists: AtomicBool,
+    injected_dir_entries: Mutex<HashMap<String, Vec<String>>>,
 }
 
 impl FaultServerState {
@@ -68,7 +70,9 @@ impl FaultServerState {
             deny_open_exact: Mutex::new(BTreeSet::new()),
             deny_rename_paths: Mutex::new(BTreeSet::new()),
             deny_rename_status: Mutex::new(StatusCode::PermissionDenied),
+            deny_setstat_paths: Mutex::new(BTreeSet::new()),
             reject_rename_if_target_exists: AtomicBool::new(false),
+            injected_dir_entries: Mutex::new(HashMap::new()),
         }
     }
 
@@ -192,6 +196,20 @@ impl russh_sftp::server::Handler for FaultSftpSubsystem {
                 files.push(SftpProtoFile::new(name, FileAttributes::from(&meta)));
             }
         }
+        if let Some(injected) = self
+            .state
+            .injected_dir_entries
+            .lock()
+            .unwrap()
+            .get(path.as_str())
+        {
+            for evil_name in injected {
+                let mut attrs = FileAttributes::default();
+                attrs.size = Some(11);
+                attrs.permissions = Some(0o100644);
+                files.push(SftpProtoFile::new(evil_name.clone(), attrs));
+            }
+        }
         let handle = self.alloc_handle();
         self.handles.insert(
             handle.clone(),
@@ -253,6 +271,15 @@ impl russh_sftp::server::Handler for FaultSftpSubsystem {
         path: SftpString,
         attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
+        if self
+            .state
+            .deny_setstat_paths
+            .lock()
+            .unwrap()
+            .contains(path.as_str())
+        {
+            return Err(StatusCode::PermissionDenied);
+        }
         let abs = self.state.resolve_virtual(&path)?;
         #[cfg(unix)]
         if let Some(mode) = attrs.permissions {
@@ -1504,5 +1531,132 @@ async fn slice5_recursive_transfers_detect_and_skip_symlink_loops_by_default_and
     assert_eq!(
         fs::read(dl_follow_dir.join("link_real.txt")).unwrap(),
         b"remote-real"
+    );
+}
+
+#[tokio::test]
+async fn slice6_malicious_remote_dir_entry_traversal_names_are_rejected_without_escaping_local_dir() {
+    let temp = TempDir::new().unwrap();
+    let remote_root = temp.path().join("remote");
+    let evil_dir = remote_root.join("evil_dir");
+    fs::create_dir_all(&evil_dir).unwrap();
+    fs::write(evil_dir.join("safe.txt"), b"safe-payload").unwrap();
+
+    let srv = spawn_fault_server(remote_root.clone(), "ops", "fault-pass").await;
+    let endpoint = setup_endpoint(&temp, &srv);
+    let queue = TransferQueue::new(SftpManager::new());
+
+    let local_base = temp.path().join("downloads");
+    let escaped_target = local_base.join("escaped.txt");
+    let abs_escape = temp.path().join("abs_escaped.txt");
+
+    for bad_name in [
+        "../escaped.txt".to_string(),
+        abs_escape.to_string_lossy().into_owned(),
+        "sub/nested.txt".to_string(),
+        r"bad\win.txt".to_string(),
+        "bad\0null.txt".to_string(),
+        String::new(),
+    ] {
+        srv.state
+            .injected_dir_entries
+            .lock()
+            .unwrap()
+            .insert("/evil_dir".to_string(), vec![bad_name.clone()]);
+
+        let target_dir = local_base.join("target");
+        let err = queue
+            .enqueue_download_dir(endpoint.clone(), "/evil_dir".to_string(), target_dir.clone())
+            .await
+            .expect_err(&format!("malicious SFTP entry `{bad_name:?}` must be rejected"));
+        assert!(
+            err.to_string().to_lowercase().contains("unsafe")
+                || err.to_string().to_lowercase().contains("invalid"),
+            "unexpected error for `{bad_name:?}`: {err}"
+        );
+        assert!(
+            !escaped_target.exists(),
+            "escaped file must not exist for `{bad_name:?}`"
+        );
+        assert!(
+            !abs_escape.exists(),
+            "absolute-path file must not exist for `{bad_name:?}`"
+        );
+    }
+    assert!(queue.snapshot().transfers.is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn slice6_permission_preserve_failure_emits_permission_preserve_skipped_notice() {
+    let temp = TempDir::new().unwrap();
+    let local_dir = temp.path().join("local");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(local_dir.join("dir_perm/sub")).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let single_src = local_dir.join("denied_perm.txt");
+    fs::write(&single_src, b"perm-test-payload").unwrap();
+    fs::write(local_dir.join("dir_perm/sub/nested.txt"), b"dir-perm-payload").unwrap();
+
+    let srv = spawn_fault_server(remote_root.clone(), "ops", "fault-pass").await;
+    srv.state
+        .deny_setstat_paths
+        .lock()
+        .unwrap()
+        .insert("/denied_perm.txt".to_string());
+    srv.state
+        .deny_setstat_paths
+        .lock()
+        .unwrap()
+        .insert("/dir_perm/sub".to_string());
+
+    let endpoint = setup_endpoint(&temp, &srv);
+    let queue = TransferQueue::new(SftpManager::new());
+
+    // 1. Single file upload: chmod failure emits PermissionPreserveSkipped notice while completing data transfer.
+    let single_id = queue.enqueue_upload(endpoint.clone(), single_src, "/denied_perm.txt".to_string());
+    assert!(queue.wait_until_idle(Duration::from_secs(10)).await);
+    let single_snap = queue.get(single_id).unwrap();
+    assert_eq!(single_snap.status, TransferStatus::Completed);
+    assert!(
+        matches!(
+            single_snap.notice,
+            Some(TransferNotice::PermissionPreserveSkipped { .. })
+        ),
+        "expected PermissionPreserveSkipped notice, got {:?}",
+        single_snap.notice
+    );
+    assert!(
+        single_snap
+            .status_notice
+            .as_deref()
+            .is_some_and(|s| s.contains("Could not preserve POSIX permissions"))
+    );
+    assert_eq!(
+        fs::read(remote_root.join("denied_perm.txt")).unwrap(),
+        b"perm-test-payload"
+    );
+
+    // 2. Directory upload: dir chmod failure emits PermissionPreserveSkipped notice on batch completion.
+    let dir_summary = queue
+        .enqueue_upload_dir(
+            endpoint,
+            local_dir.join("dir_perm"),
+            "/dir_perm".to_string(),
+        )
+        .await
+        .expect("enqueue dir upload");
+    assert_eq!(dir_summary.transfer_ids.len(), 1);
+    assert!(queue.wait_until_idle(Duration::from_secs(10)).await);
+    let dir_snap = queue.get(dir_summary.transfer_ids[0]).unwrap();
+    assert_eq!(dir_snap.status, TransferStatus::Completed);
+    assert!(
+        matches!(
+            dir_snap.notice,
+            Some(TransferNotice::PermissionPreserveSkipped { .. })
+        ),
+        "expected PermissionPreserveSkipped notice for dir chmod failure, got {:?}",
+        dir_snap.notice
     );
 }

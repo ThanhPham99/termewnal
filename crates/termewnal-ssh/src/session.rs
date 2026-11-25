@@ -11,7 +11,7 @@ use tracing::{debug, warn};
 
 use crate::TransportStatus;
 use crate::auth::{AgentConnector, SshInteractionHandler};
-use crate::client::{SshConnectConfig, SshTransport};
+use crate::client::{SshConnectConfig, SshTransport, await_channel_reply};
 use crate::error::SshError;
 use crate::supervisor::ConnectionSupervisor;
 
@@ -100,12 +100,12 @@ impl SshSession {
         tx.request_pty(true, term_name, u32::from(cols), u32::from(rows), 0, 0, &[])
             .await
             .map_err(|err| SshError::Channel(err.to_string()))?;
-        await_channel_reply(&mut rx, &buffer, "PTY request").await?;
+        await_channel_reply(&mut rx, "PTY request", |data| buffer.feed_bytes(data)).await?;
 
         tx.request_shell(true)
             .await
             .map_err(|err| SshError::Channel(err.to_string()))?;
-        await_channel_reply(&mut rx, &buffer, "shell request").await?;
+        await_channel_reply(&mut rx, "shell request", |data| buffer.feed_bytes(data)).await?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         buffer.set_write_sink(Some(Box::new(ChannelWriteSink { tx: cmd_tx.clone() })));
@@ -247,31 +247,6 @@ impl Drop for SshSession {
     fn drop(&mut self) {
         if self.supervisor.is_none() {
             self.disconnect();
-        }
-    }
-}
-
-async fn await_channel_reply(
-    rx: &mut russh::ChannelReadHalf,
-    buffer: &TerminalBuffer,
-    stage: &str,
-) -> Result<(), SshError> {
-    loop {
-        match rx.wait().await {
-            Some(ChannelMsg::Success) => return Ok(()),
-            Some(ChannelMsg::Failure) => {
-                return Err(SshError::Channel(format!("{stage} rejected by remote server")));
-            }
-            Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                buffer.feed_bytes(&data);
-            }
-            Some(ChannelMsg::WindowAdjusted { .. }) => {}
-            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
-                return Err(SshError::Channel(format!(
-                    "channel closed while awaiting {stage} reply"
-                )));
-            }
-            Some(_) => {}
         }
     }
 }

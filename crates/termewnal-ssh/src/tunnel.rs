@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 use crate::TransportStatus;
 use crate::auth::{AgentConnector, SshInteractionHandler};
 use crate::client::{
-    ForwardedTcpIpRequest, RemoteForwardRegistration, SshConnectConfig, SshTransport,
+    ForwardedTcpIpRequest, RemoteForwardRegistration, SshConnectConfig, SshTransport, ceil_secs,
 };
 use crate::error::SshError;
 use crate::supervisor::{
@@ -1055,14 +1055,6 @@ fn parse_remote_socket_addr(bind_addr: &str, port: u16) -> Option<SocketAddr> {
     Some(SocketAddr::new(ip, port))
 }
 
-fn ceil_secs(duration: Duration) -> u64 {
-    if duration.is_zero() {
-        0
-    } else {
-        duration.as_millis().div_ceil(1000) as u64
-    }
-}
-
 struct ActiveRemoteForward {
     transport: Arc<SshTransport>,
     bind_address: String,
@@ -1321,7 +1313,7 @@ async fn run_remote_tunnel(
         {
             let reason_str = retry_reason
                 .as_deref()
-                .unwrap_or("remote port forward denied (RequestDenied)");
+                .unwrap_or("remote tunnel denied (RequestDenied)");
             match wait_remote_retry_backoff(
                 &inner,
                 &tunnel_id,
@@ -1380,7 +1372,7 @@ async fn run_remote_tunnel(
                     compute_reconnect_backoff(retry_attempt, backoff.min, backoff.max, jitter);
                 next_retry_deadline = Some(TokioInstant::now() + delay);
                 let reason = format!(
-                    "remote port {remote_bind_addr}:{remote_bind_port} forward denied (RequestDenied)"
+                    "remote tunnel {remote_bind_addr}:{remote_bind_port} denied (RequestDenied)"
                 );
                 retry_reason = Some(reason.clone());
                 let secs = ceil_secs(delay);

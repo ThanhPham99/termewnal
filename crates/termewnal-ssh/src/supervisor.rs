@@ -19,7 +19,9 @@ use tracing::{debug, warn};
 
 use crate::TransportStatus;
 use crate::auth::{AgentConnector, BoxFuture, SshInteractionHandler};
-use crate::client::{SshConnectConfig, SshTransport, TcpKeepaliveSettings};
+use crate::client::{
+    SshConnectConfig, SshTransport, TcpKeepaliveSettings, await_channel_reply, ceil_secs,
+};
 use crate::error::SshError;
 use crate::proxy_jump::{SshTransportChain, connect_transport_chain};
 
@@ -88,9 +90,12 @@ impl ManualTimeSource {
 
     /// Advances both monotonic and wall clocks by `duration` (simulating steady awake time).
     pub fn advance_steady(&self, duration: Duration) {
-        let mut guard = self.current.lock().expect("manual clock mutex poisoned");
-        guard.monotonic += duration;
-        guard.wall += duration;
+        {
+            let mut guard = self.current.lock().expect("manual clock mutex poisoned");
+            guard.monotonic += duration;
+            guard.wall += duration;
+        }
+        self.notify.notify_one();
     }
 
     /// Advances only wall clock by `duration` while monotonic time stays paused (OS sleep/suspend).
@@ -911,7 +916,10 @@ impl SupervisorActor {
                 guard.teardown().await;
                 return Err(SshError::Channel(err.to_string()));
             }
-            if let Err(err) = await_channel_reply(&mut rx, &mut initial_output, "PTY request").await
+            if let Err(err) = await_channel_reply(&mut rx, "PTY request", |data| {
+                initial_output.extend_from_slice(data);
+            })
+            .await
             {
                 guard.teardown().await;
                 return Err(err);
@@ -921,8 +929,10 @@ impl SupervisorActor {
                 guard.teardown().await;
                 return Err(SshError::Channel(err.to_string()));
             }
-            if let Err(err) =
-                await_channel_reply(&mut rx, &mut initial_output, "shell request").await
+            if let Err(err) = await_channel_reply(&mut rx, "shell request", |data| {
+                initial_output.extend_from_slice(data);
+            })
+            .await
             {
                 guard.teardown().await;
                 return Err(err);
@@ -1478,41 +1488,5 @@ fn is_clock_jump(
     if wall_delta <= threshold {
         return false;
     }
-    wall_delta.saturating_sub(mono_delta) > threshold / 2 || threshold >= Duration::from_secs(2)
-}
-
-fn ceil_secs(d: Duration) -> u64 {
-    let ms = d.as_millis();
-    if ms == 0 {
-        0
-    } else {
-        ((ms + 999) / 1000) as u64
-    }
-}
-
-async fn await_channel_reply(
-    rx: &mut russh::ChannelReadHalf,
-    buffered_output: &mut Vec<u8>,
-    stage: &str,
-) -> Result<(), SshError> {
-    loop {
-        match rx.wait().await {
-            Some(ChannelMsg::Success) => return Ok(()),
-            Some(ChannelMsg::Failure) => {
-                return Err(SshError::Channel(format!(
-                    "{stage} rejected by remote server"
-                )));
-            }
-            Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
-                buffered_output.extend_from_slice(&data);
-            }
-            Some(ChannelMsg::WindowAdjusted { .. }) => {}
-            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
-                return Err(SshError::Channel(format!(
-                    "channel closed while awaiting {stage} reply"
-                )));
-            }
-            Some(_) => {}
-        }
-    }
+    wall_delta.saturating_sub(mono_delta) > threshold / 2
 }

@@ -253,7 +253,13 @@ fn multiline_paste_guard_prompts_confirms_cancels_and_respects_config_toggle() {
     assert!(pending.line_count >= 2);
     let _ = state.update(Message::CancelPendingPaste);
     assert!(state.pending_paste().is_none());
-    std::thread::sleep(Duration::from_millis(100));
+    let _ = state.update(Message::TerminalInput {
+        session_id,
+        bytes: b"printf 'AFTER_CANCEL_%s\\n' OK\r".to_vec(),
+    });
+    assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
+        s.visible_text().contains("AFTER_CANCEL_OK")
+    }));
     assert!(!pty.snapshot().visible_text().contains("CANCELED_LINE1"));
 
     // ConfirmPendingPaste dispatches buffered multi-line text to active Session.

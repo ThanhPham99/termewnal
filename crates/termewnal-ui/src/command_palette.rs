@@ -142,6 +142,7 @@ pub enum PaletteAction {
     OpenQuickConnectPrompt,
     OpenTabbyImporter,
     OpenTunnelCreator,
+    LockVault,
     ReloadSystemSsh,
     QuickConnect(QuickConnectTarget),
     ProbeReconnectAll,
@@ -381,8 +382,26 @@ impl CommandPaletteState {
         sessions: &[PaletteSessionEntry],
         system_ssh: &[SystemSshProfile],
         tunnels: &[ActiveTunnelEntry],
+        can_lock_vault: bool,
     ) -> Vec<PaletteItem> {
         let mut base_items = workspace_command_items();
+        if can_lock_vault {
+            base_items.push(PaletteItem {
+                id: "cmd:lock-vault".to_string(),
+                category: PaletteCategory::Command,
+                title: "Lock Vault".to_string(),
+                subtitle: "Lock local encrypted Vault and zeroize decrypted secrets in memory"
+                    .to_string(),
+                keywords: vec![
+                    "vault".to_string(),
+                    "lock".to_string(),
+                    "security".to_string(),
+                    "master".to_string(),
+                ],
+                shortcut: None,
+                action: PaletteAction::LockVault,
+            });
+        }
 
         for s in sessions {
             let active_marker = if s.is_active { " (Active)" } else { "" };

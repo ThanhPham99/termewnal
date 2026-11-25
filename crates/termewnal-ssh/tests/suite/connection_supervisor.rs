@@ -535,8 +535,12 @@ async fn clock_jump_and_manual_probe_now_trigger_immediate_fast_probe_recovery()
     .expect("must recover after wake reconnect");
 
     // Manual probe_now() on healthy transport keeps it Connected; on blackholed transport triggers immediate Reconnecting.
+    status_rx.borrow_and_update();
     supervisor.probe_now();
-    tokio::time::sleep(Duration::from_millis(40)).await;
+    tokio::time::timeout(Duration::from_secs(1), status_rx.changed())
+        .await
+        .expect("probe_now must refresh status")
+        .expect("status channel must remain open");
     assert!(matches!(
         supervisor.status(),
         TransportStatus::Connected { .. }
@@ -566,6 +570,91 @@ async fn clock_jump_and_manual_probe_now_trigger_immediate_fast_probe_recovery()
     })
     .await
     .expect("must recover after manual probe reconnect");
+
+    supervisor.disconnect();
+}
+
+#[tokio::test]
+async fn steady_elapsed_interval_without_clock_divergence_does_not_trigger_false_clock_jump_probe() {
+    let temp = TempDir::new().unwrap();
+    let kh = temp.path().join("known_hosts");
+    let srv = spawn_ssh_server().await;
+    let proxy = spawn_fault_proxy(srv.addr).await;
+    record_known_host_path("127.0.0.1", proxy.addr.port(), &srv.host_pubkey, &kh).unwrap();
+
+    let mut sup_cfg = SupervisorConfig::default();
+    sup_cfg.keepalive_interval = Duration::from_secs(15);
+    sup_cfg.keepalive_max_missed = 3;
+    sup_cfg.wake_probe_timeout = Duration::from_millis(80);
+    sup_cfg.backoff_min = Duration::from_millis(40);
+    sup_cfg.backoff_max = Duration::from_millis(120);
+
+    let clock = Arc::new(ManualTimeSource::new());
+    let connector = Arc::new(DefaultTransportConnector::new(
+        None,
+        Arc::new(FixedPasswordInteraction {
+            password: "secret".to_string(),
+        }),
+        Arc::new(OsAgentConnector::default()),
+    ));
+    let buffer = Arc::new(TerminalBuffer::new(80, 24, 10_000));
+    let supervisor = ConnectionSupervisor::connect_with_connector(
+        build_connect_config(proxy.addr.port(), &kh),
+        sup_cfg,
+        Arc::clone(&buffer),
+        connector,
+        clock.clone(),
+    );
+
+    let mut status_rx = supervisor.subscribe_status();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if matches!(
+                *status_rx.borrow(),
+                TransportStatus::Connected {
+                    latency_ms: Some(_)
+                }
+            ) {
+                break;
+            }
+            status_rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("initial connect must complete");
+
+    // Advance both wall and monotonic clocks equally (> 15s) while blackholed:
+    // no suspend/clock jump happened, so wake fast-probe MUST NOT fire.
+    proxy.blackhole_active.store(true, Ordering::SeqCst);
+    clock.advance_steady(Duration::from_secs(20));
+
+    let false_jump = tokio::time::timeout(Duration::from_millis(250), async {
+        loop {
+            if matches!(*status_rx.borrow(), TransportStatus::Reconnecting { .. }) {
+                break;
+            }
+            status_rx.changed().await.unwrap();
+        }
+    })
+    .await;
+    assert!(
+        false_jump.is_err(),
+        "steady elapsed interval without wall/monotonic divergence must NOT trigger fast-probe -> Reconnecting (status: {:?})",
+        supervisor.status()
+    );
+
+    // Genuine sleep/clock-jump divergence (wall +20s, monotonic unchanged) MUST trigger fast-probe.
+    clock.advance_sleep(Duration::from_secs(20));
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if matches!(*status_rx.borrow(), TransportStatus::Reconnecting { .. }) {
+                break;
+            }
+            status_rx.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("genuine sleep divergence must trigger immediate fast-probe -> Reconnecting");
 
     supervisor.disconnect();
 }
@@ -869,7 +958,11 @@ async fn clean_remote_shell_exit_marks_buffer_exited_and_stops_without_reconnect
     .await
     .expect("clean exit must mark buffer exited and transition to Disconnected");
 
-    tokio::time::sleep(Duration::from_millis(120)).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while status_rx.changed().await.is_ok() {}
+    })
+    .await
+    .expect("supervisor task must terminate cleanly without reconnecting");
     assert_eq!(srv.state.connections.load(Ordering::SeqCst), 1);
     assert_eq!(supervisor.status(), TransportStatus::Disconnected);
 }

@@ -1253,7 +1253,7 @@ impl TransferQueue {
                     if let Ok(acquired) = sftp_mgr.acquire_transfer_session(&ep).await
                         && batch_clone.ensure_dirs_created(&acquired.session).await.is_ok()
                     {
-                        batch_clone
+                        let _ = batch_clone
                             .apply_dir_permissions_bottom_up(&acquired.session)
                             .await;
                     }
@@ -1264,6 +1264,7 @@ impl TransferQueue {
                 created_dir_count,
                 skipped_symlinks,
                 skipped_symlink_loops,
+                permission_notices: Vec::new(),
             });
         }
 
@@ -1330,6 +1331,7 @@ impl TransferQueue {
             created_dir_count,
             skipped_symlinks,
             skipped_symlink_loops,
+            permission_notices: Vec::new(),
         })
     }
 
@@ -1341,14 +1343,17 @@ impl TransferQueue {
         local_dir: PathBuf,
         remote_dir: String,
     ) -> Result<DirectoryTransferSummary, SshError> {
-        let summary = self.enqueue_upload_path(endpoint.clone(), local_dir.clone(), remote_dir.clone())?;
+        let mut summary =
+            self.enqueue_upload_path(endpoint.clone(), local_dir.clone(), remote_dir.clone())?;
         if summary.transfer_ids.is_empty() && summary.created_dir_count > 0 {
             let follow = self.transfer_config().follow_symlinks;
             let plan = collect_local_dir_plan(&local_dir, &remote_dir, follow)?;
             let batch = UploadDirBatch::new(plan.dirs, &[]);
             let acquired = self.inner.sftp.acquire_transfer_session(&endpoint).await?;
             batch.ensure_dirs_created(&acquired.session).await?;
-            batch.apply_dir_permissions_bottom_up(&acquired.session).await;
+            summary.permission_notices = batch
+                .apply_dir_permissions_bottom_up(&acquired.session)
+                .await;
         }
         Ok(summary)
     }
@@ -1378,12 +1383,13 @@ impl TransferQueue {
         let batch = Arc::new(DownloadDirBatch::new(plan.dirs, &ids));
 
         if plan.files.is_empty() {
-            batch.apply_dir_permissions_bottom_up().await;
+            let permission_notices = batch.apply_dir_permissions_bottom_up().await;
             return Ok(DirectoryTransferSummary {
                 transfer_ids: Vec::new(),
                 created_dir_count,
                 skipped_symlinks,
                 skipped_symlink_loops,
+                permission_notices,
             });
         }
 
@@ -1450,6 +1456,7 @@ impl TransferQueue {
             created_dir_count,
             skipped_symlinks,
             skipped_symlink_loops,
+            permission_notices: Vec::new(),
         })
     }
 
@@ -1956,14 +1963,14 @@ impl TransferQueue {
 
             match outcome {
                 Ok(TransferOutcome::Completed { bytes, rate }) => {
-                    if let Some(ref batch) = upload_batch {
-                        batch
-                            .finish_file_and_finalize_dirs(id, &acquired.session)
-                            .await;
-                    }
-                    if let Some(ref batch) = download_batch {
-                        batch.finish_file_and_finalize_dirs(id).await;
-                    }
+                    self.finalize_dir_batches(
+                        id,
+                        generation,
+                        &acquired.session,
+                        upload_batch.as_ref(),
+                        download_batch.as_ref(),
+                    )
+                    .await;
                     self.mark_completed(id, generation, bytes, rate);
                     return;
                 }
@@ -1972,27 +1979,27 @@ impl TransferQueue {
                     return;
                 }
                 Ok(TransferOutcome::Skipped) => {
-                    if let Some(ref batch) = upload_batch {
-                        batch
-                            .finish_file_and_finalize_dirs(id, &acquired.session)
-                            .await;
-                    }
-                    if let Some(ref batch) = download_batch {
-                        batch.finish_file_and_finalize_dirs(id).await;
-                    }
+                    self.finalize_dir_batches(
+                        id,
+                        generation,
+                        &acquired.session,
+                        upload_batch.as_ref(),
+                        download_batch.as_ref(),
+                    )
+                    .await;
                     self.mark_skipped(id, generation);
                     return;
                 }
                 Ok(TransferOutcome::Interrupted(signal)) => {
                     if signal == ControlSignal::Cancel {
-                        if let Some(ref batch) = upload_batch {
-                            batch
-                                .finish_file_and_finalize_dirs(id, &acquired.session)
-                                .await;
-                        }
-                        if let Some(ref batch) = download_batch {
-                            batch.finish_file_and_finalize_dirs(id).await;
-                        }
+                        self.finalize_dir_batches(
+                            id,
+                            generation,
+                            &acquired.session,
+                            upload_batch.as_ref(),
+                            download_batch.as_ref(),
+                        )
+                        .await;
                     }
                     self.apply_interrupt(id, generation, signal);
                     return;
@@ -2031,18 +2038,38 @@ impl TransferQueue {
                         }
                         continue;
                     }
-                    if let Some(ref batch) = upload_batch {
-                        batch
-                            .finish_file_and_finalize_dirs(id, &acquired.session)
-                            .await;
-                    }
-                    if let Some(ref batch) = download_batch {
-                        batch.finish_file_and_finalize_dirs(id).await;
-                    }
+                    self.finalize_dir_batches(
+                        id,
+                        generation,
+                        &acquired.session,
+                        upload_batch.as_ref(),
+                        download_batch.as_ref(),
+                    )
+                    .await;
                     self.mark_failed_with_drop(id, generation, err.to_string(), drop_err);
                     return;
                 }
             }
+        }
+    }
+
+    async fn finalize_dir_batches(
+        &self,
+        id: TransferId,
+        generation: u64,
+        sftp: &SftpSession,
+        upload_batch: Option<&Arc<UploadDirBatch>>,
+        download_batch: Option<&Arc<DownloadDirBatch>>,
+    ) {
+        let mut notices = Vec::new();
+        if let Some(batch) = upload_batch {
+            notices.extend(batch.finish_file_and_finalize_dirs(id, sftp).await);
+        }
+        if let Some(batch) = download_batch {
+            notices.extend(batch.finish_file_and_finalize_dirs(id).await);
+        }
+        for notice in notices {
+            self.record_transfer_notice(id, generation, notice);
         }
     }
 
@@ -2260,26 +2287,14 @@ impl TransferQueue {
 
         loop {
             if let Some(signal) = current_interrupt(control_rx) {
-                if signal == ControlSignal::Pause {
-                    let _ = remote_file.shutdown().await;
-                } else if signal == ControlSignal::Cancel && plan.using_part_file {
-                    drop(remote_file);
-                    let _ = sftp.remove_file(plan.write_path.as_str()).await;
-                }
-                return Ok(TransferOutcome::Interrupted(signal));
+                return Ok(cleanup_upload_interrupt(signal, sftp, remote_file, plan).await);
             }
 
             let read_n = tokio::select! {
                 biased;
                 _ = control_rx.changed() => {
                     if let Some(signal) = current_interrupt(control_rx) {
-                        if signal == ControlSignal::Pause {
-                            let _ = remote_file.shutdown().await;
-                        } else if signal == ControlSignal::Cancel && plan.using_part_file {
-                            drop(remote_file);
-                            let _ = sftp.remove_file(plan.write_path.as_str()).await;
-                        }
-                        return Ok(TransferOutcome::Interrupted(signal));
+                        return Ok(cleanup_upload_interrupt(signal, sftp, remote_file, plan).await);
                     }
                     continue;
                 }
@@ -2294,13 +2309,7 @@ impl TransferQueue {
                 biased;
                 _ = control_rx.changed() => {
                     if let Some(signal) = current_interrupt(control_rx) {
-                        if signal == ControlSignal::Pause {
-                            let _ = remote_file.shutdown().await;
-                        } else if signal == ControlSignal::Cancel && plan.using_part_file {
-                            drop(remote_file);
-                            let _ = sftp.remove_file(plan.write_path.as_str()).await;
-                        }
-                        return Ok(TransferOutcome::Interrupted(signal));
+                        return Ok(cleanup_upload_interrupt(signal, sftp, remote_file, plan).await);
                     }
                 }
                 res = remote_file.write_all(&buf[..read_n]) => res.map_err(map_remote_sftp_io_error)?,
@@ -2316,13 +2325,7 @@ impl TransferQueue {
             biased;
             _ = control_rx.changed() => {
                 if let Some(signal) = current_interrupt(control_rx) {
-                    if signal == ControlSignal::Pause {
-                        let _ = remote_file.shutdown().await;
-                    } else if signal == ControlSignal::Cancel && plan.using_part_file {
-                        drop(remote_file);
-                        let _ = sftp.remove_file(plan.write_path.as_str()).await;
-                    }
-                    return Ok(TransferOutcome::Interrupted(signal));
+                    return Ok(cleanup_upload_interrupt(signal, sftp, remote_file, plan).await);
                 }
                 remote_file.shutdown().await.map_err(map_remote_sftp_io_error)?;
             }
@@ -2331,8 +2334,15 @@ impl TransferQueue {
         self.inner.hook.finalize_upload(sftp, plan).await?;
         if let Ok(meta) = tokio::fs::metadata(local_path).await
             && let Some(mode) = extract_local_posix_mode(&meta)
+            && let Err(err) = apply_remote_permissions(sftp, &plan.final_path, mode).await
         {
-            let _ = apply_remote_permissions(sftp, &plan.final_path, mode).await;
+            self.record_transfer_notice(
+                id,
+                generation,
+                TransferNotice::PermissionPreserveSkipped {
+                    reason: err.to_string(),
+                },
+            );
         }
         Ok(TransferOutcome::Completed {
             bytes: transferred,
@@ -2505,8 +2515,16 @@ impl TransferQueue {
 
         local_file.flush().await?;
         drop(local_file);
-        if let Some(mode) = plan.permissions {
-            let _ = apply_local_permissions(&local_path, mode).await;
+        if let Some(mode) = plan.permissions
+            && let Err(err) = apply_local_permissions(&local_path, mode).await
+        {
+            self.record_transfer_notice(
+                id,
+                generation,
+                TransferNotice::PermissionPreserveSkipped {
+                    reason: err.to_string(),
+                },
+            );
         }
         let _ = remote_file.close().await;
         Ok(TransferOutcome::Completed {
@@ -2532,6 +2550,28 @@ impl TransferQueue {
         };
         self.publish_snapshot(snap);
         true
+    }
+
+    fn record_transfer_notice(&self, id: TransferId, generation: u64, notice: TransferNotice) {
+        let snap = {
+            let mut entries = self.inner.entries.lock().expect("entries mutex poisoned");
+            let Some(entry) = entries
+                .iter_mut()
+                .find(|e| e.snapshot.id == id && e.generation == generation)
+            else {
+                return;
+            };
+            let summary = notice.summary();
+            if entry.snapshot.notice.is_none() {
+                entry.snapshot.notice = Some(notice);
+            }
+            entry.snapshot.status_notice = Some(match entry.snapshot.status_notice.take() {
+                Some(existing) if !existing.contains(&summary) => format!("{existing} {summary}"),
+                _ => summary,
+            });
+            build_queue_snapshot(&entries)
+        };
+        self.publish_snapshot(snap);
     }
 
     fn update_transport_info(
@@ -2968,6 +3008,21 @@ fn current_interrupt(control_rx: &watch::Receiver<ControlSignal>) -> Option<Cont
         ControlSignal::Run => None,
         signal => Some(signal),
     }
+}
+
+async fn cleanup_upload_interrupt(
+    signal: ControlSignal,
+    sftp: &SftpSession,
+    mut remote_file: russh_sftp::client::fs::File,
+    plan: &UploadTargetPlan,
+) -> TransferOutcome {
+    if signal == ControlSignal::Pause {
+        let _ = remote_file.shutdown().await;
+    } else if signal == ControlSignal::Cancel && plan.using_part_file {
+        drop(remote_file);
+        let _ = sftp.remove_file(plan.write_path.as_str()).await;
+    }
+    TransferOutcome::Interrupted(signal)
 }
 
 fn compute_throughput(session_bytes: u64, started_at: Instant) -> u64 {

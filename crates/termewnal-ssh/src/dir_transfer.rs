@@ -7,10 +7,11 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpClientError;
 use russh_sftp::protocol::{FileAttributes, StatusCode};
 use tokio::sync::OnceCell;
+use tracing::warn;
 
 use crate::error::SshError;
 use crate::sftp::join_remote_path;
-use crate::transfer::TransferId;
+use crate::transfer::{TransferId, TransferNotice};
 
 /// Summary returned after recursively traversing and enqueueing a directory `Transfer`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -19,6 +20,7 @@ pub struct DirectoryTransferSummary {
     pub created_dir_count: usize,
     pub skipped_symlinks: Vec<String>,
     pub skipped_symlink_loops: Vec<String>,
+    pub permission_notices: Vec<TransferNotice>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,23 +89,41 @@ impl UploadDirBatch {
         res.clone().map_err(SshError::Sftp)
     }
 
-    pub async fn finish_file_and_finalize_dirs(&self, id: TransferId, sftp: &SftpSession) {
+    pub async fn finish_file_and_finalize_dirs(
+        &self,
+        id: TransferId,
+        sftp: &SftpSession,
+    ) -> Vec<TransferNotice> {
         let all_done = {
             let mut guard = self.pending_ids.lock().expect("pending_ids mutex poisoned");
             guard.remove(&id);
             guard.is_empty()
         };
         if all_done {
-            self.apply_dir_permissions_bottom_up(sftp).await;
+            self.apply_dir_permissions_bottom_up(sftp).await
+        } else {
+            Vec::new()
         }
     }
 
-    pub async fn apply_dir_permissions_bottom_up(&self, sftp: &SftpSession) {
+    pub async fn apply_dir_permissions_bottom_up(&self, sftp: &SftpSession) -> Vec<TransferNotice> {
+        let mut notices = Vec::new();
         for spec in self.dirs.iter().rev() {
-            if let Some(mode) = spec.permissions {
-                let _ = apply_remote_permissions(sftp, &spec.remote_path, mode).await;
+            if let Some(mode) = spec.permissions
+                && let Err(err) = apply_remote_permissions(sftp, &spec.remote_path, mode).await
+            {
+                warn!(
+                    remote_path = %spec.remote_path,
+                    mode,
+                    error = %err,
+                    "failed preserving remote directory permissions"
+                );
+                notices.push(TransferNotice::PermissionPreserveSkipped {
+                    reason: format!("{}: {err}", spec.remote_path),
+                });
             }
         }
+        notices
     }
 }
 
@@ -120,23 +140,37 @@ impl DownloadDirBatch {
         }
     }
 
-    pub async fn finish_file_and_finalize_dirs(&self, id: TransferId) {
+    pub async fn finish_file_and_finalize_dirs(&self, id: TransferId) -> Vec<TransferNotice> {
         let all_done = {
             let mut guard = self.pending_ids.lock().expect("pending_ids mutex poisoned");
             guard.remove(&id);
             guard.is_empty()
         };
         if all_done {
-            self.apply_dir_permissions_bottom_up().await;
+            self.apply_dir_permissions_bottom_up().await
+        } else {
+            Vec::new()
         }
     }
 
-    pub async fn apply_dir_permissions_bottom_up(&self) {
+    pub async fn apply_dir_permissions_bottom_up(&self) -> Vec<TransferNotice> {
+        let mut notices = Vec::new();
         for (dir_path, permissions) in self.dirs.iter().rev() {
-            if let Some(mode) = permissions {
-                let _ = apply_local_permissions(dir_path, *mode).await;
+            if let Some(mode) = permissions
+                && let Err(err) = apply_local_permissions(dir_path, *mode).await
+            {
+                warn!(
+                    local_path = %dir_path.display(),
+                    mode,
+                    error = %err,
+                    "failed preserving local directory permissions"
+                );
+                notices.push(TransferNotice::PermissionPreserveSkipped {
+                    reason: format!("{}: {err}", dir_path.display()),
+                });
             }
         }
+        notices
     }
 }
 
@@ -171,23 +205,13 @@ pub(crate) async fn apply_remote_permissions(
     sftp: &SftpSession,
     remote_path: &str,
     mode: u32,
-) -> Result<bool, SshError> {
+) -> Result<(), SshError> {
     let attrs = FileAttributes {
         permissions: Some(mode & 0o7777),
         ..Default::default()
     };
-    match sftp.set_metadata(remote_path, attrs).await {
-        Ok(()) => Ok(true),
-        Err(SftpClientError::Status(status))
-            if matches!(
-                status.status_code,
-                StatusCode::OpUnsupported | StatusCode::PermissionDenied | StatusCode::Failure
-            ) =>
-        {
-            Ok(false)
-        }
-        Err(err) => Err(err.into()),
-    }
+    sftp.set_metadata(remote_path, attrs).await?;
+    Ok(())
 }
 
 async fn ensure_remote_dir_exists(sftp: &SftpSession, remote_dir: &str) -> Result<(), SshError> {
@@ -392,6 +416,7 @@ pub(crate) async fn collect_remote_dir_plan(
             if name == "." || name == ".." {
                 continue;
             }
+            crate::sftp::validate_remote_entry_name(&name)?;
             let child_remote = join_remote_path(&curr_remote, &name);
             let child_local = curr_local.join(&name);
 
@@ -526,5 +551,22 @@ fn normalize_posix_path(raw: &str) -> String {
         "/".to_string()
     } else {
         format!("/{}", parts.join("/"))
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn download_dir_batch_emits_permission_preserve_skipped_when_chmod_fails() {
+        let missing = PathBuf::from("/nonexistent_termewnal_perm_test_dir_12345");
+        let batch = DownloadDirBatch::new(vec![(missing, Some(0o755))], &[TransferId(1)]);
+        let notices = batch.finish_file_and_finalize_dirs(TransferId(1)).await;
+        assert_eq!(notices.len(), 1);
+        assert!(matches!(
+            notices[0],
+            TransferNotice::PermissionPreserveSkipped { .. }
+        ));
     }
 }

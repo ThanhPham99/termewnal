@@ -32,7 +32,7 @@ use termewnal_ssh::{
     SftpEndpoint, SftpManager, SshConnectConfig, SshSession, StandaloneTransportSpec,
     SupervisorConfig, TransferId, TransferNotice, TransferQueue, TransferQueueConfig,
     TransferQueueSnapshot, TransportStatus, TunnelManager, TunnelManagerSnapshot, join_remote_path,
-    parent_remote_path, resolve_proxy_jump_hops,
+    parent_remote_path, resolve_proxy_jump_hops, validate_remote_entry_name,
 };
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -415,7 +415,6 @@ pub struct RemoteConnectIntent {
 
 enum SessionEntry {
     Local(LocalSession),
-    Remote(RemoteSession),
     Ssh(SshSessionSlot),
 }
 
@@ -423,7 +422,6 @@ impl SessionEntry {
     fn title(&self) -> &str {
         match self {
             Self::Local(s) => &s.title,
-            Self::Remote(s) => &s.title,
             Self::Ssh(s) => &s.title,
         }
     }
@@ -432,7 +430,6 @@ impl SessionEntry {
         match self {
             Self::Local(s) => Some(s.pty.buffer()),
             Self::Ssh(s) => Some(&s.buffer),
-            Self::Remote(_) => None,
         }
     }
 
@@ -440,28 +437,20 @@ impl SessionEntry {
         match self {
             Self::Local(s) => s.snapshot = Arc::new(s.pty.snapshot()),
             Self::Ssh(s) => s.snapshot = Arc::new(s.buffer.snapshot()),
-            Self::Remote(_) => {}
         }
     }
 
     fn as_local(&self) -> Option<&LocalSession> {
         match self {
             Self::Local(s) => Some(s),
-            Self::Remote(_) | Self::Ssh(_) => None,
-        }
-    }
-
-    fn as_remote(&self) -> Option<&RemoteSession> {
-        match self {
-            Self::Remote(s) => Some(s),
-            Self::Local(_) | Self::Ssh(_) => None,
+            Self::Ssh(_) => None,
         }
     }
 
     fn as_ssh(&self) -> Option<&SshSessionSlot> {
         match self {
             Self::Ssh(s) => Some(s),
-            Self::Local(_) | Self::Remote(_) => None,
+            Self::Local(_) => None,
         }
     }
 }
@@ -712,6 +701,7 @@ pub enum Message {
     TunnelFormDirectionChanged(TunnelDirection),
     TunnelFormNameChanged(String),
     TunnelFormProfileSelected(Option<String>),
+    TunnelFormSessionSelected(SessionId),
     TunnelFormBindHostChanged(String),
     TunnelFormBindPortChanged(String),
     TunnelFormTargetHostChanged(String),
@@ -1047,67 +1037,77 @@ impl AppState {
                 title,
                 auto_connect_on_startup,
             } => {
-                let profile_auto = profile_id
+                let matched_profile = profile_id
                     .as_deref()
                     .and_then(|pid| self.profiles.profiles.iter().find(|p| p.id == pid))
-                    .map(|p| p.auto_connect_on_startup());
-                let effective_auto = profile_auto.unwrap_or(*auto_connect_on_startup);
-                Ok(self.insert_remote_session(
-                    profile_id.clone(),
-                    host.clone(),
-                    *port,
-                    username.clone(),
-                    title.clone(),
-                    effective_auto,
-                ))
+                    .and_then(ssh_target_from_profile);
+
+                let target = if let Some(mut prof_target) = matched_profile {
+                    if let Some(custom_title) =
+                        title.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                    {
+                        prof_target.name = custom_title.to_string();
+                    }
+                    prof_target
+                } else {
+                    let display_name = title
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| match username.as_deref() {
+                            Some(u) if !u.is_empty() => format!("{u}@{host}"),
+                            _ => host.clone(),
+                        });
+                    SshSessionTarget {
+                        profile_id: profile_id.clone(),
+                        name: display_name,
+                        host: host.clone(),
+                        port: *port,
+                        username: username
+                            .as_deref()
+                            .filter(|u| !u.is_empty())
+                            .map(str::to_string)
+                            .unwrap_or_else(default_os_username),
+                        auth: SshAuthMethod::Agent,
+                        proxy_jump: Vec::new(),
+                        auto_connect_on_startup: *auto_connect_on_startup,
+                        tmux_reattach: None,
+                        keepalive_interval_secs: None,
+                        keepalive_max_missed: None,
+                        auto_attach_mux: false,
+                        mux_attach_command: None,
+                    }
+                };
+
+                let auto_connect = target.auto_connect_on_startup;
+                let spec_title = target.name.clone();
+                let (sid, _) = self.insert_ssh_slot_from_target(target, &spec_title);
+                if auto_connect {
+                    self.record_remote_connect_intent(sid);
+                }
+                Ok(sid)
             }
         }
     }
 
-    fn insert_remote_session(
-        &mut self,
-        profile_id: Option<String>,
-        host: String,
-        port: u16,
-        username: Option<String>,
-        title: Option<String>,
-        auto_connect_on_startup: bool,
-    ) -> SessionId {
-        let id = SessionId(self.next_session_id);
-        self.next_session_id += 1;
-        let display_title = title
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or_else(|| match &username {
-                Some(u) if !u.is_empty() => format!("{u}@{host}"),
-                _ => host.clone(),
-            });
-
-        let connect_requested = auto_connect_on_startup;
-        if connect_requested {
+    fn record_remote_connect_intent(&mut self, session_id: SessionId) {
+        let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let already_queued = self
+            .pending_remote_connects
+            .iter()
+            .any(|i| i.session_id == session_id);
+        if !already_queued {
             self.pending_remote_connects.push(RemoteConnectIntent {
-                session_id: id,
-                profile_id: profile_id.clone(),
-                host: host.clone(),
-                port,
-                username: username.clone(),
+                session_id,
+                profile_id: slot.target.profile_id.clone(),
+                host: slot.target.host.clone(),
+                port: slot.target.port,
+                username: (!slot.target.username.is_empty()).then(|| slot.target.username.clone()),
             });
         }
-
-        self.sessions.insert(
-            id,
-            SessionEntry::Remote(RemoteSession {
-                id,
-                profile_id,
-                host,
-                port,
-                username,
-                title: display_title,
-                transport_status: TransportStatus::Disconnected,
-                auto_connect_on_startup,
-                connect_requested,
-            }),
-        );
-        id
     }
 
     /// Wires an active primary [`IpcServerHandle`] so incoming secondary launches drive `AppState`.
@@ -1441,34 +1441,8 @@ impl AppState {
                 }
                 Task::none()
             }
-            ProfileTarget::Ssh {
-                host,
-                port,
-                username,
-                auth,
-                proxy_jump,
-                auto_connect_on_startup,
-                tmux_reattach,
-                keepalive_interval_secs,
-                keepalive_max_missed,
-                auto_attach_mux,
-                mux_attach_command,
-            } => {
-                let target = SshSessionTarget {
-                    profile_id: Some(profile.id.clone()),
-                    name: profile.name.clone(),
-                    host: host.clone(),
-                    port: *port,
-                    username: username.clone(),
-                    auth: auth.clone(),
-                    proxy_jump: proxy_jump.clone(),
-                    auto_connect_on_startup: *auto_connect_on_startup,
-                    tmux_reattach: tmux_reattach.clone(),
-                    keepalive_interval_secs: *keepalive_interval_secs,
-                    keepalive_max_missed: *keepalive_max_missed,
-                    auto_attach_mux: *auto_attach_mux,
-                    mux_attach_command: mux_attach_command.clone(),
-                };
+            ProfileTarget::Ssh { .. } => {
+                let target = ssh_target_from_profile(&profile).expect("matched SSH target");
                 let tab_title = (!profile.name.trim().is_empty()).then(|| profile.name.clone());
                 self.launch_resolved_ssh_target(window_scope, target, &profile.name, tab_title, disposition)
             }
@@ -1493,23 +1467,13 @@ impl AppState {
         Ok(target.to_target_spec_with_hops(title, cols, rows, &self.config, hops))
     }
 
-    fn launch_resolved_ssh_target(
+    fn insert_ssh_slot_from_target(
         &mut self,
-        window_scope: Option<window::Id>,
         target: SshSessionTarget,
         spec_title: &str,
-        tab_title: Option<String>,
-        disposition: LaunchDisposition,
-    ) -> Task<Message> {
+    ) -> (SessionId, Option<String>) {
         match self.build_target_spec(&target, spec_title, 80, 24) {
-            Ok(spec) => {
-                let sid = self.insert_ssh_session_slot(target, spec);
-                if self.open_session_with_disposition(window_scope, sid, tab_title, disposition) {
-                    self.start_ssh_connect(sid)
-                } else {
-                    Task::none()
-                }
-            }
+            Ok(spec) => (self.insert_ssh_session_slot(target, spec), None),
             Err(err) => {
                 warn!(target = %target.name, error = %err, "failed resolving ProxyJump hops");
                 self.last_error = Some(err.clone());
@@ -1522,16 +1486,28 @@ impl AppState {
                 );
                 let sid = self.insert_ssh_session_slot(target, fallback_spec);
                 if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&sid) {
-                    slot.last_error = Some(err);
+                    slot.last_error = Some(err.clone());
                 }
-                let _ = self.open_session_with_disposition(
-                    window_scope,
-                    sid,
-                    tab_title,
-                    disposition,
-                );
-                Task::none()
+                (sid, Some(err))
             }
+        }
+    }
+
+    fn launch_resolved_ssh_target(
+        &mut self,
+        window_scope: Option<window::Id>,
+        target: SshSessionTarget,
+        spec_title: &str,
+        tab_title: Option<String>,
+        disposition: LaunchDisposition,
+    ) -> Task<Message> {
+        let (sid, hop_err) = self.insert_ssh_slot_from_target(target, spec_title);
+        if self.open_session_with_disposition(window_scope, sid, tab_title, disposition)
+            && hop_err.is_none()
+        {
+            self.start_ssh_connect(sid)
+        } else {
+            Task::none()
         }
     }
 
@@ -1709,11 +1685,9 @@ impl AppState {
                     .set_section_collapsed(SidebarSection::ActiveTunnels, false);
                 Task::none()
             }
-            StatusBarAction::ReconnectTunnels => {
-                self.reconnect_all_tunnels();
-                Task::none()
-            }
+            StatusBarAction::ReconnectTunnels => self.reconnect_all_tunnels(),
             StatusBarAction::ToggleTransferDrawer => self.toggle_sftp_drawer(),
+            StatusBarAction::LockVault => self.update(Message::VaultLock),
         }
     }
 
@@ -1734,6 +1708,10 @@ impl AppState {
             PaletteAction::OpenTunnelCreator => {
                 self.command_palette.close();
                 self.update_in_window(window_scope, Message::OpenTunnelCreateModal)
+            }
+            PaletteAction::LockVault => {
+                self.command_palette.close();
+                self.update_in_window(window_scope, Message::VaultLock)
             }
             PaletteAction::ReloadSystemSsh => {
                 self.command_palette.close();
@@ -1818,7 +1796,7 @@ impl AppState {
                 self.sftp_manager.clear_primary_transport(&slot.sftp_key());
                 spawn_ssh_disconnect_after(tunnel_cleanup, slot.supervisor, slot.active);
             }
-            Some(SessionEntry::Remote(_)) | None => {}
+            None => {}
         }
         self.sync_tunnel_telemetry();
     }
@@ -2034,33 +2012,24 @@ impl AppState {
             .cloned();
 
         let spawned = match profile {
-            Some(prof) => match prof.target {
+            Some(prof) => match &prof.target {
                 ProfileTarget::LocalShell {
                     shell,
                     working_dir,
                     args,
                 } => {
-                    let spec = self.resolve_shell_spec(shell.as_deref(), &args);
-                    let valid_cwd = working_dir.filter(|d| d.is_dir());
-                    self.spawn_local_session(spec, valid_cwd, Some(prof.name), Some(prof.id))
+                    let spec = self.resolve_shell_spec(shell.as_deref(), args);
+                    let valid_cwd = working_dir.clone().filter(|d| d.is_dir());
+                    let title = (!prof.name.trim().is_empty()).then(|| prof.name.clone());
+                    self.spawn_local_session(spec, valid_cwd, title, Some(prof.id))
                         .map(|sid| (sid, None))
                 }
-                ProfileTarget::Ssh {
-                    host,
-                    port,
-                    username,
-                    auto_connect_on_startup,
-                    ..
-                } => {
-                    let sid = self.insert_remote_session(
-                        Some(prof.id),
-                        host,
-                        port,
-                        Some(username),
-                        Some(prof.name),
-                        auto_connect_on_startup,
-                    );
-                    Ok((sid, Some(sid)))
+                ProfileTarget::Ssh { .. } => {
+                    let target = ssh_target_from_profile(&prof).expect("matched SSH target");
+                    let auto_connect = target.auto_connect_on_startup;
+                    let (sid, hop_err) = self.insert_ssh_slot_from_target(target, &prof.name);
+                    let connect_sid = (auto_connect && hop_err.is_none()).then_some(sid);
+                    Ok((sid, connect_sid))
                 }
             },
             None => self.spawn_default_local_session().map(|sid| (sid, None)),
@@ -2070,11 +2039,12 @@ impl AppState {
             Ok((session_id, auto_remote)) => {
                 if let Some(ws) = self.target_workspace_mut(target_win) {
                     ws.create_tab(session_id, None);
+                    if let Some(remote_sid) = auto_remote {
+                        self.record_remote_connect_intent(remote_sid);
+                        return self.start_ssh_connect(remote_sid);
+                    }
                 } else {
                     self.remove_session(session_id);
-                }
-                if let Some(remote_sid) = auto_remote {
-                    return Task::done(Message::ConnectRemoteSession(remote_sid));
                 }
             }
             Err(err) => {
@@ -2151,7 +2121,17 @@ impl AppState {
                         && !layout.windows.is_empty()
                         && self.restore_from_layout(&layout).unwrap_or(false)
                     {
-                        let tasks = self.open_pending_windows();
+                        let mut tasks = self.open_pending_windows();
+                        for intent in &self.pending_remote_connects {
+                            if self
+                                .ssh_session(intent.session_id)
+                                .is_some_and(|slot| slot.generation == 0)
+                            {
+                                tasks.push(Task::done(Message::ConnectRemoteSession(
+                                    intent.session_id,
+                                )));
+                            }
+                        }
                         self.lifecycle = DaemonLifecycle::Active;
                         return Task::batch(tasks);
                     }
@@ -2262,7 +2242,7 @@ impl AppState {
                                 ssh_handles.push((slot.supervisor, slot.active));
                             }
                         }
-                        Some(SessionEntry::Remote(_)) | None => {}
+                        None => {}
                     }
                 }
                 spawn_teardown_and_exit(async move {
@@ -2277,23 +2257,8 @@ impl AppState {
                 Task::batch(tasks)
             }
             Message::ConnectRemoteSession(session_id) => {
-                if let Some(SessionEntry::Remote(remote)) = self.sessions.get_mut(&session_id) {
-                    remote.connect_requested = true;
-                    let already_queued = self
-                        .pending_remote_connects
-                        .iter()
-                        .any(|i| i.session_id == session_id);
-                    if !already_queued {
-                        self.pending_remote_connects.push(RemoteConnectIntent {
-                            session_id,
-                            profile_id: remote.profile_id.clone(),
-                            host: remote.host.clone(),
-                            port: remote.port,
-                            username: remote.username.clone(),
-                        });
-                    }
-                }
-                Task::none()
+                self.record_remote_connect_intent(session_id);
+                self.reconnect_ssh_session(session_id)
             }
             Message::SaveWorkspaceLayout => {
                 self.save_layout_best_effort();
@@ -2356,7 +2321,7 @@ impl AppState {
                         }
                         slot.snapshot = Arc::new(slot.buffer.snapshot());
                     }
-                    Some(SessionEntry::Remote(_)) | None => {}
+                    None => {}
                 }
                 Task::none()
             }
@@ -2379,7 +2344,6 @@ impl AppState {
                                 match entry {
                                     SessionEntry::Local(s) => s.title = title,
                                     SessionEntry::Ssh(s) => s.title = title,
-                                    SessionEntry::Remote(_) => {}
                                 }
                             }
                         }
@@ -2395,7 +2359,6 @@ impl AppState {
                                     slot.status_message =
                                         format_ssh_slot_message(&slot.target, &slot.transport_status);
                                 }
-                                SessionEntry::Remote(_) => {}
                             }
                         }
                     }
@@ -2701,10 +2664,7 @@ impl AppState {
                 self.vault.tick_idle();
                 Task::none()
             }
-            Message::NewTab => {
-                let _ = self.open_tab_in_window(window_scope, None);
-                Task::none()
-            }
+            Message::NewTab => self.open_tab_in_window(window_scope, None),
             Message::SelectTab(tab_id) => {
                 if let Some(ws) = self.workspace_for_tab_mut(window_scope, tab_id) {
                     ws.select_tab(tab_id);
@@ -3236,19 +3196,34 @@ impl AppState {
                 let default_session = self
                     .active_session_id()
                     .filter(|sid| self.sessions.get(sid).and_then(SessionEntry::as_ssh).is_some());
-                let default_profile = default_session
-                    .and_then(|sid| self.sessions.get(&sid).and_then(SessionEntry::as_ssh))
-                    .and_then(|slot| slot.target.profile_id.clone())
-                    .or_else(|| {
-                        self.profiles
-                            .profiles
-                            .iter()
-                            .find(|p| matches!(p.target, ProfileTarget::Ssh { .. }))
-                            .map(|p| p.id.clone())
-                    });
+                let default_profile = match default_session {
+                    Some(sid) => self
+                        .sessions
+                        .get(&sid)
+                        .and_then(SessionEntry::as_ssh)
+                        .and_then(|slot| slot.target.profile_id.clone()),
+                    None => self
+                        .profiles
+                        .profiles
+                        .iter()
+                        .find(|p| matches!(p.target, ProfileTarget::Ssh { .. }))
+                        .map(|p| p.id.clone()),
+                };
+                let effective_session = if default_profile.is_some() {
+                    default_session
+                } else {
+                    default_session.or_else(|| {
+                        self.sessions.iter().find_map(|(&sid, entry)| {
+                            entry
+                                .as_ssh()
+                                .filter(|slot| slot.target.profile_id.is_none())
+                                .map(|_| sid)
+                        })
+                    })
+                };
                 self.tunnel_ui
                     .create_form_mut()
-                    .open_for(default_profile, default_session);
+                    .open_for(default_profile, effective_session);
                 operation::focus(tunnel_name_input_id())
             }
             Message::CloseTunnelCreateModal => {
@@ -3275,6 +3250,14 @@ impl AppState {
             Message::TunnelFormProfileSelected(pid) => {
                 let form = self.tunnel_ui.create_form_mut();
                 form.profile_id = pid;
+                form.session_id = None;
+                form.validation_error = None;
+                Task::none()
+            }
+            Message::TunnelFormSessionSelected(sid) => {
+                let form = self.tunnel_ui.create_form_mut();
+                form.profile_id = None;
+                form.session_id = Some(sid);
                 form.validation_error = None;
                 Task::none()
             }
@@ -3321,14 +3304,8 @@ impl AppState {
                 Task::none()
             }
             Message::ToggleTunnel(tunnel_id) => self.toggle_tunnel(&tunnel_id),
-            Message::ReconnectTunnel(tunnel_id) => {
-                self.reconnect_tunnel(&tunnel_id);
-                Task::none()
-            }
-            Message::ReconnectAllTunnels => {
-                self.reconnect_all_tunnels();
-                Task::none()
-            }
+            Message::ReconnectTunnel(tunnel_id) => self.reconnect_tunnel(&tunnel_id),
+            Message::ReconnectAllTunnels => self.reconnect_all_tunnels(),
             Message::TunnelManagerUpdated(_snap) => {
                 self.sync_tunnel_telemetry();
                 Task::none()
@@ -3614,7 +3591,7 @@ impl AppState {
                                         | TransportStatus::Degraded { .. }
                                 ))
                     }
-                    Some(SessionEntry::Remote(_)) | None => true,
+                    None => true,
                 };
                 if skip {
                     continue;
@@ -3649,7 +3626,6 @@ impl AppState {
                     return;
                 }
             }
-            SessionEntry::Remote(_) => return,
         };
         if let Err(err) = write_result {
             error!(session = session_id.0, error = %err, "failed to write terminal input");
@@ -3754,10 +3730,21 @@ impl AppState {
         {
             layers = layers.push(conflict_modal);
         }
-        if let Some(tunnel_modal) = self
-            .tunnel_ui
-            .view_create_modal(&self.profiles.profiles, &palette)
-        {
+        let adhoc_ssh_sessions: Vec<(SessionId, String)> = self
+            .sessions
+            .iter()
+            .filter_map(|(&sid, entry)| {
+                entry
+                    .as_ssh()
+                    .filter(|slot| slot.target.profile_id.is_none())
+                    .map(|slot| (sid, slot.title.clone()))
+            })
+            .collect();
+        if let Some(tunnel_modal) = self.tunnel_ui.view_create_modal(
+            &self.profiles.profiles,
+            &adhoc_ssh_sessions,
+            &palette,
+        ) {
             layers = layers.push(tunnel_modal);
         }
         if let Some(bind_warning) = self.tunnel_ui.view_public_bind_warning(&palette) {
@@ -4042,7 +4029,6 @@ impl AppState {
                 active_match,
                 terminal_focused,
             ),
-            Some(SessionEntry::Remote(remote)) => render_remote_placeholder(remote),
             Some(SessionEntry::Ssh(slot)) => {
                 let viewport = TerminalViewport::with_focus(
                     slot.id,
@@ -4147,11 +4133,6 @@ impl AppState {
                     Some(None) => format!("Termewnal — {} [exited]", session.title),
                     None => format!("Termewnal — {}", session.title),
                 },
-                SessionEntry::Remote(remote) => format!(
-                    "Termewnal — {} [{}]",
-                    remote.title,
-                    remote.transport_status.label()
-                ),
                 SessionEntry::Ssh(slot) => format!(
                     "Termewnal — {} [{}]",
                     slot.title,
@@ -4348,24 +4329,6 @@ impl AppState {
                         broadcast,
                     }
                 }
-                SessionEntry::Remote(remote) => {
-                    let target = match &remote.username {
-                        Some(u) if !u.is_empty() => format!("{u}@{}:{}", remote.host, remote.port),
-                        _ => format!("{}:{}", remote.host, remote.port),
-                    };
-                    SessionStatusHook {
-                        session_id: remote.id,
-                        kind: SessionKindLabel::Ssh,
-                        title: remote.title.clone(),
-                        target,
-                        cols: 80,
-                        rows: 24,
-                        exited: None,
-                        transport_status: remote.transport_status.clone(),
-                        zoomed,
-                        broadcast,
-                    }
-                }
                 SessionEntry::Ssh(slot) => SessionStatusHook {
                     session_id: slot.id,
                     kind: SessionKindLabel::Ssh,
@@ -4386,8 +4349,13 @@ impl AppState {
             transfers: self.status_bar.transfers().clone(),
             sidebar_open: self.sidebar.is_open(),
             transfer_drawer_open: self.status_bar.transfers().drawer_open,
+            vault_unlocked: self.can_lock_vault(),
             last_error: self.last_error.clone(),
         }
+    }
+
+    fn can_lock_vault(&self) -> bool {
+        self.vault.backend() == VaultBackend::EncryptedFile && self.vault.is_unlocked()
     }
 
     /// Builds and fuzzy-filters the Command Palette entries for the current `AppState`.
@@ -4407,15 +4375,6 @@ impl AppState {
                         let target_label = match entry {
                             SessionEntry::Local(s) => {
                                 format!("Local · {}", s.pty.shell().display_name)
-                            }
-                            SessionEntry::Remote(remote) => {
-                                let addr = match &remote.username {
-                                    Some(u) if !u.is_empty() => {
-                                        format!("{u}@{}:{}", remote.host, remote.port)
-                                    }
-                                    _ => format!("{}:{}", remote.host, remote.port),
-                                };
-                                format!("SSH · {addr} ({})", remote.transport_status.label())
                             }
                             SessionEntry::Ssh(slot) => {
                                 format!(
@@ -4440,6 +4399,7 @@ impl AppState {
             &sessions,
             self.sidebar.system_ssh_profiles(),
             self.sidebar.active_tunnels(),
+            self.can_lock_vault(),
         )
     }
 
@@ -4497,9 +4457,26 @@ impl AppState {
         self.sessions.get(&id).and_then(SessionEntry::as_local)
     }
 
-    /// Returns an immutable reference to a restored or pending remote `Session` by `id`.
-    pub fn remote_session(&self, id: SessionId) -> Option<&RemoteSession> {
-        self.sessions.get(&id).and_then(SessionEntry::as_remote)
+    /// Returns a projected remote `Session` descriptor for an SSH `Session` by `id`.
+    pub fn remote_session(&self, id: SessionId) -> Option<RemoteSession> {
+        let slot = self.ssh_session(id)?;
+        let connect_requested = slot.generation > 0
+            || slot.transport_status != TransportStatus::Disconnected
+            || self
+                .pending_remote_connects
+                .iter()
+                .any(|intent| intent.session_id == id);
+        Some(RemoteSession {
+            id: slot.id,
+            profile_id: slot.target.profile_id.clone(),
+            host: slot.target.host.clone(),
+            port: slot.target.port,
+            username: (!slot.target.username.is_empty()).then(|| slot.target.username.clone()),
+            title: slot.title.clone(),
+            transport_status: slot.transport_status.clone(),
+            auto_connect_on_startup: slot.target.auto_connect_on_startup,
+            connect_requested,
+        })
     }
 
     /// Returns an immutable reference to an SSH `Session` slot by `id`.
@@ -4511,15 +4488,9 @@ impl AppState {
     }
 
     fn update_ssh_slot_status(&mut self, session_id: SessionId, status: TransportStatus) {
-        match self.sessions.get_mut(&session_id) {
-            Some(SessionEntry::Ssh(slot)) => {
-                slot.status_message = format_ssh_slot_message(&slot.target, &status);
-                slot.transport_status = status;
-            }
-            Some(SessionEntry::Remote(remote)) => {
-                remote.transport_status = status;
-            }
-            _ => {}
+        if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) {
+            slot.status_message = format_ssh_slot_message(&slot.target, &status);
+            slot.transport_status = status;
         }
     }
 
@@ -4614,14 +4585,6 @@ impl AppState {
                     .current_working_dir()
                     .or_else(|| local.initial_working_dir.clone()),
                 shell: Some(local.pty.shell().program.clone()),
-            },
-            Some(SessionEntry::Remote(remote)) => SessionDescriptor::Remote {
-                profile_id: remote.profile_id.clone(),
-                host: remote.host.clone(),
-                port: remote.port,
-                username: remote.username.clone(),
-                title: Some(remote.title.clone()),
-                auto_connect_on_startup: remote.auto_connect_on_startup,
             },
             Some(SessionEntry::Ssh(slot)) => SessionDescriptor::Remote {
                 profile_id: slot.target.profile_id.clone(),
@@ -4899,6 +4862,9 @@ impl AppState {
             };
             self.sftp_drawer
                 .set_last_transfer_notice(Some(notice.summary()));
+        } else if let Some(perm_notice) = summary.permission_notices.first() {
+            self.sftp_drawer
+                .set_last_transfer_notice(Some(perm_notice.summary()));
         }
     }
 
@@ -4933,6 +4899,10 @@ impl AppState {
     }
 
     fn enqueue_sftp_download(&mut self, remote_path: String, file_name: String) {
+        if let Err(err) = validate_remote_entry_name(&file_name) {
+            self.sftp_drawer.set_browser_error(Some(err.to_string()));
+            return;
+        }
         let Some(session_id) = self.resolve_sftp_session_id() else {
             self.sftp_drawer.set_browser_error(Some(
                 "Connect an SSH Session before downloading files.".to_string(),
@@ -4951,6 +4921,10 @@ impl AppState {
     }
 
     fn enqueue_sftp_download_dir(&mut self, remote_path: String, dir_name: String) -> Task<Message> {
+        if let Err(err) = validate_remote_entry_name(&dir_name) {
+            self.sftp_drawer.set_browser_error(Some(err.to_string()));
+            return Task::none();
+        }
         let Some(session_id) = self.resolve_sftp_session_id() else {
             self.sftp_drawer.set_browser_error(Some(
                 "Connect an SSH Session before downloading folders.".to_string(),
@@ -5116,6 +5090,12 @@ impl AppState {
                 warn!(error = %err, "failed persisting allow_public_bind opt-in");
                 self.last_error = Some(err.to_string());
             }
+        } else {
+            self.tunnel_ui.add_ad_hoc(AdHocTunnelRule {
+                rule: pending.rule.clone(),
+                profile_id: pending.profile_id.clone(),
+                session_id: pending.session_id,
+            });
         }
 
         if pending.start_after_confirm {
@@ -5151,33 +5131,42 @@ impl AppState {
         self.start_tunnel_rule(rule, profile_id, session_id)
     }
 
-    fn reconnect_tunnel(&mut self, tunnel_id: &str) {
+    fn try_reconnect_managed_tunnel(&mut self, tunnel_id: &str) {
+        if let Err(err) = self.tunnel_manager.reconnect_tunnel(tunnel_id) {
+            self.tunnel_ui.set_start_error(tunnel_id, Some(err.to_string()));
+            self.last_error = Some(err.to_string());
+        }
+    }
+
+    fn reconnect_tunnel(&mut self, tunnel_id: &str) -> Task<Message> {
         let snap = self.tunnel_manager.snapshot();
         if let Some(existing) = snap.tunnels.iter().find(|t| t.id == tunnel_id) {
             if matches!(existing.state, termewnal_ssh::TunnelState::Retrying { .. }) {
-                let _ = self.tunnel_manager.reconnect_tunnel(tunnel_id);
-                return;
+                self.try_reconnect_managed_tunnel(tunnel_id);
+                self.sync_tunnel_telemetry();
+                return Task::none();
             }
             if existing.standalone {
                 if existing.state.is_running() {
-                    let _ = self.tunnel_manager.reconnect_tunnel(tunnel_id);
-                    return;
+                    self.try_reconnect_managed_tunnel(tunnel_id);
+                    self.sync_tunnel_telemetry();
+                    return Task::none();
                 }
             } else if let Some(sid) = existing.session_id {
-                let _ = self.reconnect_ssh_session(SessionId(sid));
-                return;
+                return self.reconnect_ssh_session(SessionId(sid));
             }
         }
-        let _ = self.toggle_tunnel(tunnel_id);
+        self.toggle_tunnel(tunnel_id)
     }
 
-    fn reconnect_all_tunnels(&mut self) {
+    fn reconnect_all_tunnels(&mut self) -> Task<Message> {
         let snap = self.tunnel_manager.snapshot();
         let mut sessions_to_reconnect = BTreeSet::new();
+        let mut tasks = Vec::new();
         for t in &snap.tunnels {
             match (&t.state, t.standalone, t.session_id) {
                 (termewnal_ssh::TunnelState::Retrying { .. }, _, _) => {
-                    let _ = self.tunnel_manager.reconnect_tunnel(&t.id);
+                    self.try_reconnect_managed_tunnel(&t.id);
                 }
                 (
                     termewnal_ssh::TunnelState::Starting
@@ -5187,10 +5176,10 @@ impl AppState {
                     true,
                     _,
                 ) => {
-                    let _ = self.tunnel_manager.reconnect_tunnel(&t.id);
+                    self.try_reconnect_managed_tunnel(&t.id);
                 }
                 (termewnal_ssh::TunnelState::Error(_), true, _) => {
-                    let _ = self.toggle_tunnel(&t.id);
+                    tasks.push(self.toggle_tunnel(&t.id));
                 }
                 (
                     termewnal_ssh::TunnelState::Holding
@@ -5205,8 +5194,10 @@ impl AppState {
             }
         }
         for sid in sessions_to_reconnect {
-            let _ = self.reconnect_ssh_session(sid);
+            tasks.push(self.reconnect_ssh_session(sid));
         }
+        self.sync_tunnel_telemetry();
+        Task::batch(tasks)
     }
 
     fn auto_start_session_tunnels(
@@ -5744,39 +5735,38 @@ pub fn shortcut_for_key_event_with_palette(
     shortcut_for_key_event(key, modifiers, active_tab)
 }
 
-fn render_remote_placeholder(
-    remote: &RemoteSession,
-) -> Element<'static, Message, Theme, iced::Renderer> {
-    let target = match &remote.username {
-        Some(user) if !user.is_empty() => format!("{user}@{}:{}", remote.host, remote.port),
-        _ => format!("{}:{}", remote.host, remote.port),
+fn ssh_target_from_profile(profile: &Profile) -> Option<SshSessionTarget> {
+    let ProfileTarget::Ssh {
+        host,
+        port,
+        username,
+        auth,
+        proxy_jump,
+        auto_connect_on_startup,
+        tmux_reattach,
+        keepalive_interval_secs,
+        keepalive_max_missed,
+        auto_attach_mux,
+        mux_attach_command,
+    } = &profile.target
+    else {
+        return None;
     };
-    let status_line = format!("Status: {}", remote.transport_status.label());
-    let mut card = column![
-        text(remote.title.clone()).size(18),
-        text(target).size(14),
-        text(status_line).size(13),
-    ]
-    .spacing(8)
-    .align_x(Alignment::Center);
-
-    if remote.connect_requested {
-        card = card.push(text("Connection requested — awaiting SSH transport wiring").size(12));
-    } else {
-        card = card.push(
-            button(text("Connect").size(14))
-                .padding([6, 16])
-                .style(button::primary)
-                .on_press(Message::ConnectRemoteSession(remote.id)),
-        );
-    }
-
-    container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
+    Some(SshSessionTarget {
+        profile_id: Some(profile.id.clone()),
+        name: profile.name.clone(),
+        host: host.clone(),
+        port: *port,
+        username: username.clone(),
+        auth: auth.clone(),
+        proxy_jump: proxy_jump.clone(),
+        auto_connect_on_startup: *auto_connect_on_startup,
+        tmux_reattach: tmux_reattach.clone(),
+        keepalive_interval_secs: *keepalive_interval_secs,
+        keepalive_max_missed: *keepalive_max_missed,
+        auto_attach_mux: *auto_attach_mux,
+        mux_attach_command: mux_attach_command.clone(),
+    })
 }
 
 fn render_broadcast_banner(banner_text: String) -> Element<'static, Message, Theme, iced::Renderer> {

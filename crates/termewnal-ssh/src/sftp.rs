@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use russh::ChannelMsg;
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::fs::Metadata;
 use russh_sftp::protocol::{FileAttributes, FileType};
@@ -14,7 +13,7 @@ use crate::auth::{
     AgentConnector, BoxFuture, HostKeyDecision, HostKeyPrompt, KeyboardInteractiveChallenge,
     OsAgentConnector, SshInteractionHandler,
 };
-use crate::client::{SshConnectConfig, SshTransport};
+use crate::client::{SshConnectConfig, SshTransport, await_channel_reply};
 use crate::error::SshError;
 
 /// Default maximum SFTP packet length (`256 KiB`).
@@ -47,23 +46,9 @@ pub async fn open_sftp_session(transport: &SshTransport) -> Result<SftpSession, 
         .await
         .map_err(|err| SshError::Sftp(format!("failed requesting SFTP subsystem: {err}")))?;
 
-    loop {
-        match channel.wait().await {
-            Some(ChannelMsg::Success) => break,
-            Some(ChannelMsg::Failure) => {
-                return Err(SshError::Sftp(
-                    "remote SSH server rejected SFTP subsystem request".to_string(),
-                ));
-            }
-            Some(ChannelMsg::WindowAdjusted { .. }) => {}
-            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
-                return Err(SshError::Sftp(
-                    "SSH channel closed while starting SFTP subsystem".to_string(),
-                ));
-            }
-            Some(_) => {}
-        }
-    }
+    await_channel_reply(&mut channel, "SFTP subsystem", |_| {})
+        .await
+        .map_err(|err| SshError::Sftp(err.to_string()))?;
 
     Ok(SftpSession::new_with_config(channel.into_stream(), pipelined_sftp_client_config()).await?)
 }
@@ -771,6 +756,26 @@ fn path_leaf_name(path: &str) -> String {
         .next()
         .unwrap_or(trimmed)
         .to_string()
+}
+
+/// Validates a single remote SFTP entry name so it cannot traverse or escape a local target directory.
+pub fn validate_remote_entry_name(name: &str) -> Result<(), SshError> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains(['/', '\\', '\0'])
+    {
+        return Err(SshError::Sftp(format!(
+            "unsafe remote SFTP entry name {name:?}"
+        )));
+    }
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(std::path::Component::Normal(_)), None) => Ok(()),
+        _ => Err(SshError::Sftp(format!(
+            "unsafe remote SFTP entry name {name:?}"
+        ))),
+    }
 }
 
 /// Joins a remote POSIX directory path and a child file/directory name cleanly.

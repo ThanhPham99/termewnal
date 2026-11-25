@@ -462,10 +462,13 @@ fn restored_remote_sessions_start_disconnected_and_honor_profile_auto_connect_on
     let auto_sid = pair_sessions[1];
     let adhoc_sid = ws.tabs()[1].root.session_ids()[0];
 
-    // Remote sessions must NOT spawn local PTY shells.
+    // Remote sessions must NOT spawn local PTY shells, and MUST create real SessionEntry::Ssh slots.
     assert!(state.session(manual_sid).is_none());
     assert!(state.session(auto_sid).is_none());
     assert!(state.session(adhoc_sid).is_none());
+    assert!(state.ssh_session(manual_sid).is_some());
+    assert!(state.ssh_session(auto_sid).is_some());
+    assert!(state.ssh_session(adhoc_sid).is_some());
 
     // All restored remote sessions start in Disconnected state.
     let manual_remote = state.remote_session(manual_sid).expect("manual remote");
@@ -486,9 +489,96 @@ fn restored_remote_sessions_start_disconnected_and_honor_profile_auto_connect_on
     assert_eq!(state.pending_remote_connects()[0].session_id, auto_sid);
     assert_eq!(state.pending_remote_connects()[0].host, "auto.example.com");
 
-    // Manual trigger requests connection for manual_sid.
-    let _ = state.update(Message::ConnectRemoteSession(manual_sid));
+    // Manual trigger requests connection for manual_sid and fires a real connect_ssh_task.
+    let connect_task = state.update(Message::ConnectRemoteSession(manual_sid));
+    assert!(connect_task.units() >= 1);
     assert!(state.remote_session(manual_sid).unwrap().connect_requested);
+    assert_eq!(
+        state.ssh_session(manual_sid).unwrap().transport_status(),
+        &TransportStatus::Connecting
+    );
     assert_eq!(state.pending_remote_connects().len(), 2);
     assert_eq!(state.pending_remote_connects()[1].session_id, manual_sid);
+
+    // Restored ad-hoc SSH session connects on Enter key without dead stub placeholder.
+    let enter_task = state.update(Message::TerminalInput {
+        session_id: adhoc_sid,
+        bytes: b"\r".to_vec(),
+    });
+    assert!(enter_task.units() >= 1);
+    assert_eq!(
+        state.ssh_session(adhoc_sid).unwrap().transport_status(),
+        &TransportStatus::Connecting
+    );
+}
+
+#[test]
+fn ipc_open_tab_with_ssh_profile_creates_real_ssh_session_and_honors_auto_connect() {
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+
+    let mut p_manual = Profile::ssh(
+        "IPC Manual SSH",
+        "ipc-manual.example.com",
+        2222,
+        "alice",
+        SshAuthMethod::Password {
+            vault_secret_ref: Some("ssh/ipc-manual".to_string()),
+        },
+    );
+    p_manual.id = "ipc-ssh-manual".to_string();
+
+    let mut p_auto = Profile::ssh(
+        "IPC Auto SSH",
+        "ipc-auto.example.com",
+        2223,
+        "deploy",
+        SshAuthMethod::Agent,
+    );
+    p_auto.id = "ipc-ssh-auto".to_string();
+    p_auto.set_auto_connect_on_startup(true);
+
+    let mut profiles = ProfilesConfig::default();
+    profiles.profiles.push(p_manual);
+    profiles.profiles.push(p_auto);
+    save_profiles(&paths, &profiles).expect("save profiles");
+
+    let mut state = super::common::boot_test_app(paths).expect("boot AppState");
+    let w1 = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(w1));
+
+    // IPC OpenTab with auto_connect_on_startup = false creates SessionEntry::Ssh in Disconnected state.
+    let _ = state.update(Message::IpcCommand(IpcCommand::OpenTab {
+        profile_id: Some("ipc-ssh-manual".to_string()),
+    }));
+    let manual_sid = state.active_session_id().expect("manual IPC tab session");
+    assert!(state.session(manual_sid).is_none());
+    let manual_slot = state.ssh_session(manual_sid).expect("real SshSessionSlot");
+    assert_eq!(manual_slot.transport_status(), &TransportStatus::Disconnected);
+    assert_eq!(manual_slot.ssh_generation(), 0);
+    assert_eq!(manual_slot.target().host, "ipc-manual.example.com");
+    assert_eq!(manual_slot.target().port, 2222);
+    drop(state.view(w1));
+
+    // Pressing Enter connects the IPC-opened SSH session.
+    let enter_task = state.update(Message::TerminalInput {
+        session_id: manual_sid,
+        bytes: b"\r".to_vec(),
+    });
+    assert!(enter_task.units() >= 1);
+    assert_eq!(
+        state.ssh_session(manual_sid).unwrap().transport_status(),
+        &TransportStatus::Connecting
+    );
+    assert_eq!(state.ssh_session(manual_sid).unwrap().ssh_generation(), 1);
+
+    // IPC OpenTab with auto_connect_on_startup = true starts Connecting immediately and returns task.
+    let auto_task = state.update(Message::IpcCommand(IpcCommand::OpenTab {
+        profile_id: Some("ipc-ssh-auto".to_string()),
+    }));
+    assert!(auto_task.units() >= 2);
+    let auto_sid = state.active_session_id().expect("auto IPC tab session");
+    let auto_slot = state.ssh_session(auto_sid).expect("real auto SshSessionSlot");
+    assert_eq!(auto_slot.transport_status(), &TransportStatus::Connecting);
+    assert_eq!(auto_slot.ssh_generation(), 1);
 }

@@ -7,10 +7,12 @@ use tempfile::TempDir;
 use termewnal_core::{
     ConfigPaths, EncryptedVault, InMemorySecretStore, OpenSshConfigError, ProfileTarget,
     SecretStore, SshAuthMethod, TabbyCredentialKind, TabbyImportError, TabbyVaultStatus,
-    TunnelDirection, VaultBackend, VaultConfig, VaultSession, clone_openssh_host_to_profile,
-    import_tabby_config_file_into_profiles, load_profiles, load_system_ssh_hosts,
-    parse_openssh_config_file, parse_tabby_config_str, save_cloned_openssh_profile,
+    TunnelDirection, VaultBackend, VaultConfig, VaultError, VaultSession,
+    clone_openssh_host_to_profile, import_tabby_config_file_into_profiles, load_profiles,
+    load_system_ssh_hosts, parse_openssh_config_file, parse_tabby_config_str,
+    save_cloned_openssh_profile,
 };
+use zeroize::Zeroizing;
 
 #[test]
 fn slice1a_parses_openssh_config_with_inheritance_includes_and_strict_readonly_invariant() {
@@ -564,4 +566,82 @@ profiles:
 
     let updated_toml = fs::read_to_string(paths.profiles_file()).expect("read updated profiles.toml");
     assert!(!updated_toml.contains("super-secret-password-99"));
+}
+
+#[test]
+fn slice2c_tabby_importer_preserves_key_passphrase_kind_on_locked_vault_and_propagates_vault_errors() {
+    struct FailingSecretStore;
+
+    impl SecretStore for FailingSecretStore {
+        fn get_secret(&self, _secret_ref: &str) -> Result<Option<Zeroizing<String>>, VaultError> {
+            Err(VaultError::KeyringFailure("dbus unreachable".to_string()))
+        }
+
+        fn set_secret(&self, _secret_ref: &str, _secret: &str) -> Result<(), VaultError> {
+            Err(VaultError::KeyringFailure("dbus unreachable".to_string()))
+        }
+
+        fn delete_secret(&self, _secret_ref: &str) -> Result<bool, VaultError> {
+            Err(VaultError::KeyringFailure("dbus unreachable".to_string()))
+        }
+    }
+
+    let temp = TempDir::new().expect("create temp root");
+    let paths_locked = ConfigPaths::from_root(temp.path().join("locked_vault"));
+
+    // Plaintext passphrase on a public-key profile when EncryptedFile Vault is locked:
+    // must surface TabbyCredentialKind::KeyPassphrase (NOT Password).
+    let yaml_key = r#"
+profiles:
+  - id: p-key-pass
+    type: ssh
+    name: Key Pass Host
+    options:
+      host: keypass.example.com
+      port: 22
+      user: deploy
+      auth: publicKey
+      privateKeys:
+        - ~/.ssh/id_ed25519
+      passphrase: "my-key-passphrase-42"
+"#;
+    let yaml_key_path = temp.path().join("tabby-keypass.yaml");
+    fs::write(&yaml_key_path, yaml_key).unwrap();
+
+    let locked_vault = VaultSession::new(
+        VaultConfig {
+            backend: VaultBackend::EncryptedFile,
+            auto_lock_minutes: 30,
+        },
+        Arc::new(InMemorySecretStore::new()),
+        EncryptedVault::open(paths_locked.vault_file()),
+    );
+
+    let locked_outcome = import_tabby_config_file_into_profiles(
+        &yaml_key_path,
+        &paths_locked,
+        "fallback",
+        Some(&locked_vault),
+    )
+    .expect("locked vault defers passphrase cleanly as missing credential");
+    assert_eq!(locked_outcome.vault_status, TabbyVaultStatus::MissingCredentials);
+    assert_eq!(locked_outcome.missing_credentials.len(), 1);
+    assert_eq!(
+        locked_outcome.missing_credentials[0].kind,
+        TabbyCredentialKind::KeyPassphrase
+    );
+
+    // Non-Locked VaultError (e.g. keyring I/O failure) must propagate instead of being swallowed.
+    let paths_err = ConfigPaths::from_root(temp.path().join("failing_store"));
+    let err = import_tabby_config_file_into_profiles(
+        &yaml_key_path,
+        &paths_err,
+        "fallback",
+        Some(&FailingSecretStore),
+    )
+    .expect_err("non-Locked VaultError must propagate");
+    assert!(
+        matches!(err, TabbyImportError::Vault(VaultError::KeyringFailure(_))),
+        "expected VaultError::KeyringFailure propagation, got {err:?}"
+    );
 }
