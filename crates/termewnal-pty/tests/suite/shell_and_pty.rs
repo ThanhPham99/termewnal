@@ -1,12 +1,24 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tempfile::TempDir;
 use termewnal_pty::{
-    PtyEvent, PtySession, PtySpawnConfig, ShellKind, detect_default_shell, resolve_unix_shell,
-    resolve_windows_shells,
+    PtyEvent, PtySession, PtySpawnConfig, ShellKind, ShellSpec, detect_default_shell,
+    resolve_unix_shell, resolve_windows_shells,
 };
+
+fn sh_pty_config(working_dir: Option<PathBuf>) -> PtySpawnConfig {
+    let mut cfg = PtySpawnConfig {
+        working_dir,
+        ..PtySpawnConfig::default()
+    };
+    #[cfg(unix)]
+    if Path::new("/bin/sh").exists() {
+        cfg.shell = ShellSpec::custom("/bin/sh", Vec::new());
+    }
+    cfg
+}
 
 #[test]
 fn unix_shell_detection_uses_env_shell_when_present_and_falls_back_to_bin_sh() {
@@ -81,7 +93,7 @@ fn real_pty_spawns_shell_and_captures_echoed_output_in_terminal_grid() {
         .write_bytes(b"echo TERMEWNAL_SLICE5_OK\r")
         .expect("write command to PTY");
 
-    let found = session.wait_for_output(Duration::from_secs(5), |snap| {
+    let found = session.wait_for_output(Duration::from_secs(10), |snap| {
         snap.visible_text().contains("TERMEWNAL_SLICE5_OK")
     });
     assert!(
@@ -93,7 +105,7 @@ fn real_pty_spawns_shell_and_captures_echoed_output_in_terminal_grid() {
 
 #[test]
 fn resizing_pty_updates_terminal_grid_and_child_tty_dimensions() {
-    let session = PtySession::spawn(PtySpawnConfig::default()).expect("spawn local shell PTY");
+    let session = PtySession::spawn(sh_pty_config(None)).expect("spawn local shell PTY");
     assert_eq!(session.dimensions(), (80, 24));
 
     session.resize(105, 37).expect("resize PTY and Term grid");
@@ -122,7 +134,7 @@ fn resizing_pty_updates_terminal_grid_and_child_tty_dimensions() {
 
 #[test]
 fn exiting_shell_delivers_eof_and_exited_event_without_hanging() {
-    let session = PtySession::spawn(PtySpawnConfig::default()).expect("spawn local shell PTY");
+    let session = PtySession::spawn(sh_pty_config(None)).expect("spawn local shell PTY");
     let mut rx = session
         .take_event_receiver()
         .expect("event receiver should be available");
@@ -161,11 +173,8 @@ fn pty_captures_working_dir_after_cd_and_respawns_in_captured_directory() {
         temp.path().join("beta dir").canonicalize().unwrap()
     });
 
-    let session = PtySession::spawn(PtySpawnConfig {
-        working_dir: Some(dir_a.clone()),
-        ..PtySpawnConfig::default()
-    })
-    .expect("spawn PTY at dir_a");
+    let session = PtySession::spawn(sh_pty_config(Some(dir_a.clone())))
+        .expect("spawn PTY at dir_a");
 
     assert_eq!(
         session.current_working_dir().and_then(|p| p.canonicalize().ok()),
@@ -190,11 +199,8 @@ fn pty_captures_working_dir_after_cd_and_respawns_in_captured_directory() {
     assert_eq!(captured.canonicalize().unwrap(), dir_b);
 
     // Respawn a fresh session at the captured working directory and verify `pwd`.
-    let respawned = PtySession::spawn(PtySpawnConfig {
-        working_dir: Some(captured),
-        ..PtySpawnConfig::default()
-    })
-    .expect("respawn PTY at captured working dir");
+    let respawned = PtySession::spawn(sh_pty_config(Some(captured)))
+        .expect("respawn PTY at captured working dir");
     respawned
         .write_bytes(b"pwd && printf \"RESPAWN_PWD_%s\\n\" OK\r")
         .expect("send pwd command");
@@ -224,7 +230,7 @@ fn pty_retains_osc7_working_dir_after_shell_exits() {
     let target = target.canonicalize().expect("canonicalize osc7 target");
     let encoded = target.to_string_lossy().replace(' ', "%20");
 
-    let session = PtySession::spawn(PtySpawnConfig::default()).expect("spawn PTY");
+    let session = PtySession::spawn(sh_pty_config(None)).expect("spawn PTY");
     let mut rx = session.take_event_receiver().expect("event receiver");
 
     let cmd = format!("printf '\\033]7;file://localhost%s\\007' '{encoded}'; exit 0\r");

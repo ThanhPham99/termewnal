@@ -10,14 +10,14 @@ use termewnal_core::{
 use termewnal_ssh::TransportStatus;
 use termewnal_ui::ipc::{IpcCommand, LaunchOutcome, acquire_or_forward};
 use termewnal_ui::{
-    AppState, BackgroundWorkStatus, CloseGuardState, DaemonLifecycle, Message, SplitAxis, SplitNode,
+    BackgroundWorkStatus, CloseGuardState, DaemonLifecycle, Message, SplitAxis, SplitNode,
 };
 
 #[test]
 fn close_guard_triggers_only_on_last_window_when_background_work_is_active() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
 
     let w1 = window::Id::unique();
     let w2 = window::Id::unique();
@@ -93,7 +93,7 @@ fn close_guard_triggers_only_on_last_window_when_background_work_is_active() {
 fn close_guard_stop_and_quit_stops_background_work_and_idle_last_window_exits_directly() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
     let w1 = window::Id::unique();
     let _ = state.update(Message::WindowOpened(w1));
 
@@ -118,7 +118,7 @@ fn close_guard_stop_and_quit_stops_background_work_and_idle_last_window_exits_di
     // When idle (no active Standalone Tunnels or Transfers), closing last window skips modal and exits.
     let temp2 = TempDir::new().expect("create second temp XDG root");
     let mut idle_state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp2.path())).expect("boot idle AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp2.path())).expect("boot idle AppState");
     let w2 = window::Id::unique();
     let _ = idle_state.update(Message::WindowOpened(w2));
 
@@ -139,7 +139,7 @@ fn multi_window_ipc_open_window_and_open_tab_share_runtime_with_isolated_workspa
         LaunchOutcome::SecondaryForwarded => panic!("expected primary IPC"),
     };
 
-    let mut state = AppState::boot_with_paths(paths).expect("boot AppState");
+    let mut state = super::common::boot_test_app(paths).expect("boot AppState");
     state.attach_ipc(ipc_handle);
 
     let w1 = window::Id::unique();
@@ -232,7 +232,7 @@ fn restart_restores_tabs_split_geometry_and_respawns_local_sessions_at_captured_
     let dir_a = dir_a.canonicalize().unwrap();
     let dir_b = dir_b.canonicalize().unwrap();
 
-    let mut state = AppState::boot_with_paths(paths.clone()).expect("boot initial AppState");
+    let mut state = super::common::boot_test_app(paths.clone()).expect("boot initial AppState");
     let w1 = window::Id::unique();
     let _ = state.update(Message::WindowOpened(w1));
 
@@ -296,7 +296,7 @@ fn restart_restores_tabs_split_geometry_and_respawns_local_sessions_at_captured_
     drop(state);
 
     // Simulate process restart from saved layout.toml.
-    let mut restored = AppState::boot_with_paths(paths.clone()).expect("restart AppState");
+    let mut restored = super::common::boot_test_app(paths.clone()).expect("restart AppState");
     let rw1 = window::Id::unique();
     let rw2 = window::Id::unique();
     let _ = restored.update(Message::WindowOpened(rw1));
@@ -360,7 +360,7 @@ fn restart_restores_tabs_split_geometry_and_respawns_local_sessions_at_captured_
 
     // Deleting a saved directory must fall back cleanly instead of crashing startup.
     std::fs::remove_dir_all(&dir_b).unwrap();
-    let mut fallback = AppState::boot_with_paths(paths).expect("restart with missing cwd");
+    let mut fallback = super::common::boot_test_app(paths).expect("restart with missing cwd");
     let fw1 = window::Id::unique();
     let _ = fallback.update(Message::WindowOpened(fw1));
     assert_eq!(fallback.window_workspace(fw1).unwrap().tab_count(), 2);
@@ -449,7 +449,7 @@ fn restored_remote_sessions_start_disconnected_and_honor_profile_auto_connect_on
     };
     save_layout(&paths, &layout).expect("save remote layout");
 
-    let mut state = AppState::boot_with_paths(paths).expect("boot with remote layout");
+    let mut state = super::common::boot_test_app(paths).expect("boot with remote layout");
     let w1 = window::Id::unique();
     let _ = state.update(Message::WindowOpened(w1));
 

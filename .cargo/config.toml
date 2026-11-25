@@ -1,0 +1,3 @@
+[alias]
+cw = "check --workspace --all-targets"
+tw = "test --workspace"

@@ -21,7 +21,7 @@ chrono = "0.4"
 data-encoding = "2.3"
 directories = "6.0"
 hmac = "0.13"
-iced = { version = "0.14", features = ["tokio", "advanced", "svg", "image", "sysinfo", "sipper"] }
+iced = { version = "0.14", features = ["tokio", "advanced"] }
 interprocess = { version = "2.4", features = ["tokio"] }
 keyring = "4.2"
 keyring-core = "1.1"
@@ -45,3 +45,27 @@ toml = "1.2"
 tracing = "0.1"
 uuid = { version = "1.29", features = ["v4", "serde"] }
 zeroize = { version = "1.9", features = ["derive"] }
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.dev.package.argon2]
+opt-level = 2
+
+[profile.dev.package.rsa]
+opt-level = 2
+
+[profile.dev.package.aes-gcm]
+opt-level = 2
+
+[profile.dev.package.sha1]
+opt-level = 2
+
+[profile.dev.package.sha2]
+opt-level = 2
+
+[profile.dev.package.hmac]
+opt-level = 2

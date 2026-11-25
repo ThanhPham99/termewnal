@@ -15,7 +15,7 @@ use termewnal_ui::status_bar::{
     SessionKindLabel, StatusBarAction, TransferSummaryHook, TunnelSummaryHook,
 };
 use termewnal_ui::{
-    AppState, LaunchDisposition, Message, SessionId, SplitAxis, TabId, shortcut_for_key_event,
+    LaunchDisposition, Message, SessionId, SplitAxis, TabId, shortcut_for_key_event,
     shortcut_for_key_event_with_palette,
 };
 
@@ -66,7 +66,7 @@ fn ctrl_b_toggles_left_sidebar_and_groups_saved_profiles_by_group_and_tag() {
     let paths = ConfigPaths::from_root(temp.path());
     seed_profiles(&paths);
 
-    let mut state = AppState::boot_with_paths(paths).expect("boot AppState");
+    let mut state = super::common::boot_test_app(paths).expect("boot AppState");
     assert!(!state.sidebar().is_open());
 
     let _ = state.update(Message::ToggleSidebar);
@@ -196,7 +196,7 @@ fn selecting_saved_profile_opens_local_pty_or_ssh_session_slot_in_tab_or_split_p
     cfg.profiles = vec![local_profile, ssh_profile];
     save_profiles(&paths, &cfg).expect("save profiles");
 
-    let mut state = AppState::boot_with_paths(paths).expect("boot AppState");
+    let mut state = super::common::boot_test_app(paths).expect("boot AppState");
     let initial_tab = state.active_tab_id().expect("initial tab");
 
     // Launching a saved local Profile opens a new tab with a live PTY in its configured working_dir.
@@ -318,7 +318,7 @@ fn ctrl_k_and_ctrl_shift_p_open_command_palette_with_fuzzy_search_and_execution(
     let paths = ConfigPaths::from_root(temp.path());
     seed_profiles(&paths);
 
-    let mut state = AppState::boot_with_paths(paths).expect("boot AppState");
+    let mut state = super::common::boot_test_app(paths).expect("boot AppState");
     let initial_session = state.active_session_id().expect("initial session");
     let initial_tab = state.active_tab_id().expect("initial tab");
 
@@ -420,7 +420,7 @@ fn command_palette_quick_connect_parses_targets_and_opens_ssh_session_slot() {
 
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
     let initial_tabs = state.workspace().tab_count();
 
     // Entering Quick Connect mode from the palette and confirming opens an SSH Session slot.
@@ -462,7 +462,7 @@ fn command_palette_quick_connect_parses_targets_and_opens_ssh_session_slot() {
 fn status_bar_reflects_active_session_and_extensible_transport_tunnel_transfer_hooks() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
     let local_sid = state.active_session_id().expect("initial local session");
 
     let initial_snap = state.status_bar_snapshot();
@@ -596,7 +596,7 @@ fn probe_reconnect_all_palette_and_status_bar_handle_degraded_reconnecting_and_m
 
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
 
     // 1. Command Palette offers "Probe / Reconnect All SSH Sessions".
     let _ = state.update(Message::OpenCommandPalette);

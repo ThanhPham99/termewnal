@@ -8,7 +8,7 @@ use termewnal_core::{
     SshAuthMethod, TabbyCredentialKind, TabbyVaultStatus, TunnelDirection, VaultBackend,
     VaultConfig, VaultSession, load_profiles, save_config,
 };
-use termewnal_ui::{AppState, LaunchDisposition, Message};
+use termewnal_ui::{LaunchDisposition, Message};
 
 #[test]
 fn slice3a_sidebar_loads_readonly_ssh_config_launches_sessions_and_clones_profiles() {
@@ -46,7 +46,7 @@ Host *
     let orig_mtime = fs::metadata(&ssh_config_path).unwrap().modified().unwrap();
 
     let paths = ConfigPaths::from_root(temp.path());
-    let mut state = AppState::boot_with_paths(paths.clone()).expect("boot AppState");
+    let mut state = super::common::boot_test_app(paths.clone()).expect("boot AppState");
 
     let aliases: Vec<&str> = state
         .sidebar()
@@ -139,7 +139,7 @@ fn slice3b_command_palette_tabby_importer_migrates_profiles_and_prompts_for_lock
     ));
 
     let mut state =
-        AppState::boot_with_paths_and_vault(paths.clone(), Arc::clone(&vault)).expect("boot AppState");
+        super::common::boot_test_app_with_vault(paths.clone(), Arc::clone(&vault)).expect("boot AppState");
     let win = window::Id::unique();
 
     // 1. Trigger Tabby Importer from Command Palette and close via EscapePressed.
@@ -308,7 +308,7 @@ fn slice3c_locked_encrypted_vault_defers_tabby_secret_and_reload_command_picks_u
     ));
 
     let mut state =
-        AppState::boot_with_paths_and_vault(paths.clone(), Arc::clone(&vault)).expect("boot AppState");
+        super::common::boot_test_app_with_vault(paths.clone(), Arc::clone(&vault)).expect("boot AppState");
 
     let tabby_yaml_path = temp.path().join("tabby-locked-termewnal-vault.yaml");
     fs::write(

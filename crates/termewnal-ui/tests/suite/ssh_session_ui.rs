@@ -19,7 +19,7 @@ use termewnal_ssh::{
     record_known_host_path,
 };
 use termewnal_ui::{
-    AppState, Message, MitmAlert, SshAuthPrompt, SshTargetSpec, SshUiEvent, StatusBarAction,
+    Message, MitmAlert, SshAuthPrompt, SshTargetSpec, SshUiEvent, StatusBarAction,
     drive_ssh_connect,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 #[test]
 fn restored_ssh_sessions_respect_auto_connect_on_startup_and_trigger_on_enter_or_click() {
     let temp = TempDir::new().unwrap();
-    let mut state = AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).unwrap();
+    let mut state = super::common::boot_test_app(ConfigPaths::from_root(temp.path())).unwrap();
     let win = window::Id::unique();
 
     // 1. Default auto_connect_on_startup = false -> restored session stays Disconnected.
@@ -102,7 +102,7 @@ fn restored_ssh_sessions_respect_auto_connect_on_startup_and_trigger_on_enter_or
 #[test]
 fn tofu_prompt_accept_and_reject_resolve_host_key_decisions_and_clear_modal() {
     let temp = TempDir::new().unwrap();
-    let mut state = AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).unwrap();
+    let mut state = super::common::boot_test_app(ConfigPaths::from_root(temp.path())).unwrap();
     let win = window::Id::unique();
 
     let profile = Profile::ssh("TOFU Host", "db.internal", 22, "admin", SshAuthMethod::Agent);
@@ -167,7 +167,7 @@ fn tofu_prompt_accept_and_reject_resolve_host_key_decisions_and_clear_modal() {
 #[test]
 fn mitm_alert_blocks_session_displays_fingerprints_and_can_be_dismissed() {
     let temp = TempDir::new().unwrap();
-    let mut state = AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).unwrap();
+    let mut state = super::common::boot_test_app(ConfigPaths::from_root(temp.path())).unwrap();
     let win = window::Id::unique();
 
     let profile = Profile::ssh("Prod", "prod.example.com", 22, "root", SshAuthMethod::Agent);
@@ -207,7 +207,7 @@ fn mitm_alert_blocks_session_displays_fingerprints_and_can_be_dismissed() {
 #[test]
 fn interactive_2fa_prompt_updates_drafts_submits_answers_and_supports_cancel() {
     let temp = TempDir::new().unwrap();
-    let mut state = AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).unwrap();
+    let mut state = super::common::boot_test_app(ConfigPaths::from_root(temp.path())).unwrap();
     let win = window::Id::unique();
 
     let profile = Profile::ssh(
@@ -419,7 +419,7 @@ async fn end_to_end_app_state_drives_tofu_vault_auth_terminal_io_resize_and_mitm
     ));
     vault.set_secret("ssh/ui-test", "ui-pass").unwrap();
 
-    let mut state = AppState::boot_with_paths_and_vault(paths, Arc::clone(&vault)).unwrap();
+    let mut state = super::common::boot_test_app_with_vault(paths, Arc::clone(&vault)).unwrap();
     let (addr, server_pubkey) = spawn_ui_ssh_server("deploy", "ui-pass").await;
 
     let spec = SshTargetSpec::quick_connect(
@@ -695,7 +695,7 @@ async fn supervised_ui_lifecycle_drives_latency_degraded_cancel_reconnect_scroll
     ));
     vault.set_secret("ssh/sup-ui", "sup-pass").unwrap();
 
-    let mut state = AppState::boot_with_paths_and_vault(paths, Arc::clone(&vault)).unwrap();
+    let mut state = super::common::boot_test_app_with_vault(paths, Arc::clone(&vault)).unwrap();
     let (srv_addr, server_pubkey) = spawn_ui_ssh_server("deploy", "sup-pass").await;
     let proxy = spawn_supervised_ui_proxy(srv_addr).await;
     record_known_host_path("127.0.0.1", proxy.addr.port(), &server_pubkey, &known_hosts).unwrap();

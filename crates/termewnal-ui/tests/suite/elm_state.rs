@@ -38,7 +38,7 @@ fn boot_with_temp_config_initializes_config_files_and_local_shell_session() {
 fn update_routes_terminal_input_and_refreshes_snapshot_on_pty_output() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
     let session_id = state.active_session_id().expect("active Session");
 
     let _ = state.update(Message::TerminalInput {
@@ -68,7 +68,7 @@ fn update_routes_terminal_input_and_refreshes_snapshot_on_pty_output() {
 fn update_viewport_resized_updates_pty_and_session_snapshot_dimensions() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
     let session_id = state.active_session_id().expect("active Session");
 
     let _ = state.update(Message::ViewportResized {
@@ -87,7 +87,7 @@ fn update_viewport_resized_updates_pty_and_session_snapshot_dimensions() {
 fn update_tracks_daemon_windows_and_session_lifecycle_events() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
     let session_id = state.active_session_id().expect("active Session");
     let win = window::Id::unique();
 
@@ -177,7 +177,7 @@ fn key_event_to_bytes_encodes_ascii_utf8_ctrl_and_navigation_keys() {
 fn update_hot_reloads_valid_config_and_profiles_without_interrupting_running_session() {
     let temp = TempDir::new().expect("create temp XDG root");
     let paths = ConfigPaths::from_root(temp.path());
-    let mut state = AppState::boot_with_paths(paths.clone()).expect("boot AppState");
+    let mut state = super::common::boot_test_app(paths.clone()).expect("boot AppState");
     let win = window::Id::unique();
     let session_id = state.active_session_id().expect("active Session");
 
@@ -294,6 +294,10 @@ fn update_vault_unlock_manual_lock_and_idle_auto_lock_tick_manage_session_secret
     let paths = ConfigPaths::from_root(temp.path());
 
     let mut cfg = AppConfig::default();
+    #[cfg(unix)]
+    if std::path::Path::new("/bin/sh").exists() {
+        cfg.terminal.shell = Some("/bin/sh".to_string());
+    }
     cfg.vault = VaultConfig {
         backend: VaultBackend::EncryptedFile,
         auto_lock_minutes: 30,
@@ -364,7 +368,7 @@ fn update_vault_unlock_manual_lock_and_idle_auto_lock_tick_manage_session_secret
 fn update_creates_switches_reorders_and_closes_workspace_tabs_with_real_sessions() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
 
     assert_eq!(state.workspace().tab_count(), 1);
     let tab1 = state.active_tab_id().expect("initial tab");
@@ -404,7 +408,7 @@ fn update_creates_switches_reorders_and_closes_workspace_tabs_with_real_sessions
 fn update_splits_panes_resizes_dividers_moves_focus_and_closes_panes() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
 
     let tab1 = state.active_tab_id().unwrap();
     let p1 = state.workspace().tab(tab1).unwrap().focused_pane;
@@ -469,7 +473,7 @@ fn update_splits_panes_resizes_dividers_moves_focus_and_closes_panes() {
 fn update_toggles_pane_zoom_and_routes_broadcast_input_with_banner_state() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
-        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+        super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
 
     let tab1 = state.active_tab_id().unwrap();
     let s1 = state.active_session_id().unwrap();
