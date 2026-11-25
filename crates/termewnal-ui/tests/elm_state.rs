@@ -420,12 +420,18 @@ fn workspace_shortcuts_map_cleanly_without_hijacking_terminal_keys() {
         Some(Message::MoveFocus(FocusDirection::Right))
     ));
 
-    // Regular shell control keys and reserved shortcuts (Ctrl+B, Ctrl+K, Ctrl+F, Ctrl+Shift+E)
-    // must NOT be hijacked by Ticket 02 workspace shortcuts.
+    // Regular shell control keys and reserved shortcuts (Ctrl+F, Ctrl+Shift+E)
+    // must NOT be hijacked by workspace shortcuts; Ctrl+B toggles Sidebar and Ctrl+K opens Command Palette.
     assert!(shortcut_for_key_event(&Key::Character("c".into()), Modifiers::CTRL, tab).is_none());
     assert!(shortcut_for_key_event(&Key::Character("d".into()), Modifiers::CTRL, tab).is_none());
-    assert!(shortcut_for_key_event(&Key::Character("b".into()), Modifiers::CTRL, tab).is_none());
+    assert!(matches!(
+        shortcut_for_key_event(&Key::Character("b".into()), Modifiers::CTRL, tab),
+        Some(Message::ToggleSidebar)
+    ));
     assert!(shortcut_for_key_event(&Key::Character("f".into()), Modifiers::CTRL, tab).is_none());
-    assert!(shortcut_for_key_event(&Key::Character("k".into()), Modifiers::CTRL, tab).is_none());
+    assert!(matches!(
+        shortcut_for_key_event(&Key::Character("k".into()), Modifiers::CTRL, tab),
+        Some(Message::ToggleCommandPalette)
+    ));
     assert!(shortcut_for_key_event(&Key::Character("E".into()), ctrl_shift, tab).is_none());
 }

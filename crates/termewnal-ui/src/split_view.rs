@@ -8,7 +8,7 @@ use iced::{
     Vector, keyboard, mouse,
 };
 
-use crate::app::{Message, shortcut_for_key_event};
+use crate::app::{Message, shortcut_for_key_event_with_palette};
 use crate::workspace::{MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, PaneId, SplitAxis, SplitId, TabId};
 
 const DIVIDER_THICKNESS: f32 = 4.0;
@@ -572,6 +572,7 @@ impl Widget<Message, Theme, iced::Renderer> for PaneFrame<'_> {
 /// Top-level wrapper intercepting workspace keyboard shortcuts before terminal panes consume them.
 pub struct ShortcutInterceptor<'a> {
     active_tab: Option<TabId>,
+    palette_open: bool,
     content: Element<'a, Message, Theme, iced::Renderer>,
 }
 
@@ -581,8 +582,18 @@ impl<'a> ShortcutInterceptor<'a> {
         content: Element<'a, Message, Theme, iced::Renderer>,
         active_tab: Option<TabId>,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
+        Self::with_palette(content, active_tab, false)
+    }
+
+    /// Wraps `content` with Command Palette modal keyboard navigation awareness.
+    pub fn with_palette(
+        content: Element<'a, Message, Theme, iced::Renderer>,
+        active_tab: Option<TabId>,
+        palette_open: bool,
+    ) -> Element<'a, Message, Theme, iced::Renderer> {
         Element::new(Self {
             active_tab,
+            palette_open,
             content,
         })
     }
@@ -636,13 +647,146 @@ impl Widget<Message, Theme, iced::Renderer> for ShortcutInterceptor<'_> {
         viewport: &Rectangle,
     ) {
         if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
-            && let Some(msg) = shortcut_for_key_event(key, *modifiers, self.active_tab)
+            && let Some(msg) =
+                shortcut_for_key_event_with_palette(key, *modifiers, self.active_tab, self.palette_open)
         {
             shell.publish(msg);
             shell.capture_event();
             return;
         }
 
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        )
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content.as_widget().draw(
+            &tree.children[0],
+            renderer,
+            theme,
+            style,
+            layout,
+            cursor,
+            viewport,
+        );
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+        self.content.as_widget_mut().overlay(
+            &mut tree.children[0],
+            layout,
+            renderer,
+            viewport,
+            translation,
+        )
+    }
+}
+
+/// Wrapper that skips forwarding already-captured events (e.g. from sidebar text inputs) to inner panes.
+pub struct CapturedEventGate<'a> {
+    content: Element<'a, Message, Theme, iced::Renderer>,
+}
+
+impl<'a> CapturedEventGate<'a> {
+    /// Wraps `content` so events already captured by sibling controls are not re-processed.
+    pub fn new(
+        content: Element<'a, Message, Theme, iced::Renderer>,
+    ) -> Element<'a, Message, Theme, iced::Renderer> {
+        Element::new(Self { content })
+    }
+}
+
+impl Widget<Message, Theme, iced::Renderer> for CapturedEventGate<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Fill)
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if shell.is_event_captured() {
+            return;
+        }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
