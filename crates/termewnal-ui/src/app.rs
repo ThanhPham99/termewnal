@@ -2,28 +2,35 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use iced::futures::{SinkExt, Stream};
-use iced::keyboard::{Key, Modifiers, key::Named};
-use iced::widget::{button, column, container, operation, row, scrollable, space, stack, text};
+use iced::keyboard::{self, Key, Modifiers, key::Named};
+use iced::widget::{
+    button, column, container, operation, row, scrollable, space, stack, text,
+};
 use iced::{
-    Alignment, Background, Border, Color, Element, Length, Size, Subscription, Task, Theme,
-    window,
+    Alignment, Background, Border, Color, Element, Event, Length, Size, Subscription, Task, Theme,
+    clipboard, event, window,
 };
 use termewnal_core::{
-    AppConfig, ConfigPaths, Profile, ProfileTarget, ProfilesConfig, SshAuthMethod,
-    ensure_config_files,
+    AppConfig, ConfigFileKind, ConfigPaths, ConfigWatchEvent, ConfigWatcher, Profile,
+    ProfileTarget, ProfilesConfig, SshAuthMethod, TerminalConfig, ThemePalette, TomlReloadError,
+    VaultBackend, VaultSession, ensure_config_files,
 };
 use termewnal_pty::{
-    PtyEvent, PtySession, PtySpawnConfig, ShellSpec, TerminalSnapshot, detect_default_shell,
+    GridSearchMatch, PtyEvent, PtySession, PtySpawnConfig, Scroll, SelectionType, ShellSpec, Side,
+    TerminalSnapshot, detect_default_shell,
 };
 use termewnal_ssh::TransportStatus;
 use tracing::error;
+use zeroize::Zeroize;
 
 use crate::command_palette::{
     CommandPaletteMode, CommandPaletteState, PaletteAction, PaletteItem, PaletteSessionEntry,
     QuickConnectTarget, command_palette_input_id, quick_connect_input_id, render_command_palette,
 };
+use crate::config_reload_ui::ConfigReloadUiState;
 use crate::sidebar::{
     ActiveTunnelEntry, SidebarSection, SidebarState, SystemSshProfile, render_sidebar,
 };
@@ -32,11 +39,19 @@ use crate::status_bar::{
     SessionKindLabel, SessionStatusHook, StatusBarAction, StatusBarSnapshot, StatusBarState,
     TransferSummaryHook, TunnelSummaryHook, render_status_bar,
 };
-use crate::terminal_widget::TerminalViewport;
+use crate::terminal_ergonomics::{
+    FileDropAction, PendingPaste, SearchBarState, classify_file_drop, cursor_style_to_shape,
+    format_paste_bytes, iced_theme_from_name, is_multiline_paste, open_url_with_system,
+    paste_confirm_modal_view, read_clipboard_via_arboard, search_bar_view, search_input_id,
+};
+use crate::terminal_widget::{TerminalViewOptions, TerminalViewport};
 use crate::workspace::{
     ClosePaneOutcome, CycleDirection, FocusDirection, PaneId, SplitAxis, SplitId, SplitNode,
     TabId, Workspace, WorkspaceTab,
 };
+
+/// Injectable OS URL-launcher boundary (`open::that_detached` by default).
+pub type UrlOpener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// Unique identifier for a runtime terminal `Session`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -182,6 +197,20 @@ impl SessionRecord {
             Self::Ssh(_) => None,
         }
     }
+
+    fn as_local(&self) -> Option<&LocalSession> {
+        match self {
+            Self::Local(s) => Some(s),
+            Self::Ssh(_) => None,
+        }
+    }
+
+    fn as_local_mut(&mut self) -> Option<&mut LocalSession> {
+        match self {
+            Self::Local(s) => Some(s),
+            Self::Ssh(_) => None,
+        }
+    }
 }
 
 /// Top-level Elm messages driving `AppState`.
@@ -203,6 +232,66 @@ pub enum Message {
         session_id: SessionId,
         event: PtyEvent,
     },
+    ApplyTerminalConfig(TerminalConfig),
+    OpenSearch,
+    CloseSearch,
+    SearchQueryChanged(String),
+    SearchNext,
+    SearchPrev,
+    EscapePressed,
+    TerminalFocused,
+    ScrollViewport {
+        session_id: SessionId,
+        delta_lines: i32,
+    },
+    ScrollToTop(SessionId),
+    ScrollToBottom(SessionId),
+    SelectionStart {
+        session_id: SessionId,
+        col: usize,
+        row: usize,
+        side: Side,
+        selection_type: SelectionType,
+    },
+    SelectionUpdate {
+        session_id: SessionId,
+        col: usize,
+        row: usize,
+        side: Side,
+    },
+    SelectionFinish {
+        session_id: SessionId,
+    },
+    CopySelection {
+        session_id: SessionId,
+    },
+    PasteFromClipboard {
+        session_id: SessionId,
+    },
+    PasteText {
+        session_id: SessionId,
+        text: String,
+    },
+    ConfirmPendingPaste,
+    CancelPendingPaste,
+    OpenUrl(String),
+    FileDropped {
+        session_id: SessionId,
+        path: PathBuf,
+        shift_held: bool,
+    },
+    ImeCommitted {
+        session_id: SessionId,
+        text: String,
+    },
+    ConfigFilesChanged(Vec<ConfigFileKind>),
+    RestoreConfigBackup(ConfigFileKind),
+    DismissReloadToast(ConfigFileKind),
+    VaultUnlockInputChanged(String),
+    VaultUnlockSubmitted(String),
+    VaultInitializeSubmitted(String),
+    VaultLock,
+    VaultAutoLockTick,
     NewTab,
     SelectTab(TabId),
     CycleTab(CycleDirection),
@@ -278,6 +367,8 @@ pub struct AppState {
     paths: ConfigPaths,
     config: AppConfig,
     profiles: ProfilesConfig,
+    vault: Arc<VaultSession>,
+    reload_ui: ConfigReloadUiState,
     windows: BTreeSet<window::Id>,
     sessions: BTreeMap<SessionId, SessionRecord>,
     workspace: Workspace,
@@ -286,6 +377,10 @@ pub struct AppState {
     status_bar: StatusBarState,
     next_session_id: u64,
     last_error: Option<String>,
+    search: SearchBarState,
+    pending_paste: Option<PendingPaste>,
+    last_copied: Option<String>,
+    url_opener: UrlOpener,
 }
 
 impl AppState {
@@ -314,11 +409,33 @@ impl AppState {
     pub fn boot_with_paths(paths: ConfigPaths) -> Result<Self, String> {
         let (config, profiles) =
             ensure_config_files(&paths).map_err(|err| format!("failed to load config: {err}"))?;
+        let vault = Arc::new(VaultSession::for_paths(&paths, &config.vault));
+        Self::boot_with_loaded(paths, config, profiles, vault)
+    }
 
+    /// Initializes configuration files under `paths` using an injected [`VaultSession`] (for tests).
+    pub fn boot_with_paths_and_vault(
+        paths: ConfigPaths,
+        vault: Arc<VaultSession>,
+    ) -> Result<Self, String> {
+        let (config, profiles) =
+            ensure_config_files(&paths).map_err(|err| format!("failed to load config: {err}"))?;
+        vault.apply_config(&config.vault);
+        Self::boot_with_loaded(paths, config, profiles, vault)
+    }
+
+    fn boot_with_loaded(
+        paths: ConfigPaths,
+        config: AppConfig,
+        profiles: ProfilesConfig,
+        vault: Arc<VaultSession>,
+    ) -> Result<Self, String> {
         let mut state = Self {
             paths,
             config,
             profiles,
+            vault,
+            reload_ui: ConfigReloadUiState::default(),
             windows: BTreeSet::new(),
             sessions: BTreeMap::new(),
             workspace: Workspace::new(),
@@ -327,11 +444,21 @@ impl AppState {
             status_bar: StatusBarState::new(),
             next_session_id: 1,
             last_error: None,
+            search: SearchBarState::default(),
+            pending_paste: None,
+            last_copied: None,
+            url_opener: Arc::new(open_url_with_system),
         };
 
         let initial_session = state.spawn_default_local_session()?;
         state.workspace.create_tab(initial_session, None);
         Ok(state)
+    }
+
+    /// Overrides the OS URL opener boundary (used by tests to avoid spawning a desktop browser).
+    pub fn with_url_opener(mut self, opener: UrlOpener) -> Self {
+        self.url_opener = opener;
+        self
     }
 
     fn spawn_default_local_session(&mut self) -> Result<SessionId, String> {
@@ -373,6 +500,7 @@ impl AppState {
             cols: 80,
             rows: 24,
             scrollback_lines: self.config.terminal.scrollback_lines,
+            cursor_shape: cursor_style_to_shape(self.config.terminal.cursor_style),
             working_dir,
         };
 
@@ -716,23 +844,7 @@ impl AppState {
                 }
             }
             Message::TerminalInput { session_id, bytes } => {
-                let targets = self.workspace.input_targets_for_session(session_id);
-                let is_broadcast = targets.len() > 1;
-                for target_id in targets {
-                    if let Some(SessionRecord::Local(session)) = self.sessions.get(&target_id) {
-                        if is_broadcast && session.exited.is_some() {
-                            continue;
-                        }
-                        if let Err(err) = session.pty.write_bytes(&bytes) {
-                            error!(
-                                session = target_id.0,
-                                error = %err,
-                                "failed to write PTY input"
-                            );
-                            self.last_error = Some(err.to_string());
-                        }
-                    }
-                }
+                self.dispatch_bytes_with_broadcast(session_id, &bytes);
                 Task::none()
             }
             Message::ViewportResized {
@@ -758,10 +870,18 @@ impl AppState {
                 Task::none()
             }
             Message::PtyEvent { session_id, event } => {
+                let is_active_session = Some(session_id) == self.active_session_id();
                 if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
                     match event {
                         PtyEvent::Output => {
                             session.snapshot = Arc::new(session.pty.snapshot());
+                            if is_active_session
+                                && self.search.open
+                                && !self.search.query.is_empty()
+                            {
+                                let pty = Arc::clone(&session.pty);
+                                self.search.refresh_matches(Some(pty.as_ref()), false);
+                            }
                         }
                         PtyEvent::Title(title) => {
                             if !title.is_empty() {
@@ -775,6 +895,276 @@ impl AppState {
                         }
                     }
                 }
+                Task::none()
+            }
+            Message::ApplyTerminalConfig(cfg) => {
+                self.config.terminal = cfg;
+                self.sync_terminal_options_to_sessions();
+                Task::none()
+            }
+            Message::OpenSearch => {
+                let active_pty = self
+                    .active_session_id()
+                    .and_then(|id| self.sessions.get(&id))
+                    .and_then(SessionRecord::as_local)
+                    .map(|s| s.pty.as_ref());
+                let target = self.search.open(active_pty);
+                self.focus_search_match(target);
+                operation::focus(search_input_id())
+            }
+            Message::CloseSearch => {
+                self.search.close();
+                Task::none()
+            }
+            Message::SearchQueryChanged(query) => {
+                let active_pty = self
+                    .active_session_id()
+                    .and_then(|id| self.sessions.get(&id))
+                    .and_then(SessionRecord::as_local)
+                    .map(|s| s.pty.as_ref());
+                let target = self.search.set_query(query, active_pty);
+                self.focus_search_match(target);
+                Task::none()
+            }
+            Message::SearchNext => {
+                let target = self.search.step_next();
+                self.focus_search_match(target);
+                Task::none()
+            }
+            Message::SearchPrev => {
+                let target = self.search.step_prev();
+                self.focus_search_match(target);
+                Task::none()
+            }
+            Message::EscapePressed => {
+                if self.command_palette.is_open() {
+                    self.command_palette.close();
+                    return Task::none();
+                }
+                if self.pending_paste.take().is_some() {
+                    return Task::none();
+                }
+                if self.search.open && self.search.input_focused {
+                    self.search.close();
+                }
+                Task::none()
+            }
+            Message::TerminalFocused => {
+                self.search.input_focused = false;
+                Task::none()
+            }
+            Message::ScrollViewport {
+                session_id,
+                delta_lines,
+            } => {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
+                    session.pty.scroll_display(Scroll::Delta(delta_lines));
+                    session.snapshot = Arc::new(session.pty.snapshot());
+                }
+                Task::none()
+            }
+            Message::ScrollToTop(session_id) => {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
+                    session.pty.scroll_display(Scroll::Top);
+                    session.snapshot = Arc::new(session.pty.snapshot());
+                }
+                Task::none()
+            }
+            Message::ScrollToBottom(session_id) => {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
+                    session.pty.scroll_to_bottom();
+                    session.snapshot = Arc::new(session.pty.snapshot());
+                }
+                Task::none()
+            }
+            Message::SelectionStart {
+                session_id,
+                col,
+                row,
+                side,
+                selection_type,
+            } => {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
+                    session
+                        .pty
+                        .start_selection(col, row, side, selection_type);
+                    session.snapshot = Arc::new(session.pty.snapshot());
+                }
+                Task::none()
+            }
+            Message::SelectionUpdate {
+                session_id,
+                col,
+                row,
+                side,
+            } => {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
+                    session.pty.update_selection(col, row, side);
+                    session.snapshot = Arc::new(session.pty.snapshot());
+                }
+                Task::none()
+            }
+            Message::SelectionFinish { session_id } => {
+                let copied = if let Some(SessionRecord::Local(session)) =
+                    self.sessions.get_mut(&session_id)
+                {
+                    let selected = session.pty.finish_selection();
+                    session.snapshot = Arc::new(session.pty.snapshot());
+                    if self.config.terminal.copy_on_select {
+                        selected
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(text) = copied {
+                    self.copy_text_to_clipboard(text)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::CopySelection { session_id } => {
+                let copied = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(SessionRecord::as_local)
+                    .and_then(|session| session.pty.selection_text());
+                if let Some(text) = copied {
+                    self.copy_text_to_clipboard(text)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::PasteFromClipboard { session_id } => clipboard::read().map(move |opt| {
+                let text = opt.or_else(read_clipboard_via_arboard).unwrap_or_default();
+                Message::PasteText { session_id, text }
+            }),
+            Message::PasteText { session_id, text } => {
+                if text.is_empty() {
+                    return Task::none();
+                }
+                if self.config.terminal.confirm_multiline_paste && is_multiline_paste(&text) {
+                    self.pending_paste = Some(PendingPaste::new(session_id, text));
+                } else {
+                    self.dispatch_paste_to_session(session_id, &text);
+                }
+                Task::none()
+            }
+            Message::ConfirmPendingPaste => {
+                if let Some(pending) = self.pending_paste.take() {
+                    self.dispatch_paste_to_session(pending.session_id, &pending.text);
+                }
+                Task::none()
+            }
+            Message::CancelPendingPaste => {
+                self.pending_paste = None;
+                Task::none()
+            }
+            Message::OpenUrl(url) => {
+                if let Err(err) = (self.url_opener)(&url) {
+                    error!(url = %url, error = %err, "failed to open URL");
+                    self.last_error = Some(err);
+                }
+                Task::none()
+            }
+            Message::FileDropped {
+                session_id,
+                path,
+                shift_held,
+            } => {
+                let action = classify_file_drop(session_id, &path, false, shift_held, false);
+                match action {
+                    FileDropAction::InsertShellPath {
+                        session_id,
+                        escaped_text,
+                    } => {
+                        self.write_bytes_to_session(session_id, escaped_text.as_bytes());
+                    }
+                    FileDropAction::UploadToSftp { .. } => {}
+                }
+                Task::none()
+            }
+            Message::ImeCommitted { session_id, text } => {
+                if !text.is_empty() {
+                    self.dispatch_bytes_with_broadcast(session_id, text.as_bytes());
+                }
+                Task::none()
+            }
+            Message::ConfigFilesChanged(kinds) => {
+                let mut seen = BTreeSet::new();
+                for kind in kinds {
+                    if !seen.insert(kind) {
+                        continue;
+                    }
+                    let res = match kind {
+                        ConfigFileKind::AppConfig => {
+                            let reloaded = self.reload_ui.reload_config(
+                                &self.paths,
+                                &mut self.config,
+                                &self.vault,
+                            );
+                            if matches!(reloaded, Ok(true)) {
+                                self.sync_terminal_options_to_sessions();
+                            }
+                            reloaded
+                        }
+                        ConfigFileKind::Profiles => self
+                            .reload_ui
+                            .reload_profiles(&self.paths, &mut self.profiles),
+                    };
+                    if let Err(err) = res {
+                        error!(file = kind.file_name(), error = %err, "TOML hot-reload failed");
+                        self.last_error = Some(err.to_string());
+                    }
+                }
+                Task::none()
+            }
+            Message::RestoreConfigBackup(kind) => {
+                match self.reload_ui.restore_backup(
+                    &self.paths,
+                    kind,
+                    &mut self.config,
+                    &mut self.profiles,
+                    &self.vault,
+                ) {
+                    Ok(()) => {
+                        self.last_error = None;
+                        if kind == ConfigFileKind::AppConfig {
+                            self.sync_terminal_options_to_sessions();
+                        }
+                    }
+                    Err(err) => {
+                        error!(file = kind.file_name(), error = %err, "failed to restore .bak.1");
+                        self.last_error = Some(err);
+                    }
+                }
+                Task::none()
+            }
+            Message::DismissReloadToast(kind) => {
+                self.reload_ui.dismiss_error(kind);
+                Task::none()
+            }
+            Message::VaultUnlockInputChanged(password) => {
+                self.reload_ui.set_vault_password_draft(password);
+                Task::none()
+            }
+            Message::VaultUnlockSubmitted(password) => {
+                self.apply_vault_password_op(password, VaultSession::unlock);
+                Task::none()
+            }
+            Message::VaultInitializeSubmitted(password) => {
+                self.apply_vault_password_op(password, VaultSession::initialize_encrypted);
+                Task::none()
+            }
+            Message::VaultLock => {
+                self.vault.lock();
+                self.reload_ui.clear_vault_prompt();
+                Task::none()
+            }
+            Message::VaultAutoLockTick => {
+                self.vault.tick_idle();
                 Task::none()
             }
             Message::NewTab => {
@@ -1024,7 +1414,90 @@ impl AppState {
         }
     }
 
-    /// Renders the workspace tab strip, collapsible Left Sidebar, optional Broadcast Input banner, active split panes, Status Bar, and Command Palette modal.
+    fn sync_terminal_options_to_sessions(&mut self) {
+        let shape = cursor_style_to_shape(self.config.terminal.cursor_style);
+        let scrollback = self.config.terminal.scrollback_lines;
+        for record in self.sessions.values_mut() {
+            if let Some(session) = record.as_local_mut() {
+                session.pty.apply_options(scrollback, shape);
+                session.snapshot = Arc::new(session.pty.snapshot());
+            }
+        }
+        if self.search.open && !self.search.query.is_empty() {
+            let active_pty = self
+                .active_session_id()
+                .and_then(|id| self.sessions.get(&id))
+                .and_then(SessionRecord::as_local)
+                .map(|s| s.pty.as_ref());
+            self.search.refresh_matches(active_pty, false);
+        }
+    }
+
+    fn focus_search_match(&mut self, target: Option<GridSearchMatch>) {
+        if let Some(matched) = target
+            && let Some(SessionRecord::Local(session)) = self
+                .active_session_id()
+                .and_then(|id| self.sessions.get_mut(&id))
+        {
+            session.pty.scroll_to_match(matched);
+            session.snapshot = Arc::new(session.pty.snapshot());
+        }
+    }
+
+    fn copy_text_to_clipboard(&mut self, text: String) -> Task<Message> {
+        self.last_copied = Some(text.clone());
+        Task::batch([
+            clipboard::write(text.clone()),
+            clipboard::write_primary(text),
+        ])
+    }
+
+    fn dispatch_paste_to_session(&mut self, session_id: SessionId, text: &str) {
+        let Some(SessionRecord::Local(session)) = self.sessions.get(&session_id) else {
+            return;
+        };
+        let bytes = format_paste_bytes(text, session.pty.is_bracketed_paste());
+        self.write_bytes_to_session(session_id, &bytes);
+    }
+
+    fn dispatch_bytes_with_broadcast(&mut self, session_id: SessionId, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let targets = self.workspace.input_targets_for_session(session_id);
+        let is_broadcast = targets.len() > 1;
+        for target_id in targets {
+            if is_broadcast
+                && self
+                    .sessions
+                    .get(&target_id)
+                    .and_then(SessionRecord::as_local)
+                    .is_some_and(|session| session.exited.is_some())
+            {
+                continue;
+            }
+            self.write_bytes_to_session(target_id, bytes);
+        }
+    }
+
+    fn write_bytes_to_session(&mut self, session_id: SessionId, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+        if let Err(err) = session.pty.write_bytes(bytes) {
+            error!(session = session_id.0, error = %err, "failed to write PTY input");
+            self.last_error = Some(err.to_string());
+        } else if session.pty.display_offset() > 0 {
+            session.pty.scroll_to_bottom();
+            session.snapshot = Arc::new(session.pty.snapshot());
+        }
+    }
+
+    /// Renders the workspace tab strip, collapsible Left Sidebar, status/reload/Vault banners,
+    /// active split panes, Status Bar, Search/Paste overlays, and Command Palette modal.
     pub fn view(&self, _window_id: window::Id) -> Element<'_, Message, Theme, iced::Renderer> {
         let mut main_pane_col = column![self.render_tab_strip()]
             .width(Length::Fill)
@@ -1032,6 +1505,13 @@ impl AppState {
 
         if let Some(banner_text) = self.broadcast_banner_text() {
             main_pane_col = main_pane_col.push(render_broadcast_banner(banner_text));
+        }
+
+        if let Some(toasts) = self.reload_ui.view_reload_toasts() {
+            main_pane_col = main_pane_col.push(toasts);
+        }
+        if let Some(vault_bar) = self.reload_ui.view_vault_banner(&self.vault) {
+            main_pane_col = main_pane_col.push(vault_bar);
         }
 
         let body = match self.workspace.active_tab() {
@@ -1061,21 +1541,27 @@ impl AppState {
         .height(Length::Fill)
         .into();
 
-        let root = if self.command_palette.is_open() {
-            let items = self.command_palette_items();
-            stack![
-                base_layout,
-                render_command_palette(&self.command_palette, items, self.last_error()),
-            ]
+        let palette = ThemePalette::for_name(&self.config.terminal.theme);
+        let mut layers = stack![base_layout]
             .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
-        } else {
-            base_layout
-        };
+            .height(Length::Fill);
+        if self.search.open {
+            layers = layers.push(search_bar_view(&self.search, &palette));
+        }
+        if let Some(pending) = &self.pending_paste {
+            layers = layers.push(paste_confirm_modal_view(pending, &palette));
+        }
+        if self.command_palette.is_open() {
+            let items = self.command_palette_items();
+            layers = layers.push(render_command_palette(
+                &self.command_palette,
+                items,
+                self.last_error(),
+            ));
+        }
 
         ShortcutInterceptor::with_palette(
-            root,
+            layers.into(),
             self.active_tab_id(),
             self.command_palette.is_open(),
         )
@@ -1292,11 +1778,28 @@ impl AppState {
         show_border: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
         let terminal_focused = focused && !self.command_palette.is_open();
+        let ime_enabled = !self.command_palette.is_open()
+            && self.pending_paste.is_none()
+            && !(self.search.open && self.search.input_focused);
+        let options = TerminalViewOptions::from_config(&self.config.terminal, ime_enabled);
+        let is_active_session = Some(session_id) == self.active_session_id();
+        let (matches, active_match): (Arc<[GridSearchMatch]>, Option<usize>) = if is_active_session
+        {
+            (
+                Arc::from(self.search.matches.as_slice()),
+                self.search.active_index,
+            )
+        } else {
+            (Arc::from([]), None)
+        };
+
         let content = match self.sessions.get(&session_id) {
             Some(SessionRecord::Local(session)) => TerminalViewport::with_focus(
                 session.id,
                 Arc::clone(&session.snapshot),
-                self.config.terminal.font_size,
+                options,
+                matches,
+                active_match,
                 terminal_focused,
             ),
             Some(SessionRecord::Ssh(slot)) => render_ssh_session_slot(slot),
@@ -1378,13 +1881,22 @@ impl AppState {
 
     /// Resolves the active `iced::Theme` from configuration.
     pub fn theme(&self, _window_id: window::Id) -> Theme {
-        theme_from_name(&self.config.terminal.theme)
+        iced_theme_from_name(&self.config.terminal.theme)
     }
 
-    /// Subscribes to window lifecycle events and live PTY output streams.
+    /// Subscribes to window lifecycle events, live PTY output streams, config hot-reload, and
+    /// Vault auto-lock ticks.
     pub fn subscription(&self) -> Subscription<Message> {
         let close_requests = window::close_requests().map(Message::CloseRequested);
         let closed = window::close_events().map(Message::WindowClosed);
+        let shortcuts = event::listen_with(window_shortcut_event);
+        let config_watch = Subscription::run_with(
+            ConfigWatchSubKey {
+                config_dir: self.paths.config_dir().to_path_buf(),
+                paths: self.paths.clone(),
+            },
+            config_watch_stream,
+        );
 
         let pty_subs = self.sessions.values().filter_map(|record| match record {
             SessionRecord::Local(session) => Some(Subscription::run_with(
@@ -1397,9 +1909,14 @@ impl AppState {
             SessionRecord::Ssh(_) => None,
         });
 
+        let vault_tick = (self.vault.backend() == VaultBackend::EncryptedFile
+            && self.vault.is_unlocked())
+        .then(|| iced::time::every(Duration::from_secs(15)).map(|_| Message::VaultAutoLockTick));
+
         Subscription::batch(
-            [close_requests, closed]
+            [close_requests, closed, shortcuts, config_watch]
                 .into_iter()
+                .chain(vault_tick)
                 .chain(pty_subs),
         )
     }
@@ -1417,6 +1934,35 @@ impl AppState {
     /// Returns the active [`ProfilesConfig`].
     pub fn profiles(&self) -> &ProfilesConfig {
         &self.profiles
+    }
+
+    /// Returns the process-level [`VaultSession`].
+    pub fn vault(&self) -> &Arc<VaultSession> {
+        &self.vault
+    }
+
+    /// Returns active hot-reload parse-error toasts keyed by file kind.
+    pub fn reload_errors(&self) -> &BTreeMap<ConfigFileKind, TomlReloadError> {
+        self.reload_ui.errors()
+    }
+
+    fn apply_vault_password_op(
+        &mut self,
+        mut password: String,
+        op: impl FnOnce(&VaultSession, &str) -> Result<(), termewnal_core::VaultError>,
+    ) {
+        match op(&self.vault, &password) {
+            Ok(()) => {
+                self.reload_ui.clear_vault_prompt();
+                self.last_error = None;
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                self.reload_ui.set_vault_error(Some(msg.clone()));
+                self.last_error = Some(msg);
+            }
+        }
+        password.zeroize();
     }
 
     /// Returns the workspace tab and split-pane layout state.
@@ -1587,6 +2133,103 @@ impl AppState {
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
+
+    /// Returns the active `Ctrl+F` search bar state.
+    pub fn search(&self) -> &SearchBarState {
+        &self.search
+    }
+
+    /// Returns the pending multi-line paste confirmation payload, if any.
+    pub fn pending_paste(&self) -> Option<&PendingPaste> {
+        self.pending_paste.as_ref()
+    }
+
+    /// Returns the most recent text copied via selection or `Ctrl+Shift+C`.
+    pub fn last_copied_text(&self) -> Option<&str> {
+        self.last_copied.as_deref()
+    }
+}
+
+fn window_shortcut_event(
+    event: Event,
+    status: event::Status,
+    _window_id: window::Id,
+) -> Option<Message> {
+    if status == event::Status::Captured {
+        return None;
+    }
+
+    let Event::Keyboard(keyboard::Event::KeyPressed {
+        key,
+        modified_key,
+        modifiers,
+        ..
+    }) = event
+    else {
+        return None;
+    };
+
+    if modifiers.control()
+        && !modifiers.shift()
+        && !modifiers.alt()
+        && !modifiers.logo()
+        && matches!(
+            (key.as_ref(), modified_key.as_ref()),
+            (Key::Character(s), _) | (_, Key::Character(s)) if s.eq_ignore_ascii_case("f")
+        )
+    {
+        return Some(Message::OpenSearch);
+    }
+
+    match key {
+        Key::Named(Named::Escape) => Some(Message::EscapePressed),
+        Key::Named(Named::F3) => Some(if modifiers.shift() {
+            Message::SearchPrev
+        } else {
+            Message::SearchNext
+        }),
+        _ => None,
+    }
+}
+
+#[derive(Clone)]
+struct ConfigWatchSubKey {
+    config_dir: PathBuf,
+    paths: ConfigPaths,
+}
+
+impl Hash for ConfigWatchSubKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.config_dir.hash(state);
+    }
+}
+
+fn config_watch_stream(
+    key: &ConfigWatchSubKey,
+) -> std::pin::Pin<Box<dyn Stream<Item = Message> + Send>> {
+    let paths = key.paths.clone();
+    Box::pin(iced::stream::channel(16, async move |mut output| {
+        let Ok((watcher, mut rx)) = ConfigWatcher::start(paths) else {
+            return;
+        };
+        let _watcher = watcher;
+        while let Some(event) = rx.recv().await {
+            let msg = match event {
+                ConfigWatchEvent::Changed(kinds) => Message::ConfigFilesChanged(kinds),
+                ConfigWatchEvent::Rescan => Message::ConfigFilesChanged(vec![
+                    ConfigFileKind::AppConfig,
+                    ConfigFileKind::Profiles,
+                ]),
+                ConfigWatchEvent::Error(err) => {
+                    error!(error = %err, "config directory watcher error");
+                    continue;
+                }
+            };
+            if output.send(msg).await.is_err() {
+                break;
+            }
+        }
+    }))
 }
 
 #[derive(Clone)]
@@ -1825,15 +2468,4 @@ fn render_ssh_session_slot(
         .center_y(Length::Fill)
         .padding(20)
         .into()
-}
-
-fn theme_from_name(name: &str) -> Theme {
-    match name.trim().to_ascii_lowercase().as_str() {
-        "light" => Theme::Light,
-        "dracula" => Theme::Dracula,
-        "nord" => Theme::Nord,
-        "tokyo night" | "tokyonight" => Theme::TokyoNight,
-        "catppuccin" | "catppuccin mocha" | "catppuccinmocha" => Theme::CatppuccinMocha,
-        _ => Theme::Dark,
-    }
 }

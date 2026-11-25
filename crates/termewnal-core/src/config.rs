@@ -12,6 +12,7 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const PROFILES_FILE_NAME: &str = "profiles.toml";
+const VAULT_FILE_NAME: &str = "vault.enc";
 
 /// Standard XDG/OS directory locations for Termewnal configuration and runtime state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -75,6 +76,11 @@ impl ConfigPaths {
     pub fn profiles_file(&self) -> PathBuf {
         self.config_dir.join(PROFILES_FILE_NAME)
     }
+
+    /// Path to the optional local encrypted `Vault` file under `data_local_dir()`.
+    pub fn vault_file(&self) -> PathBuf {
+        self.data_local_dir.join(VAULT_FILE_NAME)
+    }
 }
 
 /// Terminal cursor visual shape.
@@ -99,12 +105,22 @@ pub struct TerminalConfig {
     pub font_family: String,
     /// Font size in logical pixels.
     pub font_size: f32,
+    /// Enable OpenType font ligatures during terminal text shaping.
+    #[serde(default)]
+    pub font_ligatures: bool,
     /// Terminal cursor shape.
     pub cursor_style: CursorStyle,
     /// Built-in UI/terminal theme name.
     pub theme: String,
     /// Copy selected terminal text to clipboard automatically.
     pub copy_on_select: bool,
+    /// Prompt for confirmation before pasting text containing newlines.
+    #[serde(default = "default_confirm_multiline_paste")]
+    pub confirm_multiline_paste: bool,
+}
+
+fn default_confirm_multiline_paste() -> bool {
+    true
 }
 
 impl Default for TerminalConfig {
@@ -114,9 +130,11 @@ impl Default for TerminalConfig {
             scrollback_lines: 10_000,
             font_family: "monospace".to_string(),
             font_size: 14.0,
+            font_ligatures: false,
             cursor_style: CursorStyle::Block,
             theme: "Dark".to_string(),
             copy_on_select: false,
+            confirm_multiline_paste: true,
         }
     }
 }
@@ -138,6 +156,36 @@ impl Default for WindowConfig {
     }
 }
 
+/// Secret storage backend preference stored in `config.toml` (contains no secrets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultBackend {
+    /// Store credentials in the native OS keyring (`Secret Service` / `Keychain` / `Credential Manager`).
+    #[default]
+    Keyring,
+    /// Store credentials in a local Argon2id + AES-256-GCM encrypted `Vault` file.
+    EncryptedFile,
+}
+
+/// Non-secret `Vault` preferences stored in `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VaultConfig {
+    /// Active secret storage backend.
+    pub backend: VaultBackend,
+    /// Idle/sleep auto-lock timeout in minutes for the encrypted local `Vault` (`0` disables auto-lock).
+    pub auto_lock_minutes: u64,
+}
+
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            backend: VaultBackend::Keyring,
+            auto_lock_minutes: 30,
+        }
+    }
+}
+
 /// Non-secret application configuration persisted to `config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -145,6 +193,7 @@ pub struct AppConfig {
     pub schema_version: u32,
     pub terminal: TerminalConfig,
     pub window: WindowConfig,
+    pub vault: VaultConfig,
 }
 
 impl Default for AppConfig {
@@ -153,6 +202,7 @@ impl Default for AppConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
             terminal: TerminalConfig::default(),
             window: WindowConfig::default(),
+            vault: VaultConfig::default(),
         }
     }
 }
