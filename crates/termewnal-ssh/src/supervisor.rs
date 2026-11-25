@@ -21,6 +21,7 @@ use crate::TransportStatus;
 use crate::auth::{AgentConnector, BoxFuture, SshInteractionHandler};
 use crate::client::{SshConnectConfig, SshTransport, TcpKeepaliveSettings};
 use crate::error::SshError;
+use crate::proxy_jump::{SshTransportChain, connect_transport_chain};
 
 /// Default timeout (`3s`) for immediate wake / manual fast keepalive probes.
 pub const DEFAULT_WAKE_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -126,9 +127,22 @@ pub trait TransportConnector: Send + Sync {
         config: &'a SshConnectConfig,
         keepalive: Option<TcpKeepaliveSettings>,
     ) -> BoxFuture<'a, Result<SshTransport, SshError>>;
+
+    /// Opens and authenticates an ordered [`SshTransportChain`] (`A -> B -> C`) for `config`.
+    fn connect_chain<'a>(
+        &'a self,
+        config: &'a SshConnectConfig,
+        keepalive: Option<TcpKeepaliveSettings>,
+    ) -> BoxFuture<'a, Result<SshTransportChain, SshError>> {
+        Box::pin(async move {
+            let transport = self.connect(config, keepalive).await?;
+            Ok(SshTransportChain::direct(transport))
+        })
+    }
 }
 
-/// Default direct-TCP [`TransportConnector`] using `Vault`, interactive TOFU/auth callbacks, and Agent.
+/// Default [`TransportConnector`] supporting direct TCP and ordered multi-hop `ProxyJump`
+/// chains with `Vault`, interactive TOFU/auth callbacks, and SSH Agent.
 pub struct DefaultTransportConnector {
     vault: Option<Arc<dyn SecretStore>>,
     interaction: Arc<dyn SshInteractionHandler>,
@@ -158,6 +172,23 @@ impl TransportConnector for DefaultTransportConnector {
     ) -> BoxFuture<'a, Result<SshTransport, SshError>> {
         Box::pin(async move {
             SshTransport::connect_with_keepalive(
+                config,
+                keepalive,
+                self.vault.as_deref(),
+                Arc::clone(&self.interaction),
+                Arc::clone(&self.agent_connector),
+            )
+            .await
+        })
+    }
+
+    fn connect_chain<'a>(
+        &'a self,
+        config: &'a SshConnectConfig,
+        keepalive: Option<TcpKeepaliveSettings>,
+    ) -> BoxFuture<'a, Result<SshTransportChain, SshError>> {
+        Box::pin(async move {
+            connect_transport_chain(
                 config,
                 keepalive,
                 self.vault.as_deref(),
@@ -601,7 +632,7 @@ enum ConnectedExit {
 
 enum ConnectOutcome {
     Connected {
-        transport: Arc<SshTransport>,
+        chain: SshTransportChain,
         rx: russh::ChannelReadHalf,
         tx: russh::ChannelWriteHalf<ClientMsg>,
         initial_output: Vec<u8>,
@@ -611,6 +642,36 @@ enum ConnectOutcome {
     FatalStop(Option<String>),
     CancelledToDisconnected,
     Shutdown,
+}
+
+struct ChainDropGuard(Option<SshTransportChain>);
+
+impl ChainDropGuard {
+    fn chain(&self) -> &SshTransportChain {
+        self.0.as_ref().expect("chain present until taken or torn down")
+    }
+
+    async fn teardown(&mut self) {
+        if let Some(chain) = self.0.take() {
+            chain.teardown_reverse().await;
+        }
+    }
+
+    fn take(&mut self) -> SshTransportChain {
+        self.0.take().expect("chain already taken")
+    }
+}
+
+impl Drop for ChainDropGuard {
+    fn drop(&mut self) {
+        if let Some(chain) = self.0.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                chain.teardown_reverse().await;
+            });
+        }
+    }
 }
 
 enum BackoffWaitOutcome {
@@ -654,16 +715,17 @@ impl SupervisorActor {
 
             match self.attempt_connect_and_open_pty().await {
                 ConnectOutcome::Connected {
-                    transport,
+                    chain,
                     rx,
                     tx,
                     initial_output,
                 } => {
+                    let transport = Arc::clone(chain.target());
                     let is_reconnect = self.has_connected_once;
                     self.has_connected_once = true;
                     self.epoch = self.epoch.wrapping_add(1);
                     self.used_interactive_auth
-                        .store(transport.used_interactive_auth(), Ordering::SeqCst);
+                        .store(chain.used_interactive_auth(), Ordering::SeqCst);
 
                     let mut mux_command_sent = None;
                     if is_reconnect {
@@ -702,7 +764,7 @@ impl SupervisorActor {
                         None,
                     );
 
-                    match self.monitor_connected(transport, rx, tx).await {
+                    match self.monitor_connected(chain, rx, tx).await {
                         ConnectedExit::Drop(reason) => {
                             self.last_error = Some(reason);
                             self.clear_transport();
@@ -822,31 +884,51 @@ impl SupervisorActor {
         let ka = self.config.tcp_keepalive_settings();
         let connector = Arc::clone(&self.connector);
         let connect_fut = async move {
-            let transport = connector.connect(&cfg, ka).await?;
-            let transport = Arc::new(transport);
-            let channel = transport.open_session_channel().await?;
+            let chain = connector.connect_chain(&cfg, ka).await?;
+            let mut guard = ChainDropGuard(Some(chain));
+            let channel = match guard.chain().target().open_session_channel().await {
+                Ok(ch) => ch,
+                Err(err) => {
+                    guard.teardown().await;
+                    return Err(err);
+                }
+            };
             let (mut rx, tx) = channel.split();
             let mut initial_output = Vec::new();
 
-            tx.request_pty(
-                true,
-                &cfg.term_name,
-                u32::from(cfg.cols),
-                u32::from(cfg.rows),
-                0,
-                0,
-                &[],
-            )
-            .await
-            .map_err(|err| SshError::Channel(err.to_string()))?;
-            await_channel_reply(&mut rx, &mut initial_output, "PTY request").await?;
-
-            tx.request_shell(true)
+            if let Err(err) = tx
+                .request_pty(
+                    true,
+                    &cfg.term_name,
+                    u32::from(cfg.cols),
+                    u32::from(cfg.rows),
+                    0,
+                    0,
+                    &[],
+                )
                 .await
-                .map_err(|err| SshError::Channel(err.to_string()))?;
-            await_channel_reply(&mut rx, &mut initial_output, "shell request").await?;
+            {
+                guard.teardown().await;
+                return Err(SshError::Channel(err.to_string()));
+            }
+            if let Err(err) = await_channel_reply(&mut rx, &mut initial_output, "PTY request").await
+            {
+                guard.teardown().await;
+                return Err(err);
+            }
 
-            Ok::<_, SshError>((transport, rx, tx, initial_output))
+            if let Err(err) = tx.request_shell(true).await {
+                guard.teardown().await;
+                return Err(SshError::Channel(err.to_string()));
+            }
+            if let Err(err) =
+                await_channel_reply(&mut rx, &mut initial_output, "shell request").await
+            {
+                guard.teardown().await;
+                return Err(err);
+            }
+
+            Ok::<_, SshError>((guard.take(), rx, tx, initial_output))
         };
         tokio::pin!(connect_fut);
 
@@ -854,8 +936,8 @@ impl SupervisorActor {
             tokio::select! {
                 res = &mut connect_fut => {
                     return match res {
-                        Ok((transport, rx, tx, initial_output)) => ConnectOutcome::Connected {
-                            transport,
+                        Ok((chain, rx, tx, initial_output)) => ConnectOutcome::Connected {
+                            chain,
                             rx,
                             tx,
                             initial_output,
@@ -899,10 +981,11 @@ impl SupervisorActor {
 
     async fn monitor_connected(
         &mut self,
-        transport: Arc<SshTransport>,
+        chain: SshTransportChain,
         mut rx: russh::ChannelReadHalf,
         tx: russh::ChannelWriteHalf<ClientMsg>,
     ) -> ConnectedExit {
+        let transport = Arc::clone(chain.target());
         let mut exit_status: Option<i32> = None;
         let mut missed_probes: u32 = 0;
         let mut last_clock = self.time_source.now();
@@ -912,8 +995,8 @@ impl SupervisorActor {
         let mut probe_in_flight: Option<(bool, Pin<Box<oneshot::Receiver<ProbeOutcome>>>)> =
             Some((
                 false,
-                Box::pin(spawn_probe(
-                    Arc::clone(&transport),
+                Box::pin(spawn_chain_probe(
+                    chain.clone(),
                     self.config.effective_probe_timeout(),
                 )),
             ));
@@ -931,6 +1014,14 @@ impl SupervisorActor {
             let jump_fut = wait_jump_notify(jump_notify.as_ref());
 
             tokio::select! {
+                (hop_idx, hop_host, hop_port) = chain.wait_upstream_closed(), if chain.has_jump_hops() => {
+                    let _ = tokio::time::timeout(Duration::from_millis(150), tx.close()).await;
+                    chain.teardown_reverse().await;
+                    return ConnectedExit::Drop(format!(
+                        "upstream ProxyJump hop #{} ({hop_host}:{hop_port}) disconnected",
+                        hop_idx + 1,
+                    ));
+                }
                 msg = rx.wait() => {
                     match msg {
                         Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
@@ -951,12 +1042,14 @@ impl SupervisorActor {
                             debug!("SSH channel received EOF");
                         }
                         Some(ChannelMsg::Close) | None => {
-                            let _ = tx.close().await;
-                            if exit_status.is_some() && !transport.is_closed() && missed_probes == 0 {
-                                let _ = transport.close().await;
+                            let _ = tokio::time::timeout(Duration::from_millis(150), tx.close()).await;
+                            let clean_exit = exit_status.is_some()
+                                && !chain.any_hop_closed()
+                                && missed_probes == 0;
+                            chain.teardown_reverse().await;
+                            if clean_exit {
                                 return ConnectedExit::CleanShellExit(exit_status);
                             }
-                            let _ = transport.close().await;
                             return ConnectedExit::Drop("SSH transport closed".to_string());
                         }
                         Some(_) => {}
@@ -967,7 +1060,7 @@ impl SupervisorActor {
                         Some(SupervisorCmd::WriteBytes(bytes)) => {
                             if let Err(err) = tx.data_bytes(bytes).await {
                                 warn!(error = %err, "failed writing bytes to SSH channel");
-                                let _ = transport.close().await;
+                                chain.teardown_reverse().await;
                                 return ConnectedExit::Drop(err.to_string());
                             }
                         }
@@ -984,25 +1077,25 @@ impl SupervisorActor {
                         Some(SupervisorCmd::ProbeNow) => {
                             probe_in_flight = Some((
                                 true,
-                                Box::pin(spawn_probe(
-                                    Arc::clone(&transport),
+                                Box::pin(spawn_chain_probe(
+                                    chain.clone(),
                                     self.config.wake_probe_timeout,
                                 )),
                             ));
                         }
                         Some(SupervisorCmd::ReconnectNow) => {
-                            let _ = tx.close().await;
-                            let _ = transport.close().await;
+                            let _ = tokio::time::timeout(Duration::from_millis(150), tx.close()).await;
+                            chain.teardown_reverse().await;
                             return ConnectedExit::Drop("manual reconnect requested".to_string());
                         }
                         Some(SupervisorCmd::CancelReconnect) => {
-                            let _ = tx.close().await;
-                            let _ = transport.close().await;
+                            let _ = tokio::time::timeout(Duration::from_millis(150), tx.close()).await;
+                            chain.teardown_reverse().await;
                             return ConnectedExit::CancelToDisconnected;
                         }
                         Some(SupervisorCmd::Disconnect) | None => {
-                            let _ = tx.close().await;
-                            let _ = transport.close().await;
+                            let _ = tokio::time::timeout(Duration::from_millis(150), tx.close()).await;
+                            chain.teardown_reverse().await;
                             return ConnectedExit::Shutdown;
                         }
                         Some(SupervisorCmd::UpdateKeepalive { interval, max_missed }) => {
@@ -1035,20 +1128,20 @@ impl SupervisorActor {
                             );
                         }
                         ProbeOutcome::Dead(err) => {
-                            let _ = tx.close().await;
-                            let _ = transport.close().await;
+                            let _ = tokio::time::timeout(Duration::from_millis(150), tx.close()).await;
+                            chain.teardown_reverse().await;
                             return ConnectedExit::Drop(err.to_string());
                         }
                         ProbeOutcome::TimedOut => {
                             if is_fast_probe {
-                                let _ = tx.close().await;
-                                let _ = transport.close().await;
+                                let _ = tokio::time::timeout(Duration::from_millis(150), tx.close()).await;
+                                chain.teardown_reverse().await;
                                 return ConnectedExit::Drop("fast keepalive probe timed out".to_string());
                             }
                             missed_probes = missed_probes.saturating_add(1);
                             if missed_probes >= self.config.keepalive_max_missed.max(1) {
-                                let _ = tx.close().await;
-                                let _ = transport.close().await;
+                                let _ = tokio::time::timeout(Duration::from_millis(150), tx.close()).await;
+                                chain.teardown_reverse().await;
                                 return ConnectedExit::Drop(format!(
                                     "keepalive timed out after {missed_probes} missed probes"
                                 ));
@@ -1070,8 +1163,8 @@ impl SupervisorActor {
                         if probe_in_flight.is_none() {
                             probe_in_flight = Some((
                                 false,
-                                Box::pin(spawn_probe(
-                                    Arc::clone(&transport),
+                                Box::pin(spawn_chain_probe(
+                                    chain.clone(),
                                     self.config.effective_probe_timeout(),
                                 )),
                             ));
@@ -1082,10 +1175,10 @@ impl SupervisorActor {
                 }
                 () = wake_sleep => {
                     wake_check_deadline = TokioInstant::now() + wake_check_period(&self.config);
-                    self.maybe_trigger_wake_probe(&transport, &mut last_clock, &mut probe_in_flight);
+                    self.maybe_trigger_wake_probe(&chain, &mut last_clock, &mut probe_in_flight);
                 }
                 () = jump_fut, if jump_notify.is_some() => {
-                    self.maybe_trigger_wake_probe(&transport, &mut last_clock, &mut probe_in_flight);
+                    self.maybe_trigger_wake_probe(&chain, &mut last_clock, &mut probe_in_flight);
                 }
             }
         }
@@ -1093,7 +1186,7 @@ impl SupervisorActor {
 
     fn maybe_trigger_wake_probe(
         &self,
-        transport: &Arc<SshTransport>,
+        chain: &SshTransportChain,
         last_clock: &mut SupervisorInstant,
         probe_in_flight: &mut Option<(bool, Pin<Box<oneshot::Receiver<ProbeOutcome>>>)>,
     ) {
@@ -1103,8 +1196,8 @@ impl SupervisorActor {
         if jumped {
             *probe_in_flight = Some((
                 true,
-                Box::pin(spawn_probe(
-                    Arc::clone(transport),
+                Box::pin(spawn_chain_probe(
+                    chain.clone(),
                     self.config.wake_probe_timeout,
                 )),
             ));
@@ -1243,16 +1336,71 @@ impl SupervisorActor {
     }
 }
 
-fn spawn_probe(
-    transport: Arc<SshTransport>,
+fn spawn_chain_probe(
+    chain: SshTransportChain,
     timeout: Duration,
 ) -> oneshot::Receiver<ProbeOutcome> {
     let (tx, rx) = oneshot::channel();
     tokio::spawn(async move {
-        let outcome = run_probe(&transport, timeout).await;
+        let outcome = run_chain_probe(&chain, timeout).await;
         let _ = tx.send(outcome);
     });
     rx
+}
+
+async fn run_chain_probe(chain: &SshTransportChain, timeout: Duration) -> ProbeOutcome {
+    if let Some(dead_hop) = chain
+        .all_hops_outer_to_inner()
+        .find(|hop| hop.is_closed())
+    {
+        return ProbeOutcome::Dead(SshError::Connection {
+            host: dead_hop.host().to_string(),
+            port: dead_hop.port(),
+            reason: "SSH transport closed".to_string(),
+        });
+    }
+
+    if !chain.has_jump_hops() {
+        return run_probe(chain.target(), timeout).await;
+    }
+
+    let target_idx = chain.hop_count() - 1;
+    let mut set = tokio::task::JoinSet::new();
+    for (idx, hop) in chain.all_hops_outer_to_inner().enumerate() {
+        let hop = Arc::clone(hop);
+        set.spawn(async move { (idx, run_probe(&hop, timeout).await) });
+    }
+
+    let mut timed_out = false;
+    let mut target_rtt_ms = 0;
+    while let Some(joined) = set.join_next().await {
+        match joined {
+            Ok((idx, ProbeOutcome::Alive { rtt_ms })) => {
+                if idx == target_idx {
+                    target_rtt_ms = rtt_ms;
+                }
+            }
+            Ok((_idx, ProbeOutcome::TimedOut)) => {
+                timed_out = true;
+            }
+            Ok((_idx, ProbeOutcome::Dead(err))) => {
+                set.abort_all();
+                return ProbeOutcome::Dead(err);
+            }
+            Err(_) => {
+                set.abort_all();
+                return ProbeOutcome::Dead(SshError::Disconnected);
+            }
+        }
+    }
+
+    if timed_out {
+        ProbeOutcome::TimedOut
+    } else {
+        ProbeOutcome::Alive {
+            rtt_ms: target_rtt_ms,
+        }
+    }
 }
 
 async fn run_probe(transport: &SshTransport, timeout: Duration) -> ProbeOutcome {

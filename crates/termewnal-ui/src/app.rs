@@ -27,11 +27,12 @@ use termewnal_pty::{
     TerminalBuffer, TerminalSnapshot, detect_default_shell,
 };
 use termewnal_ssh::{
-    ConflictResolution, ConnectionSupervisor, DirectoryTransferSummary, OsAgentConnector,
-    ProfileTransportKey, RejectAllInteractionHandler, RemoteListing, SftpEndpoint, SftpManager,
-    SshConnectConfig, SshSession, StandaloneTransportSpec, SupervisorConfig, TransferId,
-    TransferNotice, TransferQueue, TransferQueueConfig, TransferQueueSnapshot, TransportStatus,
-    TunnelManager, TunnelManagerSnapshot, join_remote_path, parent_remote_path,
+    ConflictResolution, ConnectionSupervisor, DirectoryTransferSummary, JumpHopSpec,
+    OsAgentConnector, ProfileTransportKey, RejectAllInteractionHandler, RemoteListing,
+    SftpEndpoint, SftpManager, SshConnectConfig, SshSession, StandaloneTransportSpec,
+    SupervisorConfig, TransferId, TransferNotice, TransferQueue, TransferQueueConfig,
+    TransferQueueSnapshot, TransportStatus, TunnelManager, TunnelManagerSnapshot, join_remote_path,
+    parent_remote_path, resolve_proxy_jump_hops,
 };
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -139,7 +140,12 @@ impl SshSessionTarget {
             port: spec.connect_config.port,
             username: spec.connect_config.username.clone(),
             auth: spec.connect_config.auth.clone(),
-            proxy_jump: Vec::new(),
+            proxy_jump: spec
+                .connect_config
+                .proxy_jump
+                .iter()
+                .map(JumpHopSpec::display_addr)
+                .collect(),
             auto_connect_on_startup: spec.auto_connect_on_startup,
             tmux_reattach: None,
             keepalive_interval_secs: Some(spec.supervisor_config.keepalive_interval.as_secs()),
@@ -149,12 +155,13 @@ impl SshSessionTarget {
         }
     }
 
-    fn to_target_spec(
+    fn to_target_spec_with_hops(
         &self,
         title: &str,
         cols: u16,
         rows: u16,
         app_config: &AppConfig,
+        proxy_jump: Vec<JumpHopSpec>,
     ) -> SshTargetSpec {
         let (ka_secs, ka_max) = self.resolve_keepalive(app_config);
         let mut supervisor_config = SupervisorConfig::from_app_config(app_config);
@@ -171,6 +178,7 @@ impl SshSessionTarget {
                 username: self.username.clone(),
                 auth: self.auth.clone(),
                 known_hosts_path: None,
+                proxy_jump,
                 nodelay: true,
                 term_name: "xterm-256color".to_string(),
                 cols: cols.max(1),
@@ -181,6 +189,18 @@ impl SshSessionTarget {
             agent_connector: Arc::new(OsAgentConnector::default()),
             auto_connect_on_startup: self.auto_connect_on_startup,
         }
+    }
+
+    fn to_target_spec(
+        &self,
+        title: &str,
+        cols: u16,
+        rows: u16,
+        app_config: &AppConfig,
+    ) -> SshTargetSpec {
+        let hops = resolve_proxy_jump_hops(&self.proxy_jump, &[], &[], &self.username, None)
+            .unwrap_or_default();
+        self.to_target_spec_with_hops(title, cols, rows, app_config, hops)
     }
 }
 
@@ -1448,13 +1468,67 @@ impl AppState {
                     mux_attach_command: mux_attach_command.clone(),
                 };
                 let tab_title = (!profile.name.trim().is_empty()).then(|| profile.name.clone());
-                let spec = target.to_target_spec(&profile.name, 80, 24, &self.config);
+                self.launch_resolved_ssh_target(window_scope, target, &profile.name, tab_title, disposition)
+            }
+        }
+    }
+
+    fn build_target_spec(
+        &self,
+        target: &SshSessionTarget,
+        title: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<SshTargetSpec, String> {
+        let hops = resolve_proxy_jump_hops(
+            &target.proxy_jump,
+            &self.profiles.profiles,
+            &self.openssh_hosts,
+            &target.username,
+            None,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(target.to_target_spec_with_hops(title, cols, rows, &self.config, hops))
+    }
+
+    fn launch_resolved_ssh_target(
+        &mut self,
+        window_scope: Option<window::Id>,
+        target: SshSessionTarget,
+        spec_title: &str,
+        tab_title: Option<String>,
+        disposition: LaunchDisposition,
+    ) -> Task<Message> {
+        match self.build_target_spec(&target, spec_title, 80, 24) {
+            Ok(spec) => {
                 let sid = self.insert_ssh_session_slot(target, spec);
                 if self.open_session_with_disposition(window_scope, sid, tab_title, disposition) {
                     self.start_ssh_connect(sid)
                 } else {
                     Task::none()
                 }
+            }
+            Err(err) => {
+                warn!(target = %target.name, error = %err, "failed resolving ProxyJump hops");
+                self.last_error = Some(err.clone());
+                let fallback_spec = target.to_target_spec_with_hops(
+                    spec_title,
+                    80,
+                    24,
+                    &self.config,
+                    Vec::new(),
+                );
+                let sid = self.insert_ssh_session_slot(target, fallback_spec);
+                if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&sid) {
+                    slot.last_error = Some(err);
+                }
+                let _ = self.open_session_with_disposition(
+                    window_scope,
+                    sid,
+                    tab_title,
+                    disposition,
+                );
+                Task::none()
             }
         }
     }
@@ -1581,18 +1655,8 @@ impl AppState {
             auto_attach_mux: false,
             mux_attach_command: None,
         };
-        let spec = target.to_target_spec(&host.alias, 80, 24, &self.config);
-        let sid = self.insert_ssh_session_slot(target, spec);
-        if self.open_session_with_disposition(
-            window_scope,
-            sid,
-            Some(host.alias),
-            disposition,
-        ) {
-            self.start_ssh_connect(sid)
-        } else {
-            Task::none()
-        }
+        let alias = host.alias.clone();
+        self.launch_resolved_ssh_target(window_scope, target, &alias, Some(host.alias), disposition)
     }
 
     fn handle_command_palette_confirm(&mut self, window_scope: Option<window::Id>) -> Task<Message> {
@@ -2762,9 +2826,11 @@ impl AppState {
                 Task::none()
             }
             Message::OpenSshProfile(profile) => {
-                match SshTargetSpec::from_profile_with_config(
+                match SshTargetSpec::from_profile_with_sources(
                     &profile,
                     &self.config,
+                    &self.profiles.profiles,
+                    &self.openssh_hosts,
                     80,
                     24,
                     self.config.terminal.scrollback_lines,
@@ -2780,9 +2846,11 @@ impl AppState {
                 }
             }
             Message::RestoreSshProfile(profile) => {
-                match SshTargetSpec::from_profile_with_config(
+                match SshTargetSpec::from_profile_with_sources(
                     &profile,
                     &self.config,
+                    &self.profiles.profiles,
+                    &self.openssh_hosts,
                     80,
                     24,
                     self.config.terminal.scrollback_lines,
@@ -5245,9 +5313,11 @@ impl AppState {
     ) -> Option<SshTargetSpec> {
         if let Some(pid) = profile_id
             && let Some(profile) = self.profiles.profiles.iter().find(|p| p.id == pid)
-            && let Ok(spec) = SshTargetSpec::from_profile_with_config(
+            && let Ok(spec) = SshTargetSpec::from_profile_with_sources(
                 profile,
                 &self.config,
+                &self.profiles.profiles,
+                &self.openssh_hosts,
                 80,
                 24,
                 self.config.terminal.scrollback_lines,

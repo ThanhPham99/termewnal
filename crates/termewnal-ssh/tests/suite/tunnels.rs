@@ -268,6 +268,7 @@ fn build_connect_config(addr: SocketAddr, known_hosts_path: &Path) -> SshConnect
             vault_secret_ref: None,
         },
         known_hosts_path: Some(known_hosts_path.to_path_buf()),
+        proxy_jump: Vec::new(),
         nodelay: true,
         term_name: "xterm-256color".to_string(),
         cols: 80,
