@@ -5,9 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aes-gcm.workspace = true
+argon2.workspace = true
 directories.workspace = true
+keyring.workspace = true
+keyring-core.workspace = true
+notify.workspace = true
+notify-debouncer-mini.workspace = true
+rand.workspace = true
 serde.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 toml.workspace = true
 uuid.workspace = true
+zeroize.workspace = true

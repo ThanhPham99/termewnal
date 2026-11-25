@@ -5,8 +5,10 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arboard.workspace = true
 iced.workspace = true
 interprocess.workspace = true
+open.workspace = true
 serde.workspace = true
 termewnal-core = { path = "../termewnal-core" }
 termewnal-pty = { path = "../termewnal-pty" }
@@ -15,6 +17,7 @@ thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
