@@ -31,8 +31,9 @@ pub use openssh_config::{
     load_system_ssh_hosts, parse_openssh_config_file, save_cloned_openssh_profile,
 };
 pub use profile::{
-    Profile, ProfileTarget, ProfilesConfig, SshAuthMethod, SshProfileConfig, TunnelDirection,
-    TunnelRule, load_profiles, resolve_mux_attach_command, save_profiles,
+    DEFAULT_TUNNEL_HOLD_GRACE_SECS, Profile, ProfileTarget, ProfilesConfig, SshAuthMethod,
+    SshProfileConfig, TunnelDirection, TunnelRule, is_public_bind_host, load_profiles,
+    resolve_mux_attach_command, save_profiles,
 };
 pub use storage::{MAX_BACKUPS, backup_path};
 pub use tabby_importer::{

@@ -13,6 +13,7 @@ pub mod status_bar;
 pub mod tabby_import_ui;
 pub mod terminal_ergonomics;
 pub mod terminal_widget;
+pub mod tunnel_ui;
 pub mod workspace;
 
 pub use app::{
@@ -56,6 +57,11 @@ pub use terminal_ergonomics::{
 pub use terminal_widget::{
     ImeComposition, ImeUpdate, TerminalPalette, TerminalViewOptions, TerminalViewport,
     ime_cursor_anchor_rect, key_event_to_bytes,
+};
+pub use tunnel_ui::{
+    AdHocTunnelRule, PendingPublicBindWarning, TunnelCreateForm, TunnelUiState,
+    build_active_tunnel_entries, tunnel_bind_host_input_id, tunnel_bind_port_input_id,
+    tunnel_name_input_id, tunnel_target_host_input_id, tunnel_target_port_input_id,
 };
 pub use workspace::{
     ClosePaneOutcome, CycleDirection, DEFAULT_SPLIT_RATIO, FocusDirection, MAX_SPLIT_RATIO,

@@ -78,6 +78,7 @@ pub enum StatusBarAction {
     ReconnectSession(SessionId),
     CancelReconnect(SessionId),
     ToggleTunnelsView,
+    ReconnectTunnels,
     ToggleTransferDrawer,
 }
 
@@ -213,6 +214,7 @@ impl StatusBarSnapshot {
         if self.tunnels.total == 0
             && self.tunnels.active == 0
             && self.tunnels.holding == 0
+            && self.tunnels.reconnecting == 0
             && self.tunnels.error == 0
         {
             return "Tunnels: 0".to_string();
@@ -227,6 +229,12 @@ impl StatusBarSnapshot {
             return format!(
                 "Tunnels: {} active, {} holding",
                 self.tunnels.active, self.tunnels.holding
+            );
+        }
+        if self.tunnels.reconnecting > 0 {
+            return format!(
+                "Tunnels: {} active, {} reconnecting",
+                self.tunnels.active, self.tunnels.reconnecting
             );
         }
         format!("Tunnels: {} active", self.tunnels.active)
@@ -346,13 +354,34 @@ pub fn render_status_bar(
             );
     }
 
+    let tunnel_color = if snapshot.tunnels.error > 0 {
+        Color::from_rgb8(248, 113, 113)
+    } else if snapshot.tunnels.holding > 0 || snapshot.tunnels.reconnecting > 0 {
+        Color::from_rgb8(251, 191, 36)
+    } else if snapshot.tunnels.active > 0 {
+        Color::from_rgb8(74, 222, 128)
+    } else {
+        Color::from_rgb8(203, 213, 225)
+    };
+
+    right = right.push(
+        button(text(snapshot.tunnels_text()).size(11).color(tunnel_color))
+            .padding([2, 7])
+            .style(button::subtle)
+            .on_press(Message::StatusBarAction(StatusBarAction::ToggleTunnelsView)),
+    );
+
+    if snapshot.tunnels.holding > 0 || snapshot.tunnels.reconnecting > 0 || snapshot.tunnels.error > 0
+    {
+        right = right.push(
+            button(text("Reconnect Tunnels").size(11))
+                .padding([2, 6])
+                .style(button::primary)
+                .on_press(Message::StatusBarAction(StatusBarAction::ReconnectTunnels)),
+        );
+    }
+
     right = right
-        .push(
-            button(text(snapshot.tunnels_text()).size(11))
-                .padding([2, 7])
-                .style(button::subtle)
-                .on_press(Message::StatusBarAction(StatusBarAction::ToggleTunnelsView)),
-        )
         .push(
             button(text(snapshot.transfers_text()).size(11))
                 .padding([2, 7])

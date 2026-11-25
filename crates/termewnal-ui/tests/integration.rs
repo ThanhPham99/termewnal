@@ -16,5 +16,7 @@ mod openssh_and_tabby_ui;
 mod sftp_drawer_and_transfers;
 #[path = "suite/ssh_session_ui.rs"]
 mod ssh_session_ui;
+#[path = "suite/tunnels_ui.rs"]
+mod tunnels_ui;
 #[path = "suite/workspace_tree.rs"]
 mod workspace_tree;

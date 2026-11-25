@@ -1,4 +1,6 @@
+use std::net::IpAddr;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -327,6 +329,28 @@ pub enum TunnelDirection {
     Dynamic,
 }
 
+/// Default hold-until-reconnected grace timeout in seconds for Local/Dynamic `Tunnel` clients.
+pub const DEFAULT_TUNNEL_HOLD_GRACE_SECS: u64 = 10;
+
+/// Returns `true` if `bind_host` exposes a `Tunnel` listener beyond loopback (e.g. `0.0.0.0`, `::`, LAN IP).
+pub fn is_public_bind_host(bind_host: &str) -> bool {
+    let trimmed = bind_host.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let unbracketed = trimmed
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(trimmed);
+    if unbracketed.eq_ignore_ascii_case("localhost") {
+        return false;
+    }
+    match unbracketed.parse::<IpAddr>() {
+        Ok(ip) => !ip.is_loopback(),
+        Err(_) => true,
+    }
+}
+
 /// Static port-forwarding `Tunnel` rule saved inside a `Profile`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunnelRule {
@@ -342,6 +366,72 @@ pub struct TunnelRule {
     pub target_port: Option<u16>,
     #[serde(default)]
     pub standalone: bool,
+    #[serde(default)]
+    pub allow_public_bind: bool,
+    #[serde(default)]
+    pub hold_grace_secs: Option<u64>,
+}
+
+impl TunnelRule {
+    /// Creates a new Local (`-L`) `TunnelRule` defaulting to `127.0.0.1` loopback bind.
+    pub fn local(
+        name: impl Into<String>,
+        bind_port: u16,
+        target_host: impl Into<String>,
+        target_port: u16,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            direction: TunnelDirection::Local,
+            bind_host: default_bind_host(),
+            bind_port,
+            target_host: Some(target_host.into()),
+            target_port: Some(target_port),
+            standalone: false,
+            allow_public_bind: false,
+            hold_grace_secs: None,
+        }
+    }
+
+    /// Creates a new Dynamic SOCKS5 (`-D`) `TunnelRule` defaulting to `127.0.0.1` loopback bind.
+    pub fn dynamic_socks5(name: impl Into<String>, bind_port: u16) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            direction: TunnelDirection::Dynamic,
+            bind_host: default_bind_host(),
+            bind_port,
+            target_host: None,
+            target_port: None,
+            standalone: false,
+            allow_public_bind: false,
+            hold_grace_secs: None,
+        }
+    }
+
+    /// Returns the normalized local bind host, falling back to `127.0.0.1` when blank.
+    pub fn effective_bind_host(&self) -> &str {
+        let trimmed = self.bind_host.trim();
+        if trimmed.is_empty() {
+            "127.0.0.1"
+        } else {
+            trimmed
+        }
+    }
+
+    /// Returns the hold-until-reconnected grace [`Duration`], defaulting to `10s`.
+    pub fn effective_hold_grace(&self) -> Duration {
+        Duration::from_secs(
+            self.hold_grace_secs
+                .unwrap_or(DEFAULT_TUNNEL_HOLD_GRACE_SECS),
+        )
+    }
+
+    /// Returns `true` when binding this rule would expose a non-loopback address without opt-in.
+    pub fn requires_public_bind_opt_in(&self) -> bool {
+        !self.allow_public_bind && is_public_bind_host(self.effective_bind_host())
+    }
 }
 
 fn default_bind_host() -> String {
