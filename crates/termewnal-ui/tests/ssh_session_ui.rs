@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -8,19 +9,22 @@ use russh::keys::{Algorithm, PrivateKey, PublicKey};
 use russh::{Channel, ChannelId, MethodKind, MethodSet, server};
 use tempfile::TempDir;
 use termewnal_core::{
-    ConfigPaths, Profile, SshAuthMethod, VaultBackend, VaultConfig,
+    AppConfig, ConfigPaths, Profile, SshAuthMethod, VaultBackend, VaultConfig,
     vault::{EncryptedVault, InMemorySecretStore, SecretStore, VaultSession},
 };
 use termewnal_pty::PtyEvent;
 use termewnal_ssh::{
     HostKeyDecision, HostKeyPrompt, InteractivePromptItem, KeyboardInteractiveChallenge,
-    SshConnectConfig, TransportStatus, fingerprint_sha256, record_known_host_path,
+    SshConnectConfig, SupervisorConfig, TransportStatus, fingerprint_sha256,
+    record_known_host_path,
 };
 use termewnal_ui::{
-    AppState, Message, MitmAlert, SshAuthPrompt, SshTargetSpec, SshUiEvent, drive_ssh_connect,
+    AppState, Message, MitmAlert, SshAuthPrompt, SshTargetSpec, SshUiEvent, StatusBarAction,
+    drive_ssh_connect,
 };
-use tokio::net::TcpListener;
-use tokio::sync::{mpsc, oneshot};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::{mpsc, oneshot, watch};
 
 #[test]
 fn restored_ssh_sessions_respect_auto_connect_on_startup_and_trigger_on_enter_or_click() {
@@ -568,6 +572,338 @@ async fn end_to_end_app_state_drives_tofu_vault_auth_terminal_io_resize_and_mitm
     assert!(state.ssh_ui().mitm_alert(mitm_sid).is_some());
     assert_eq!(
         state.ssh_session(mitm_sid).unwrap().transport_status(),
+        &TransportStatus::Disconnected
+    );
+}
+
+struct SupervisedUiProxy {
+    addr: SocketAddr,
+    blackhole_active: Arc<AtomicBool>,
+    accept_new: Arc<AtomicBool>,
+    drop_tx: watch::Sender<u64>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+}
+
+impl SupervisedUiProxy {
+    fn drop_active_connections(&self) {
+        let next = *self.drop_tx.borrow() + 1;
+        let _ = self.drop_tx.send(next);
+    }
+}
+
+impl Drop for SupervisedUiProxy {
+    fn drop(&mut self) {
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+async fn spawn_supervised_ui_proxy(target: SocketAddr) -> SupervisedUiProxy {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let blackhole_active = Arc::new(AtomicBool::new(false));
+    let accept_new = Arc::new(AtomicBool::new(true));
+    let (drop_tx, drop_rx) = watch::channel(0_u64);
+    let (shutdown_tx, mut shutdown_rx) = oneshot::channel();
+
+    let bh = Arc::clone(&blackhole_active);
+    let accept_flag = Arc::clone(&accept_new);
+
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => break,
+                res = listener.accept() => {
+                    let Ok((client, _)) = res else { break; };
+                    if !accept_flag.load(Ordering::SeqCst) {
+                        drop(client);
+                        continue;
+                    }
+                    let Ok(upstream) = TcpStream::connect(target).await else {
+                        drop(client);
+                        continue;
+                    };
+                    let bh = Arc::clone(&bh);
+                    let mut drop_rx = drop_rx.clone();
+                    let conn_gen = *drop_rx.borrow_and_update();
+                    tokio::spawn(async move {
+                        let (mut c_rx, mut c_tx) = client.into_split();
+                        let (mut u_rx, mut u_tx) = upstream.into_split();
+                        let mut c_buf = [0u8; 8192];
+                        let mut u_buf = [0u8; 8192];
+                        loop {
+                            if *drop_rx.borrow_and_update() != conn_gen {
+                                break;
+                            }
+                            tokio::select! {
+                                _ = drop_rx.changed() => break,
+                                n = c_rx.read(&mut c_buf) => {
+                                    match n {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => {
+                                            if !bh.load(Ordering::SeqCst)
+                                                && u_tx.write_all(&c_buf[..n]).await.is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                                n = u_rx.read(&mut u_buf) => {
+                                    match n {
+                                        Ok(0) | Err(_) => break,
+                                        Ok(n) => {
+                                            if !bh.load(Ordering::SeqCst)
+                                                && c_tx.write_all(&u_buf[..n]).await.is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                }
+            }
+        }
+    });
+
+    SupervisedUiProxy {
+        addr,
+        blackhole_active,
+        accept_new,
+        drop_tx,
+        shutdown_tx: Some(shutdown_tx),
+    }
+}
+
+#[tokio::test]
+async fn supervised_ui_lifecycle_drives_latency_degraded_cancel_reconnect_scrollback_and_mux() {
+    let temp = TempDir::new().unwrap();
+    let paths = ConfigPaths::from_root(temp.path());
+    let known_hosts = temp.path().join("known_hosts");
+
+    let vault = Arc::new(VaultSession::new(
+        VaultConfig {
+            backend: VaultBackend::Keyring,
+            auto_lock_minutes: 30,
+        },
+        Arc::new(InMemorySecretStore::new()),
+        EncryptedVault::open(paths.vault_file()),
+    ));
+    vault.set_secret("ssh/sup-ui", "sup-pass").unwrap();
+
+    let mut state = AppState::boot_with_paths_and_vault(paths, Arc::clone(&vault)).unwrap();
+    let (srv_addr, server_pubkey) = spawn_ui_ssh_server("deploy", "sup-pass").await;
+    let proxy = spawn_supervised_ui_proxy(srv_addr).await;
+    record_known_host_path("127.0.0.1", proxy.addr.port(), &server_pubkey, &known_hosts).unwrap();
+
+    let mut profile = Profile::ssh(
+        "Supervised UI",
+        "127.0.0.1",
+        proxy.addr.port(),
+        "deploy",
+        SshAuthMethod::Password {
+            vault_secret_ref: Some("ssh/sup-ui".to_string()),
+        },
+    );
+    profile.set_mux_attach(true, Some("tmux attach -t ui-work".to_string()));
+
+    let mut sup_cfg = SupervisorConfig::from_configs(&AppConfig::default(), &profile);
+    sup_cfg.keepalive_interval = Duration::from_millis(60);
+    sup_cfg.keepalive_max_missed = 3;
+    sup_cfg.probe_timeout = Duration::from_millis(50);
+    sup_cfg.backoff_min = Duration::from_millis(50);
+    sup_cfg.backoff_max = Duration::from_millis(150);
+
+    let spec = SshTargetSpec::from_profile_with_config(
+        &profile,
+        &AppConfig::default(),
+        80,
+        24,
+        10_000,
+    )
+    .unwrap()
+    .with_known_hosts_path(&known_hosts)
+    .with_supervisor_config(sup_cfg);
+
+    let (sid, _task) = state.open_ssh_session(spec.clone(), true);
+    let gen_id = state.ssh_session(sid).unwrap().ssh_generation();
+    let buffer = Arc::clone(state.ssh_session(sid).unwrap().buffer());
+
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    tokio::spawn(drive_ssh_connect(
+        sid,
+        gen_id,
+        spec,
+        Arc::clone(&buffer),
+        Arc::clone(&vault),
+        ev_tx,
+    ));
+
+    // Wait for initial Connected + RTT latency update in Status Bar.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(ev) = ev_rx.recv().await {
+            let _ = state.update(Message::SshEvent {
+                session_id: sid,
+                event: ev,
+            });
+            if matches!(
+                state.ssh_session(sid).unwrap().transport_status(),
+                TransportStatus::Connected {
+                    latency_ms: Some(_)
+                }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("must reach Connected with RTT latency");
+    assert!(
+        state
+            .status_bar_snapshot()
+            .transport_text()
+            .starts_with("Transport: Connected (")
+    );
+    assert!(state.ssh_session(sid).unwrap().supervisor().is_some());
+
+    // Produce terminal output before drop.
+    let _ = state.update(Message::TerminalInput {
+        session_id: sid,
+        bytes: b"UI_SCROLLBACK_KEEP\r".to_vec(),
+    });
+    assert!(
+        buffer
+            .wait_for_output_async(Duration::from_secs(3), |s| {
+                s.visible_text().contains("UI_SCROLLBACK_KEEP")
+            })
+            .await
+    );
+
+    // Inject blackhole -> Status Bar transitions through Degraded -> Reconnecting with controls.
+    proxy.blackhole_active.store(true, Ordering::SeqCst);
+    let mut saw_degraded = false;
+    let mut saw_reconnecting = false;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(ev) = ev_rx.recv().await {
+            let _ = state.update(Message::SshEvent {
+                session_id: sid,
+                event: ev,
+            });
+            let snap = state.status_bar_snapshot();
+            match state.ssh_session(sid).unwrap().transport_status() {
+                TransportStatus::Degraded { .. } => {
+                    saw_degraded = true;
+                    assert!(snap.shows_reconnect_controls());
+                }
+                TransportStatus::Reconnecting { .. } => {
+                    saw_reconnecting = true;
+                    assert!(snap.shows_reconnect_controls());
+                    assert!(snap.transport_text().contains("Reconnecting #"));
+                    break;
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("must observe Degraded and Reconnecting in Status Bar");
+    assert!(saw_degraded && saw_reconnecting);
+
+    // Clear blackhole and observe recovery + divider + mux attach + preserved scrollback.
+    proxy.blackhole_active.store(false, Ordering::SeqCst);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(ev) = ev_rx.recv().await {
+            let _ = state.update(Message::SshEvent {
+                session_id: sid,
+                event: ev,
+            });
+            if matches!(
+                state.ssh_session(sid).unwrap().transport_status(),
+                TransportStatus::Connected { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("must recover after blackhole cleared");
+
+    assert!(
+        buffer
+            .wait_for_output_async(Duration::from_secs(3), |s| {
+                let txt = s.visible_text();
+                txt.contains("UI_SCROLLBACK_KEEP")
+                    && txt.contains("--- Reconnected at ")
+                    && txt.contains("tmux attach -t ui-work")
+            })
+            .await,
+        "expected preserved scrollback + divider + mux command, got:\n{}",
+        buffer.snapshot().visible_text()
+    );
+
+    // Drop again with accept_new=false, cancel via Status Bar Cancel button -> Disconnected,
+    // then trigger StatusBarAction::ReconnectSession -> recovers!
+    proxy.accept_new.store(false, Ordering::SeqCst);
+    proxy.drop_active_connections();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(ev) = ev_rx.recv().await {
+            let _ = state.update(Message::SshEvent {
+                session_id: sid,
+                event: ev,
+            });
+            if matches!(
+                state.ssh_session(sid).unwrap().transport_status(),
+                TransportStatus::Reconnecting { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("must enter Reconnecting after drop");
+
+    let _ = state.update(Message::StatusBarAction(StatusBarAction::CancelReconnect(
+        sid,
+    )));
+    assert_eq!(
+        state.ssh_session(sid).unwrap().transport_status(),
+        &TransportStatus::Disconnected
+    );
+    assert!(buffer.snapshot().visible_text().contains("UI_SCROLLBACK_KEEP"));
+
+    proxy.accept_new.store(true, Ordering::SeqCst);
+    let _ = state.update(Message::StatusBarAction(StatusBarAction::ReconnectSession(
+        sid,
+    )));
+    assert_eq!(
+        state.ssh_session(sid).unwrap().transport_status(),
+        &TransportStatus::Connecting
+    );
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(ev) = ev_rx.recv().await {
+            let _ = state.update(Message::SshEvent {
+                session_id: sid,
+                event: ev,
+            });
+            if matches!(
+                state.ssh_session(sid).unwrap().transport_status(),
+                TransportStatus::Connected { .. }
+            ) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("ReconnectSession must recover supervised session");
+
+    let _ = state.update(Message::DisconnectSshSession(sid));
+    assert_eq!(
+        state.ssh_session(sid).unwrap().transport_status(),
         &TransportStatus::Disconnected
     );
 }

@@ -10,6 +10,12 @@ use crate::storage::{load_toml_or_default, save_toml_atomic};
 /// Current schema version written to `config.toml` and `profiles.toml`.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
+/// Default SSH keepalive probe interval in seconds (`15s`).
+pub const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 15;
+
+/// Default maximum consecutive missed SSH keepalive probes (`3`, ~45s timeout).
+pub const DEFAULT_KEEPALIVE_MAX_MISSED: u32 = 3;
+
 const CONFIG_FILE_NAME: &str = "config.toml";
 const PROFILES_FILE_NAME: &str = "profiles.toml";
 const LAYOUT_FILE_NAME: &str = "layout.toml";
@@ -209,6 +215,10 @@ pub struct AppConfig {
     pub terminal: TerminalConfig,
     pub window: WindowConfig,
     pub vault: VaultConfig,
+    /// Global SSH keepalive probe interval in seconds (`0` disables periodic probes).
+    pub keepalive_interval_secs: u64,
+    /// Global maximum consecutive missed SSH keepalive probes before reconnecting.
+    pub keepalive_max_missed: u32,
 }
 
 impl Default for AppConfig {
@@ -218,6 +228,8 @@ impl Default for AppConfig {
             terminal: TerminalConfig::default(),
             window: WindowConfig::default(),
             vault: VaultConfig::default(),
+            keepalive_interval_secs: DEFAULT_KEEPALIVE_INTERVAL_SECS,
+            keepalive_max_missed: DEFAULT_KEEPALIVE_MAX_MISSED,
         }
     }
 }

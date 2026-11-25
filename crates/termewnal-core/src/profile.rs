@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::config::{CURRENT_SCHEMA_VERSION, ConfigPaths};
+use crate::config::{AppConfig, CURRENT_SCHEMA_VERSION, ConfigPaths};
 use crate::error::CoreError;
 use crate::storage::{load_toml_or_default, save_toml_atomic};
 
@@ -79,6 +79,10 @@ impl Profile {
                 proxy_jump: Vec::new(),
                 auto_connect_on_startup: false,
                 tmux_reattach: None,
+                keepalive_interval_secs: None,
+                keepalive_max_missed: None,
+                auto_attach_mux: false,
+                mux_attach_command: None,
             },
             tunnels: Vec::new(),
         }
@@ -105,6 +109,145 @@ impl Profile {
             *auto_connect_on_startup = enabled;
         }
     }
+
+    /// Returns the per-`Profile` [`SshProfileConfig`] overrides for SSH targets (`None` for local shells).
+    pub fn ssh_config(&self) -> Option<SshProfileConfig> {
+        match &self.target {
+            ProfileTarget::Ssh {
+                keepalive_interval_secs,
+                keepalive_max_missed,
+                auto_attach_mux,
+                mux_attach_command,
+                ..
+            } => Some(SshProfileConfig {
+                keepalive_interval_secs: *keepalive_interval_secs,
+                keepalive_max_missed: *keepalive_max_missed,
+                auto_attach_mux: *auto_attach_mux,
+                mux_attach_command: mux_attach_command.clone(),
+            }),
+            ProfileTarget::LocalShell { .. } => None,
+        }
+    }
+
+    /// Applies per-`Profile` [`SshProfileConfig`] overrides on SSH targets (no-op for local shells).
+    pub fn set_ssh_config(&mut self, config: SshProfileConfig) {
+        if let ProfileTarget::Ssh {
+            keepalive_interval_secs,
+            keepalive_max_missed,
+            auto_attach_mux,
+            mux_attach_command,
+            ..
+        } = &mut self.target
+        {
+            *keepalive_interval_secs = config.keepalive_interval_secs;
+            *keepalive_max_missed = config.keepalive_max_missed;
+            *auto_attach_mux = config.auto_attach_mux;
+            *mux_attach_command = config.mux_attach_command;
+        }
+    }
+
+    /// Updates per-`Profile` keepalive interval and missed-probe overrides (no-op for local shells).
+    pub fn set_keepalive_overrides(&mut self, interval_secs: Option<u64>, max_missed: Option<u32>) {
+        if let ProfileTarget::Ssh {
+            keepalive_interval_secs,
+            keepalive_max_missed,
+            ..
+        } = &mut self.target
+        {
+            *keepalive_interval_secs = interval_secs;
+            *keepalive_max_missed = max_missed;
+        }
+    }
+
+    /// Enables or disables automatic `tmux`/`screen` attach on reconnect with an optional command.
+    pub fn set_mux_attach(&mut self, enabled: bool, command: Option<String>) {
+        if let ProfileTarget::Ssh {
+            auto_attach_mux,
+            mux_attach_command,
+            ..
+        } = &mut self.target
+        {
+            *auto_attach_mux = enabled;
+            *mux_attach_command = command;
+        }
+    }
+
+    /// Resolves effective `(keepalive_interval_secs, keepalive_max_missed)` by applying per-`Profile`
+    /// overrides on top of global [`AppConfig`] defaults.
+    pub fn resolve_keepalive(&self, global: &AppConfig) -> (u64, u32) {
+        match &self.target {
+            ProfileTarget::Ssh {
+                keepalive_interval_secs,
+                keepalive_max_missed,
+                ..
+            } => (
+                keepalive_interval_secs.unwrap_or(global.keepalive_interval_secs),
+                keepalive_max_missed.unwrap_or(global.keepalive_max_missed),
+            ),
+            ProfileTarget::LocalShell { .. } => {
+                (global.keepalive_interval_secs, global.keepalive_max_missed)
+            }
+        }
+    }
+
+    /// Returns the shell command to run upon reconnection when multiplexer auto-attach is enabled.
+    pub fn effective_mux_attach_command(&self) -> Option<String> {
+        let ProfileTarget::Ssh {
+            auto_attach_mux,
+            mux_attach_command,
+            tmux_reattach,
+            ..
+        } = &self.target
+        else {
+            return None;
+        };
+
+        resolve_mux_attach_command(
+            *auto_attach_mux,
+            mux_attach_command.as_deref(),
+            tmux_reattach.as_deref(),
+        )
+    }
+}
+
+/// Resolves the multiplexer attach command from `auto_attach_mux`, explicit `mux_attach_command`,
+/// and legacy `tmux_reattach` session name/command fallback.
+pub fn resolve_mux_attach_command(
+    auto_attach_mux: bool,
+    mux_attach_command: Option<&str>,
+    tmux_reattach: Option<&str>,
+) -> Option<String> {
+    if !auto_attach_mux {
+        return None;
+    }
+
+    if let Some(cmd) = mux_attach_command
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(cmd.to_string());
+    }
+
+    tmux_reattach
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|val| {
+            if val.contains(char::is_whitespace) {
+                val.to_string()
+            } else {
+                format!("tmux attach -t {val} || tmux new -s {val}")
+            }
+        })
+}
+
+/// Per-`Profile` SSH keepalive and multiplexer auto-attach settings.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SshProfileConfig {
+    pub keepalive_interval_secs: Option<u64>,
+    pub keepalive_max_missed: Option<u32>,
+    pub auto_attach_mux: bool,
+    pub mux_attach_command: Option<String>,
 }
 
 /// Connection target for a `Profile`.
@@ -134,6 +277,14 @@ pub enum ProfileTarget {
         auto_connect_on_startup: bool,
         #[serde(default)]
         tmux_reattach: Option<String>,
+        #[serde(default)]
+        keepalive_interval_secs: Option<u64>,
+        #[serde(default)]
+        keepalive_max_missed: Option<u32>,
+        #[serde(default)]
+        auto_attach_mux: bool,
+        #[serde(default)]
+        mux_attach_command: Option<String>,
     },
 }
 

@@ -186,6 +186,10 @@ fn selecting_saved_profile_opens_local_pty_or_ssh_session_slot_in_tab_or_split_p
         proxy_jump: vec!["bastion.internal".to_string()],
         auto_connect_on_startup: true,
         tmux_reattach: Some("main".to_string()),
+        keepalive_interval_secs: None,
+        keepalive_max_missed: None,
+        auto_attach_mux: false,
+        mux_attach_command: None,
     };
 
     let mut cfg = ProfilesConfig::default();
@@ -583,4 +587,131 @@ fn status_bar_reflects_active_session_and_extensible_transport_tunnel_transfer_h
     let _ = state.view(win);
     let _ = state.update(Message::CommandPaletteEnterQuickConnect);
     let _ = state.view(win);
+}
+
+#[test]
+fn probe_reconnect_all_palette_and_status_bar_handle_degraded_reconnecting_and_mitm_safely() {
+    use termewnal_ssh::HostKeyPrompt;
+    use termewnal_ui::{MitmAlert, SshUiEvent};
+
+    let temp = TempDir::new().expect("create temp XDG root");
+    let mut state =
+        AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+
+    // 1. Command Palette offers "Probe / Reconnect All SSH Sessions".
+    let _ = state.update(Message::OpenCommandPalette);
+    let _ = state.update(Message::CommandPaletteQueryChanged("probe".to_string()));
+    let items = state.command_palette_items();
+    assert!(matches!(
+        items.first().map(|i| &i.action),
+        Some(PaletteAction::ProbeReconnectAll)
+    ));
+    let _ = state.update(Message::CloseCommandPalette);
+
+    // 2. Create 4 SSH sessions in distinct states:
+    //    a) Connected (should probe without dropping)
+    let _ = state.update(Message::QuickConnect(QuickConnectTarget {
+        host: "connected.internal".to_string(),
+        port: 22,
+        username: "ops".to_string(),
+    }));
+    let connected_sid = state.active_session_id().unwrap();
+    let _ = state.update(Message::SetSessionTransportStatus {
+        session_id: connected_sid,
+        status: TransportStatus::Connected {
+            latency_ms: Some(12),
+        },
+    });
+    assert_eq!(state.ssh_session(connected_sid).unwrap().probe_count(), 0);
+
+    //    b) Degraded (shows reconnect controls + probes)
+    let _ = state.update(Message::QuickConnect(QuickConnectTarget {
+        host: "degraded.internal".to_string(),
+        port: 22,
+        username: "ops".to_string(),
+    }));
+    let degraded_sid = state.active_session_id().unwrap();
+    let _ = state.update(Message::SetSessionTransportStatus {
+        session_id: degraded_sid,
+        status: TransportStatus::Degraded { missed_probes: 2 },
+    });
+    let degraded_snap = state.status_bar_snapshot();
+    assert_eq!(
+        degraded_snap.transport_text(),
+        "Transport: Degraded (2 missed)"
+    );
+    assert!(degraded_snap.shows_reconnect_controls());
+
+    //    c) Reconnecting (should immediately transition to Connecting on ProbeReconnectAll)
+    let _ = state.update(Message::QuickConnect(QuickConnectTarget {
+        host: "reconnecting.internal".to_string(),
+        port: 22,
+        username: "ops".to_string(),
+    }));
+    let reconnecting_sid = state.active_session_id().unwrap();
+    let _ = state.update(Message::SetSessionTransportStatus {
+        session_id: reconnecting_sid,
+        status: TransportStatus::Reconnecting {
+            attempt: 2,
+            next_retry_secs: 4,
+        },
+    });
+
+    //    d) MITM-blocked (must NEVER auto-reconnect)
+    let _ = state.update(Message::QuickConnect(QuickConnectTarget {
+        host: "mitm.internal".to_string(),
+        port: 22,
+        username: "ops".to_string(),
+    }));
+    let mitm_sid = state.active_session_id().unwrap();
+    let mitm_gen = state.ssh_session(mitm_sid).unwrap().ssh_generation();
+    let _ = state.update(Message::SshEvent {
+        session_id: mitm_sid,
+        event: SshUiEvent::MitmBlocked {
+            generation: mitm_gen,
+            alert: MitmAlert {
+                session_id: mitm_sid,
+                host: "mitm.internal".to_string(),
+                port: 22,
+                line: 1,
+                key_type: "ssh-ed25519".to_string(),
+                expected_fingerprint: "SHA256:good".to_string(),
+                received_fingerprint: "SHA256:bad".to_string(),
+            },
+        },
+    });
+
+    //    e) Untouched restored SSH session (generation == 0, Disconnected) must remain Disconnected.
+    let restored_prof = Profile::ssh("Restored", "restored.internal", 22, "ops", SshAuthMethod::Agent);
+    let _ = state.update(Message::RestoreSshProfile(restored_prof));
+    let untouched_sid = state.active_session_id().unwrap();
+    assert_eq!(state.ssh_session(untouched_sid).unwrap().ssh_generation(), 0);
+    assert_eq!(
+        state.ssh_session(untouched_sid).unwrap().transport_status(),
+        &TransportStatus::Disconnected
+    );
+    let _ = HostKeyPrompt {
+        host: String::new(),
+        port: 22,
+        key_type: String::new(),
+        fingerprint_sha256: String::new(),
+    };
+
+    // Trigger Probe / Reconnect All via StatusBarAction::ProbeAll.
+    let _ = state.update(Message::StatusBarAction(StatusBarAction::ProbeAll));
+
+    assert_eq!(state.ssh_session(connected_sid).unwrap().probe_count(), 1);
+    assert_eq!(state.ssh_session(degraded_sid).unwrap().probe_count(), 1);
+    assert_eq!(
+        state.ssh_session(reconnecting_sid).unwrap().transport_status(),
+        &TransportStatus::Connecting
+    );
+    assert_eq!(
+        state.ssh_session(mitm_sid).unwrap().transport_status(),
+        &TransportStatus::Disconnected
+    );
+    assert_eq!(
+        state.ssh_session(untouched_sid).unwrap().transport_status(),
+        &TransportStatus::Disconnected
+    );
 }

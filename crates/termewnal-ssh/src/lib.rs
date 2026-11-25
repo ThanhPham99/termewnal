@@ -5,19 +5,26 @@ pub mod client;
 pub mod error;
 pub mod known_hosts;
 pub mod session;
+pub mod supervisor;
 
 pub use auth::{
     AgentConnector, AuthOutcome, BoxFuture, BoxedAgentClient, HostKeyDecision, HostKeyPrompt,
     InteractivePromptItem, KeyboardInteractiveChallenge, OsAgentConnector,
     RejectAllInteractionHandler, SshInteractionHandler, authenticate_session,
 };
-pub use client::{SshClientHandler, SshConnectConfig, SshTransport};
+pub use client::{SshClientHandler, SshConnectConfig, SshTransport, TcpKeepaliveSettings};
 pub use error::SshError;
 pub use known_hosts::{
     KnownHostStatus, default_known_hosts_path, fingerprint_sha256, record_known_host,
     record_known_host_path, verify_known_host, verify_known_host_path,
 };
 pub use session::SshSession;
+pub use supervisor::{
+    ConnectionSupervisor, DEFAULT_BACKOFF_MAX, DEFAULT_BACKOFF_MIN, DEFAULT_WAKE_PROBE_TIMEOUT,
+    DefaultTransportConnector, ManualTimeSource, SupervisorConfig, SupervisorEvent,
+    SupervisorInstant, SystemTimeSource, TimeSource, TransportConnector, TransportReadySnapshot,
+    TransportStatusEvent, compute_reconnect_backoff, format_reconnected_divider,
+};
 
 /// Connection lifecycle state of an SSH `Transport`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

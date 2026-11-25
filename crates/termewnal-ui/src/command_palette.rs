@@ -140,6 +140,7 @@ pub enum PaletteAction {
     CloseFocusedPane,
     OpenQuickConnectPrompt,
     QuickConnect(QuickConnectTarget),
+    ProbeReconnectAll,
     SwitchSession(SessionId),
     LaunchProfile {
         profile_id: String,
@@ -532,6 +533,22 @@ fn workspace_command_items() -> Vec<PaletteItem> {
             ],
             shortcut: None,
             action: PaletteAction::OpenQuickConnectPrompt,
+        },
+        PaletteItem {
+            id: "cmd:probe-reconnect-all".to_string(),
+            category: PaletteCategory::Command,
+            title: "Probe / Reconnect All SSH Sessions".to_string(),
+            subtitle: "Dispatch immediate 3s keepalive probes and reconnect dropped SSH Transports".to_string(),
+            keywords: vec![
+                "ssh".to_string(),
+                "probe".to_string(),
+                "reconnect".to_string(),
+                "keepalive".to_string(),
+                "wake".to_string(),
+                "all".to_string(),
+            ],
+            shortcut: None,
+            action: PaletteAction::ProbeReconnectAll,
         },
         PaletteItem {
             id: "cmd:new-tab".to_string(),

@@ -10,7 +10,8 @@ pub mod theme;
 pub mod vault;
 
 pub use config::{
-    AppConfig, CURRENT_SCHEMA_VERSION, ConfigPaths, CursorStyle, TerminalConfig, VaultBackend,
+    AppConfig, CURRENT_SCHEMA_VERSION, ConfigPaths, CursorStyle,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_KEEPALIVE_MAX_MISSED, TerminalConfig, VaultBackend,
     VaultConfig, WindowConfig, ensure_config_files, load_config, save_config,
 };
 pub use error::CoreError;
@@ -24,8 +25,8 @@ pub use layout::{
     load_layout, save_layout,
 };
 pub use profile::{
-    Profile, ProfileTarget, ProfilesConfig, SshAuthMethod, TunnelDirection, TunnelRule,
-    load_profiles, save_profiles,
+    Profile, ProfileTarget, ProfilesConfig, SshAuthMethod, SshProfileConfig, TunnelDirection,
+    TunnelRule, load_profiles, resolve_mux_attach_command, save_profiles,
 };
 pub use storage::{MAX_BACKUPS, backup_path};
 pub use theme::{BuiltinTheme, RgbColor, ThemePalette};

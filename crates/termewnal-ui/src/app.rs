@@ -18,13 +18,16 @@ use termewnal_core::{
     ConfigWatcher, LayoutSplitAxis, LayoutSplitNode, Profile, ProfileTarget, ProfilesConfig,
     SessionDescriptor, SshAuthMethod, TabLayout, TerminalConfig, ThemePalette, TomlReloadError,
     VaultBackend, VaultSession, WindowLayout, WorkspaceLayout, ensure_config_files, load_layout,
-    save_layout,
+    resolve_mux_attach_command, save_layout,
 };
 use termewnal_pty::{
     GridSearchMatch, PtyEvent, PtySession, PtySpawnConfig, Scroll, SelectionType, ShellSpec, Side,
     TerminalBuffer, TerminalSnapshot, detect_default_shell,
 };
-use termewnal_ssh::{OsAgentConnector, SshConnectConfig, SshSession, TransportStatus};
+use termewnal_ssh::{
+    ConnectionSupervisor, OsAgentConnector, SshConnectConfig, SshSession, SupervisorConfig,
+    TransportStatus,
+};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 use zeroize::Zeroize;
@@ -86,12 +89,33 @@ pub struct SshSessionTarget {
     pub proxy_jump: Vec<String>,
     pub auto_connect_on_startup: bool,
     pub tmux_reattach: Option<String>,
+    pub keepalive_interval_secs: Option<u64>,
+    pub keepalive_max_missed: Option<u32>,
+    pub auto_attach_mux: bool,
+    pub mux_attach_command: Option<String>,
 }
 
 impl SshSessionTarget {
     /// Returns the formatted `user@host:port` destination string.
     pub fn display_addr(&self) -> String {
         format!("{}@{}:{}", self.username, self.host, self.port)
+    }
+
+    fn effective_mux_command(&self) -> Option<String> {
+        resolve_mux_attach_command(
+            self.auto_attach_mux,
+            self.mux_attach_command.as_deref(),
+            self.tmux_reattach.as_deref(),
+        )
+    }
+
+    fn resolve_keepalive(&self, app_config: &AppConfig) -> (u64, u32) {
+        (
+            self.keepalive_interval_secs
+                .unwrap_or(app_config.keepalive_interval_secs),
+            self.keepalive_max_missed
+                .unwrap_or(app_config.keepalive_max_missed),
+        )
     }
 
     fn from_target_spec(spec: &SshTargetSpec) -> Self {
@@ -105,6 +129,10 @@ impl SshSessionTarget {
             proxy_jump: Vec::new(),
             auto_connect_on_startup: spec.auto_connect_on_startup,
             tmux_reattach: None,
+            keepalive_interval_secs: Some(spec.supervisor_config.keepalive_interval.as_secs()),
+            keepalive_max_missed: Some(spec.supervisor_config.keepalive_max_missed),
+            auto_attach_mux: spec.supervisor_config.mux_attach_command.is_some(),
+            mux_attach_command: spec.supervisor_config.mux_attach_command.clone(),
         }
     }
 
@@ -113,8 +141,14 @@ impl SshSessionTarget {
         title: &str,
         cols: u16,
         rows: u16,
-        scrollback_lines: usize,
+        app_config: &AppConfig,
     ) -> SshTargetSpec {
+        let (ka_secs, ka_max) = self.resolve_keepalive(app_config);
+        let mut supervisor_config = SupervisorConfig::from_app_config(app_config);
+        supervisor_config.keepalive_interval = Duration::from_secs(ka_secs);
+        supervisor_config.keepalive_max_missed = ka_max.max(1);
+        supervisor_config.mux_attach_command = self.effective_mux_command();
+
         SshTargetSpec {
             profile_id: self.profile_id.clone(),
             title: title.to_string(),
@@ -128,8 +162,9 @@ impl SshSessionTarget {
                 term_name: "xterm-256color".to_string(),
                 cols: cols.max(1),
                 rows: rows.max(1),
-                scrollback_lines,
+                scrollback_lines: app_config.terminal.scrollback_lines,
             },
+            supervisor_config,
             agent_connector: Arc::new(OsAgentConnector::default()),
             auto_connect_on_startup: self.auto_connect_on_startup,
         }
@@ -152,6 +187,8 @@ pub struct SshSessionSlot {
     exited: Option<Option<i32>>,
     generation: u64,
     active: Option<Arc<SshSession>>,
+    supervisor: Option<ConnectionSupervisor>,
+    probe_count: u64,
     last_error: Option<String>,
 }
 
@@ -225,6 +262,16 @@ impl SshSessionSlot {
     /// Returns the active [`SshSession`] handle if this SSH `Session` is currently connected.
     pub fn ssh_session(&self) -> Option<&Arc<SshSession>> {
         self.active.as_ref()
+    }
+
+    /// Returns the active [`ConnectionSupervisor`] handle if supervised transport is attached.
+    pub fn supervisor(&self) -> Option<&ConnectionSupervisor> {
+        self.supervisor.as_ref()
+    }
+
+    /// Returns the number of manual keepalive probes triggered on this SSH `Session`.
+    pub fn probe_count(&self) -> u64 {
+        self.probe_count
     }
 
     /// Returns the [`SshTargetSpec`] used to connect this SSH `Session`.
@@ -516,6 +563,7 @@ pub enum Message {
     },
     ConnectSshSession(SessionId),
     DisconnectSshSession(SessionId),
+    ProbeAndReconnectAll,
     SshEvent {
         session_id: SessionId,
         event: SshUiEvent,
@@ -1037,6 +1085,8 @@ impl AppState {
             exited: None,
             generation: 0,
             active: None,
+            supervisor: None,
+            probe_count: 0,
             last_error: None,
         };
         self.sessions.insert(id, SessionEntry::Ssh(slot));
@@ -1051,6 +1101,9 @@ impl AppState {
 
         if let Some(prev) = slot.active.take() {
             prev.disconnect();
+        }
+        if let Some(prev_sup) = slot.supervisor.take() {
+            prev_sup.disconnect();
         }
         slot.generation = slot.generation.wrapping_add(1);
         slot.last_error = None;
@@ -1073,15 +1126,84 @@ impl AppState {
         )
     }
 
-    fn disconnect_ssh_session(&mut self, session_id: SessionId) {
+    fn reconnect_ssh_session(&mut self, session_id: SessionId) -> Task<Message> {
+        if self.ssh_ui.mitm_alert(session_id).is_some() {
+            return Task::none();
+        }
+        if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id)
+            && let Some(sup) = &slot.supervisor
+        {
+            sup.reconnect_now();
+            slot.last_error = None;
+            slot.exited = None;
+            slot.transport_status = TransportStatus::Connecting;
+            slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
+            return Task::none();
+        }
+        self.start_ssh_connect(session_id)
+    }
+
+    fn cancel_ssh_reconnect(&mut self, session_id: SessionId) {
         self.ssh_ui.clear_session_prompts(session_id);
         if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) {
+            if let Some(sup) = &slot.supervisor {
+                sup.cancel_reconnect();
+            }
             if let Some(ssh) = slot.active.take() {
                 ssh.disconnect();
             }
             slot.transport_status = TransportStatus::Disconnected;
             slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
         }
+    }
+
+    fn disconnect_ssh_session(&mut self, session_id: SessionId) {
+        self.ssh_ui.clear_session_prompts(session_id);
+        if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) {
+            if let Some(sup) = slot.supervisor.take() {
+                sup.disconnect();
+            }
+            if let Some(ssh) = slot.active.take() {
+                ssh.disconnect();
+            }
+            slot.transport_status = TransportStatus::Disconnected;
+            slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
+        }
+    }
+
+    fn probe_and_reconnect_all(&mut self) -> Task<Message> {
+        let ssh_ids: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter_map(|(&id, entry)| matches!(entry, SessionEntry::Ssh(_)).then_some(id))
+            .collect();
+
+        let mut tasks = Vec::new();
+        for sid in ssh_ids {
+            if self.ssh_ui.mitm_alert(sid).is_some() {
+                continue;
+            }
+            let action_needed = match self.sessions.get_mut(&sid) {
+                Some(SessionEntry::Ssh(slot)) => match slot.transport_status {
+                    TransportStatus::Connected { .. } | TransportStatus::Degraded { .. } => {
+                        slot.probe_count = slot.probe_count.saturating_add(1);
+                        if let Some(sup) = &slot.supervisor {
+                            sup.probe_now();
+                        }
+                        false
+                    }
+                    TransportStatus::Reconnecting { .. } => true,
+                    TransportStatus::Disconnected => slot.generation > 0,
+                    TransportStatus::Connecting => false,
+                },
+                _ => false,
+            };
+            if action_needed {
+                let task = self.reconnect_ssh_session(sid);
+                tasks.push(task);
+            }
+        }
+        Task::batch(tasks)
     }
 
     fn open_session_with_disposition(
@@ -1161,6 +1283,10 @@ impl AppState {
                 proxy_jump,
                 auto_connect_on_startup,
                 tmux_reattach,
+                keepalive_interval_secs,
+                keepalive_max_missed,
+                auto_attach_mux,
+                mux_attach_command,
             } => {
                 let target = SshSessionTarget {
                     profile_id: Some(profile.id.clone()),
@@ -1172,14 +1298,13 @@ impl AppState {
                     proxy_jump: proxy_jump.clone(),
                     auto_connect_on_startup: *auto_connect_on_startup,
                     tmux_reattach: tmux_reattach.clone(),
+                    keepalive_interval_secs: *keepalive_interval_secs,
+                    keepalive_max_missed: *keepalive_max_missed,
+                    auto_attach_mux: *auto_attach_mux,
+                    mux_attach_command: mux_attach_command.clone(),
                 };
                 let tab_title = (!profile.name.trim().is_empty()).then(|| profile.name.clone());
-                let spec = target.to_target_spec(
-                    &profile.name,
-                    80,
-                    24,
-                    self.config.terminal.scrollback_lines,
-                );
+                let spec = target.to_target_spec(&profile.name, 80, 24, &self.config);
                 let sid = self.insert_ssh_session_slot(target, spec);
                 if self.open_session_with_disposition(window_scope, sid, tab_title, disposition) {
                     self.start_ssh_connect(sid)
@@ -1206,13 +1331,12 @@ impl AppState {
             proxy_jump: Vec::new(),
             auto_connect_on_startup: false,
             tmux_reattach: None,
+            keepalive_interval_secs: None,
+            keepalive_max_missed: None,
+            auto_attach_mux: false,
+            mux_attach_command: None,
         };
-        let spec = ssh_target.to_target_spec(
-            &label,
-            80,
-            24,
-            self.config.terminal.scrollback_lines,
-        );
+        let spec = ssh_target.to_target_spec(&label, 80, 24, &self.config);
         let sid = self.insert_ssh_session_slot(ssh_target, spec);
         if self.open_session_with_disposition(
             window_scope,
@@ -1251,13 +1375,12 @@ impl AppState {
             proxy_jump: host.proxy_jump,
             auto_connect_on_startup: false,
             tmux_reattach: None,
+            keepalive_interval_secs: None,
+            keepalive_max_missed: None,
+            auto_attach_mux: false,
+            mux_attach_command: None,
         };
-        let spec = target.to_target_spec(
-            &host.alias,
-            80,
-            24,
-            self.config.terminal.scrollback_lines,
-        );
+        let spec = target.to_target_spec(&host.alias, 80, 24, &self.config);
         let sid = self.insert_ssh_session_slot(target, spec);
         if self.open_session_with_disposition(
             window_scope,
@@ -1305,9 +1428,12 @@ impl AppState {
                 Task::none()
             }
             StatusBarAction::OpenCommandPalette => self.update(Message::OpenCommandPalette),
-            StatusBarAction::ReconnectSession(session_id) => self.start_ssh_connect(session_id),
+            StatusBarAction::ProbeAll => self.probe_and_reconnect_all(),
+            StatusBarAction::ReconnectSession(session_id) => {
+                self.reconnect_ssh_session(session_id)
+            }
             StatusBarAction::CancelReconnect(session_id) => {
-                self.disconnect_ssh_session(session_id);
+                self.cancel_ssh_reconnect(session_id);
                 Task::none()
             }
             StatusBarAction::ToggleTunnelsView => {
@@ -1361,6 +1487,10 @@ impl AppState {
                 self.command_palette.close();
                 self.launch_quick_connect(window_scope, target)
             }
+            PaletteAction::ProbeReconnectAll => {
+                self.command_palette.close();
+                self.probe_and_reconnect_all()
+            }
             PaletteAction::SwitchSession(session_id) => {
                 self.command_palette.close();
                 self.update_in_window(window_scope, Message::FocusSession(session_id))
@@ -1398,6 +1528,9 @@ impl AppState {
         match self.sessions.remove(&session_id) {
             Some(SessionEntry::Local(session)) => session.pty.terminate(),
             Some(SessionEntry::Ssh(slot)) => {
+                if let Some(sup) = slot.supervisor {
+                    sup.disconnect();
+                }
                 if let Some(ssh) = slot.active {
                     ssh.disconnect();
                 }
@@ -1856,8 +1989,9 @@ impl AppState {
                     && let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id)
                     && slot.active.is_none()
                     && slot.transport_status == TransportStatus::Disconnected
+                    && self.ssh_ui.mitm_alert(session_id).is_none()
                 {
-                    return self.start_ssh_connect(session_id);
+                    return self.reconnect_ssh_session(session_id);
                 }
                 self.dispatch_bytes_with_broadcast(session_id, &bytes);
                 Task::none()
@@ -1879,7 +2013,16 @@ impl AppState {
                     Some(SessionEntry::Ssh(slot)) => {
                         slot.cols = cols.max(1);
                         slot.rows = rows.max(1);
-                        if let Some(ssh) = &slot.active {
+                        if let Some(sup) = &slot.supervisor {
+                            if let Err(err) = sup.resize(cols, rows) {
+                                error!(
+                                    session = session_id.0,
+                                    error = %err,
+                                    "failed to resize supervised SSH channel"
+                                );
+                                self.last_error = Some(err.to_string());
+                            }
+                        } else if let Some(ssh) = &slot.active {
                             if let Err(err) = ssh.resize(cols, rows) {
                                 error!(
                                     session = session_id.0,
@@ -2379,8 +2522,9 @@ impl AppState {
                 Task::none()
             }
             Message::OpenSshProfile(profile) => {
-                match SshTargetSpec::from_profile(
+                match SshTargetSpec::from_profile_with_config(
                     &profile,
+                    &self.config,
                     80,
                     24,
                     self.config.terminal.scrollback_lines,
@@ -2396,8 +2540,9 @@ impl AppState {
                 }
             }
             Message::RestoreSshProfile(profile) => {
-                match SshTargetSpec::from_profile(
+                match SshTargetSpec::from_profile_with_config(
                     &profile,
+                    &self.config,
                     80,
                     24,
                     self.config.terminal.scrollback_lines,
@@ -2505,11 +2650,12 @@ impl AppState {
                 self.update_ssh_slot_status(session_id, status);
                 Task::none()
             }
-            Message::ConnectSshSession(session_id) => self.start_ssh_connect(session_id),
+            Message::ConnectSshSession(session_id) => self.reconnect_ssh_session(session_id),
             Message::DisconnectSshSession(session_id) => {
                 self.disconnect_ssh_session(session_id);
                 Task::none()
             }
+            Message::ProbeAndReconnectAll => self.probe_and_reconnect_all(),
             Message::OpenCommandPalette => {
                 self.command_palette.open();
                 operation::focus(command_palette_input_id())
@@ -2582,6 +2728,7 @@ impl AppState {
 
         let event_gen = match &event {
             SshUiEvent::Connected { generation, .. }
+            | SshUiEvent::TransportStatus { generation, .. }
             | SshUiEvent::HostKeyPrompt { generation, .. }
             | SshUiEvent::AuthPrompt { generation, .. }
             | SshUiEvent::MitmBlocked { generation, .. }
@@ -2592,11 +2739,36 @@ impl AppState {
         }
 
         match event {
-            SshUiEvent::Connected { session: ssh, .. } => {
-                slot.active = Some(ssh);
+            SshUiEvent::Connected {
+                session: ssh,
+                supervisor,
+                ..
+            } => {
+                slot.active = ssh;
+                slot.supervisor = supervisor;
                 slot.last_error = None;
                 slot.exited = None;
                 slot.transport_status = TransportStatus::Connected { latency_ms: None };
+                slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
+                slot.snapshot = Arc::new(slot.buffer.snapshot());
+            }
+            SshUiEvent::TransportStatus {
+                status, last_error, ..
+            } => {
+                if !matches!(
+                    status,
+                    TransportStatus::Connected { .. } | TransportStatus::Degraded { .. }
+                ) {
+                    slot.active = None;
+                }
+                if matches!(status, TransportStatus::Connected { .. }) {
+                    slot.last_error = None;
+                    slot.exited = None;
+                } else if let Some(err) = last_error {
+                    slot.last_error = Some(err.clone());
+                    self.last_error = Some(err);
+                }
+                slot.transport_status = status;
                 slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
                 slot.snapshot = Arc::new(slot.buffer.snapshot());
             }
@@ -2613,6 +2785,7 @@ impl AppState {
             }
             SshUiEvent::MitmBlocked { alert, .. } => {
                 slot.active = None;
+                slot.supervisor = None;
                 slot.transport_status = TransportStatus::Disconnected;
                 let msg = format!(
                     "HOST KEY VERIFICATION FAILED for {}:{} (known_hosts line {}): expected {}, received {}",
@@ -2629,6 +2802,7 @@ impl AppState {
             }
             SshUiEvent::Disconnected { error, .. } => {
                 slot.active = None;
+                slot.supervisor = None;
                 slot.transport_status = TransportStatus::Disconnected;
                 slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
                 self.ssh_ui.clear_session_prompts(session_id);
@@ -2644,10 +2818,17 @@ impl AppState {
     fn sync_terminal_options_to_sessions(&mut self) {
         let shape = cursor_style_to_shape(self.config.terminal.cursor_style);
         let scrollback = self.config.terminal.scrollback_lines;
+        let app_cfg = self.config.clone();
         for entry in self.sessions.values_mut() {
             if let Some(buf) = entry.buffer() {
                 buf.apply_options(scrollback, shape);
                 entry.refresh_snapshot();
+            }
+            if let SessionEntry::Ssh(slot) = entry
+                && let Some(sup) = &slot.supervisor
+            {
+                let (ka_secs, ka_max) = slot.target.resolve_keepalive(&app_cfg);
+                sup.update_keepalive(Duration::from_secs(ka_secs), ka_max);
             }
         }
         if self.search.open && !self.search.query.is_empty() {
@@ -2706,7 +2887,15 @@ impl AppState {
             if is_broadcast {
                 let skip = match self.sessions.get(&target_id) {
                     Some(SessionEntry::Local(s)) => s.exited.is_some(),
-                    Some(SessionEntry::Ssh(s)) => s.active.is_none(),
+                    Some(SessionEntry::Ssh(s)) => {
+                        s.active.is_none()
+                            && !(s.supervisor.is_some()
+                                && matches!(
+                                    s.transport_status,
+                                    TransportStatus::Connected { .. }
+                                        | TransportStatus::Degraded { .. }
+                                ))
+                    }
                     Some(SessionEntry::Remote(_)) | None => true,
                 };
                 if skip {
@@ -2727,7 +2916,16 @@ impl AppState {
         let write_result = match entry {
             SessionEntry::Local(session) => session.pty.write_bytes(bytes).map_err(|e| e.to_string()),
             SessionEntry::Ssh(slot) => {
-                if let Some(ssh) = &slot.active {
+                if let Some(sup) = &slot.supervisor {
+                    if matches!(
+                        slot.transport_status,
+                        TransportStatus::Connected { .. } | TransportStatus::Degraded { .. }
+                    ) {
+                        sup.write_bytes(bytes).map_err(|e| e.to_string())
+                    } else {
+                        return;
+                    }
+                } else if let Some(ssh) = &slot.active {
                     ssh.write_bytes(bytes).map_err(|e| e.to_string())
                 } else {
                     return;
