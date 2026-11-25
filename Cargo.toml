@@ -14,9 +14,12 @@ rust-version = "1.91"
 
 [workspace.dependencies]
 alacritty_terminal = "0.26"
+arboard = { version = "3.7", features = ["wayland-data-control"] }
 directories = "6.0"
 iced = { version = "0.14", features = ["tokio", "advanced", "svg", "image", "sysinfo", "sipper"] }
+open = "5.4"
 portable-pty = "0.9"
+regex = "1.13"
 serde = { version = "1.0", features = ["derive"] }
 tempfile = "3.27"
 thiserror = "2.0"
