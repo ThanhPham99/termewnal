@@ -708,6 +708,7 @@ fn setup_endpoint(temp: &TempDir, srv: &FaultServer) -> SftpEndpoint {
         cols: 80,
         rows: 24,
         scrollback_lines: 10_000,
+        proxy_jump: Vec::new(),
     };
     let key = ProfileTransportKey::from_connect_config(Some("prof-fault".to_string()), &cfg);
     SftpEndpoint::new(key, cfg)

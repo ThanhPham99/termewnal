@@ -510,6 +510,7 @@ async fn boot_connected_ui(
             cols: 80,
             rows: 24,
             scrollback_lines: 10_000,
+            proxy_jump: Vec::new(),
         },
     )
     .with_agent_connector(Arc::new(OsAgentConnector::default()));
