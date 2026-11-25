@@ -5,7 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+arboard.workspace = true
 iced.workspace = true
+open.workspace = true
 termewnal-core = { path = "../termewnal-core" }
 termewnal-pty = { path = "../termewnal-pty" }
 termewnal-ssh = { path = "../termewnal-ssh" }

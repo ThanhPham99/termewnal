@@ -5,6 +5,7 @@ pub mod error;
 pub mod hot_reload;
 pub mod profile;
 mod storage;
+pub mod theme;
 pub mod vault;
 
 pub use config::{
@@ -22,6 +23,7 @@ pub use profile::{
     load_profiles, save_profiles,
 };
 pub use storage::{MAX_BACKUPS, backup_path};
+pub use theme::{BuiltinTheme, RgbColor, ThemePalette};
 pub use vault::{
     ClockSample, DEFAULT_KEYRING_SERVICE, EncryptedVault, InMemorySecretStore, KeyringSecretStore,
     ManualVaultClock, SecretStore, SystemVaultClock, VaultClock, VaultError, VaultKdfParams,
