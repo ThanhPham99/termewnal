@@ -32,7 +32,7 @@ pub use config_reload_ui::ConfigReloadUiState;
 pub use ipc::{IpcCommand, IpcError, IpcServerHandle, LaunchOutcome, acquire_or_forward, send_command};
 pub use sftp_drawer::{
     DEFAULT_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH, MIN_SFTP_DRAWER_WIDTH, SftpDrawerDock,
-    SftpDrawerState, render_sftp_drawer,
+    SftpDrawerState, render_conflict_resolution_modal, render_sftp_drawer,
 };
 pub use sidebar::{
     ActiveTunnelEntry, ProfileGroupView, SidebarSection, SidebarState, SystemSshProfile,

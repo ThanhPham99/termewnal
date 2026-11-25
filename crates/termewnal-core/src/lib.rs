@@ -13,8 +13,9 @@ pub mod vault;
 
 pub use config::{
     AppConfig, CURRENT_SCHEMA_VERSION, ConfigPaths, CursorStyle,
-    DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_KEEPALIVE_MAX_MISSED, TerminalConfig, VaultBackend,
-    VaultConfig, WindowConfig, ensure_config_files, load_config, save_config,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_KEEPALIVE_MAX_MISSED, DEFAULT_PART_THRESHOLD_BYTES,
+    TerminalConfig, TransferConfig, TransferConflictPolicy, VaultBackend, VaultConfig,
+    WindowConfig, ensure_config_files, load_config, save_config,
 };
 pub use error::CoreError;
 pub use hot_reload::{

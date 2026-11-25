@@ -16,6 +16,9 @@ pub const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 15;
 /// Default maximum consecutive missed SSH keepalive probes (`3`, ~45s timeout).
 pub const DEFAULT_KEEPALIVE_MAX_MISSED: u32 = 3;
 
+/// Default size threshold in bytes (`1 MiB`) above which SFTP uploads use `.termewnal.part`.
+pub const DEFAULT_PART_THRESHOLD_BYTES: u64 = 1_048_576;
+
 const CONFIG_FILE_NAME: &str = "config.toml";
 const PROFILES_FILE_NAME: &str = "profiles.toml";
 const LAYOUT_FILE_NAME: &str = "layout.toml";
@@ -235,6 +238,45 @@ impl Default for VaultConfig {
     }
 }
 
+/// Default collision policy applied when an SFTP `Transfer` targets an existing file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TransferConflictPolicy {
+    /// Pause the `Transfer` and prompt the user (`Overwrite`, `Resume`, `Skip`, `Rename`).
+    #[default]
+    Ask,
+    /// Replace the existing target file.
+    Overwrite,
+    /// Resume from the existing destination byte offset (or `.termewnal.part` size).
+    Resume,
+    /// Skip the colliding file without modifying the target.
+    Skip,
+    /// Automatically disambiguate the target filename (e.g. `name (1).ext`).
+    Rename,
+}
+
+/// Non-secret SFTP `Transfer` preferences stored in `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TransferConfig {
+    /// Policy applied when a target file already exists.
+    pub default_conflict_policy: TransferConflictPolicy,
+    /// Whether recursive directory transfers follow symlinks (with cycle detection) instead of skipping them.
+    pub follow_symlinks: bool,
+    /// Minimum byte threshold (`> part_threshold_bytes`) triggering `.termewnal.part` atomic uploads.
+    pub part_threshold_bytes: u64,
+}
+
+impl Default for TransferConfig {
+    fn default() -> Self {
+        Self {
+            default_conflict_policy: TransferConflictPolicy::Ask,
+            follow_symlinks: false,
+            part_threshold_bytes: DEFAULT_PART_THRESHOLD_BYTES,
+        }
+    }
+}
+
 /// Non-secret application configuration persisted to `config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -243,6 +285,9 @@ pub struct AppConfig {
     pub terminal: TerminalConfig,
     pub window: WindowConfig,
     pub vault: VaultConfig,
+    /// SFTP `Transfer` atomic `.part`, conflict policy, and symlink traversal settings.
+    #[serde(default)]
+    pub transfer: TransferConfig,
     /// Global SSH keepalive probe interval in seconds (`0` disables periodic probes).
     pub keepalive_interval_secs: u64,
     /// Global maximum consecutive missed SSH keepalive probes before reconnecting.
@@ -256,6 +301,7 @@ impl Default for AppConfig {
             terminal: TerminalConfig::default(),
             window: WindowConfig::default(),
             vault: VaultConfig::default(),
+            transfer: TransferConfig::default(),
             keepalive_interval_secs: DEFAULT_KEEPALIVE_INTERVAL_SECS,
             keepalive_max_missed: DEFAULT_KEEPALIVE_MAX_MISSED,
         }

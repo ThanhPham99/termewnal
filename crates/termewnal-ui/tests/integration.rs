@@ -14,6 +14,8 @@ mod navigation_chrome;
 mod openssh_and_tabby_ui;
 #[path = "suite/sftp_drawer_and_transfers.rs"]
 mod sftp_drawer_and_transfers;
+#[path = "suite/sftp_resilience_ui.rs"]
+mod sftp_resilience_ui;
 #[path = "suite/ssh_session_ui.rs"]
 mod ssh_session_ui;
 #[path = "suite/workspace_tree.rs"]

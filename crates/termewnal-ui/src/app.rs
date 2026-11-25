@@ -26,8 +26,9 @@ use termewnal_pty::{
     TerminalBuffer, TerminalSnapshot, detect_default_shell,
 };
 use termewnal_ssh::{
-    ConnectionSupervisor, OsAgentConnector, ProfileTransportKey, RemoteListing, SftpEndpoint,
-    SftpManager, SshConnectConfig, SshSession, SupervisorConfig, TransferId, TransferQueue,
+    ConflictResolution, ConnectionSupervisor, DirectoryTransferSummary, OsAgentConnector,
+    ProfileTransportKey, RemoteListing, SftpEndpoint, SftpManager, SshConnectConfig, SshSession,
+    SupervisorConfig, TransferId, TransferNotice, TransferQueue, TransferQueueConfig,
     TransferQueueSnapshot, TransportStatus, join_remote_path, parent_remote_path,
 };
 use tokio::sync::mpsc;
@@ -44,7 +45,9 @@ use crate::command_palette::{
 };
 use crate::config_reload_ui::ConfigReloadUiState;
 use crate::ipc::{IpcCommand, IpcServerHandle};
-use crate::sftp_drawer::{SftpDrawerDock, SftpDrawerState, render_sftp_drawer};
+use crate::sftp_drawer::{
+    SftpDrawerDock, SftpDrawerState, render_conflict_resolution_modal, render_sftp_drawer,
+};
 use crate::sidebar::{
     ActiveTunnelEntry, SidebarSection, SidebarState, SystemSshProfile, render_sidebar,
 };
@@ -646,6 +649,10 @@ pub enum Message {
         remote_path: String,
         file_name: String,
     },
+    SftpDownloadDir {
+        remote_path: String,
+        dir_name: String,
+    },
     SftpDrawerFileDropped {
         path: PathBuf,
     },
@@ -658,7 +665,17 @@ pub enum Message {
         session_id: SessionId,
         result: Result<(), String>,
     },
+    SftpDirEnqueueResult {
+        result: Result<DirectoryTransferSummary, String>,
+    },
     TransferQueueUpdated(TransferQueueSnapshot),
+    TransferConflictRenameInputChanged(String),
+    TransferConflictApplyToAllToggled(bool),
+    ResolveTransferConflict {
+        transfer_id: TransferId,
+        resolution: ConflictResolution,
+        apply_to_all: bool,
+    },
     PauseTransfer(TransferId),
     ResumeTransfer(TransferId),
     CancelTransfer(TransferId),
@@ -794,7 +811,13 @@ impl AppState {
             Arc::clone(&tracker) as Arc<dyn BackgroundWorkSource>;
         let workspace_ids = WorkspaceIds::new();
         let sftp_manager = SftpManager::new();
-        let transfer_queue = TransferQueue::new(sftp_manager.clone());
+        let transfer_queue = TransferQueue::with_config(
+            sftp_manager.clone(),
+            TransferQueueConfig {
+                transfer: config.transfer.clone(),
+                ..TransferQueueConfig::default()
+            },
+        );
         let download_dir = paths.cache_dir().join("downloads");
         let mut state = Self {
             paths,
@@ -2464,6 +2487,8 @@ impl AppState {
                             );
                             if matches!(reloaded, Ok(true)) {
                                 self.sync_terminal_options_to_sessions();
+                                self.transfer_queue
+                                    .set_transfer_config(self.config.transfer.clone());
                             }
                             reloaded
                         }
@@ -2490,6 +2515,8 @@ impl AppState {
                         self.last_error = None;
                         if kind == ConfigFileKind::AppConfig {
                             self.sync_terminal_options_to_sessions();
+                            self.transfer_queue
+                                .set_transfer_config(self.config.transfer.clone());
                         }
                     }
                     Err(err) => {
@@ -2951,6 +2978,10 @@ impl AppState {
                 self.enqueue_sftp_download(remote_path, file_name);
                 Task::none()
             }
+            Message::SftpDownloadDir {
+                remote_path,
+                dir_name,
+            } => self.enqueue_sftp_download_dir(remote_path, dir_name),
             Message::SftpDrawerFileDropped { path } => {
                 if let Some(session_id) = self.resolve_sftp_session_id() {
                     let action =
@@ -2985,8 +3016,39 @@ impl AppState {
                     Task::none()
                 }
             },
+            Message::SftpDirEnqueueResult { result } => {
+                match result {
+                    Ok(summary) => {
+                        self.record_dir_transfer_notices(&summary);
+                        self.sync_transfer_telemetry();
+                    }
+                    Err(err) => {
+                        self.sftp_drawer.set_browser_error(Some(err));
+                    }
+                }
+                Task::none()
+            }
             Message::TransferQueueUpdated(snap) => {
                 self.sftp_drawer.set_queue_snapshot(snap);
+                self.sync_transfer_telemetry();
+                Task::none()
+            }
+            Message::TransferConflictRenameInputChanged(input) => {
+                self.sftp_drawer.set_conflict_rename_input(input);
+                Task::none()
+            }
+            Message::TransferConflictApplyToAllToggled(apply_to_all) => {
+                self.sftp_drawer.set_conflict_apply_to_all(apply_to_all);
+                Task::none()
+            }
+            Message::ResolveTransferConflict {
+                transfer_id,
+                resolution,
+                apply_to_all,
+            } => {
+                let _ = self
+                    .transfer_queue
+                    .resolve_conflict(transfer_id, resolution, apply_to_all);
                 self.sync_transfer_telemetry();
                 Task::none()
             }
@@ -3092,9 +3154,10 @@ impl AppState {
                 supervisor,
                 ..
             } => {
+                let sftp_key = slot.sftp_key();
                 if let Some(ref session) = ssh {
                     self.sftp_manager.register_primary_transport(
-                        slot.sftp_key(),
+                        sftp_key.clone(),
                         Arc::clone(session.primary_transport()),
                     );
                 }
@@ -3105,6 +3168,9 @@ impl AppState {
                 slot.transport_status = TransportStatus::Connected { latency_ms: None };
                 slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
                 slot.snapshot = Arc::new(slot.buffer.snapshot());
+                if self.transfer_queue.resume_reconnected(&sftp_key) > 0 {
+                    self.sync_transfer_telemetry();
+                }
                 if self.sftp_drawer.is_open()
                     && (self.sftp_drawer.bound_session_id().is_none()
                         || self.sftp_drawer.bound_session_id() == Some(session_id))
@@ -3117,11 +3183,13 @@ impl AppState {
             SshUiEvent::TransportStatus {
                 status, last_error, ..
             } => {
+                let sftp_key = slot.sftp_key();
+                let mut resumed = 0;
                 if !matches!(
                     status,
                     TransportStatus::Connected { .. } | TransportStatus::Degraded { .. }
                 ) {
-                    self.sftp_manager.clear_primary_transport(&slot.sftp_key());
+                    self.sftp_manager.clear_primary_transport(&sftp_key);
                     slot.active = None;
                 }
                 if matches!(status, TransportStatus::Connected { .. }) {
@@ -3129,13 +3197,12 @@ impl AppState {
                     slot.exited = None;
                     if let Some(sup) = &slot.supervisor {
                         if let Some(transport) = sup.current_transport() {
-                            self.sftp_manager.register_primary_transport(
-                                slot.sftp_key(),
-                                Arc::clone(&transport),
-                            );
+                            self.sftp_manager
+                                .register_primary_transport(sftp_key.clone(), Arc::clone(&transport));
                             slot.active = Some(Arc::new(SshSession::from_supervised(transport, sup)));
                         }
                     }
+                    resumed = self.transfer_queue.resume_reconnected(&sftp_key);
                 } else if let Some(err) = last_error {
                     slot.last_error = Some(err.clone());
                     self.last_error = Some(err);
@@ -3143,6 +3210,9 @@ impl AppState {
                 slot.transport_status = status;
                 slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
                 slot.snapshot = Arc::new(slot.buffer.snapshot());
+                if resumed > 0 {
+                    self.sync_transfer_telemetry();
+                }
                 Task::none()
             }
             SshUiEvent::HostKeyPrompt {
@@ -3409,6 +3479,11 @@ impl AppState {
         }
         if self.tabby_import.is_open() {
             layers = layers.push(self.tabby_import.view(&palette, self.vault.requires_unlock()));
+        }
+        if let Some(conflict_modal) =
+            render_conflict_resolution_modal(&self.sftp_drawer, &palette)
+        {
+            layers = layers.push(conflict_modal);
         }
         if self.command_palette.is_open() {
             let items = self.command_palette_items();
@@ -4509,10 +4584,29 @@ impl AppState {
         )
     }
 
+    fn reset_transfer_conflict_override_if_idle(&self) {
+        let snap = self.transfer_queue.snapshot();
+        if !snap.has_incomplete_work() && snap.awaiting_conflict_count == 0 {
+            self.transfer_queue.reset_conflict_policy_override();
+        }
+    }
+
+    fn record_dir_transfer_notices(&mut self, summary: &DirectoryTransferSummary) {
+        if let Some(first_skipped) = summary.skipped_symlinks.first() {
+            let notice = TransferNotice::SymlinkSkipped {
+                path: first_skipped.clone(),
+                is_loop: !summary.skipped_symlink_loops.is_empty(),
+            };
+            self.sftp_drawer
+                .set_last_transfer_notice(Some(notice.summary()));
+        }
+    }
+
     fn enqueue_sftp_upload(&mut self, session_id: SessionId, local_path: PathBuf) {
         let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
             return;
         };
+        self.reset_transfer_conflict_override_if_idle();
         let file_name = local_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -4524,9 +4618,18 @@ impl AppState {
             join_remote_path(&remote_dir, &file_name)
         };
         let endpoint = slot.sftp_endpoint(&self.vault);
-        self.transfer_queue
-            .enqueue_upload(endpoint, local_path, remote_path);
-        self.sync_transfer_telemetry();
+        match self
+            .transfer_queue
+            .enqueue_upload_path(endpoint, local_path, remote_path)
+        {
+            Ok(summary) => {
+                self.record_dir_transfer_notices(&summary);
+                self.sync_transfer_telemetry();
+            }
+            Err(err) => {
+                self.sftp_drawer.set_browser_error(Some(err.to_string()));
+            }
+        }
     }
 
     fn enqueue_sftp_download(&mut self, remote_path: String, file_name: String) {
@@ -4539,11 +4642,37 @@ impl AppState {
         let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
             return;
         };
+        self.reset_transfer_conflict_override_if_idle();
         let local_path = self.sftp_drawer.download_dir().join(&file_name);
         let endpoint = slot.sftp_endpoint(&self.vault);
         self.transfer_queue
             .enqueue_download(endpoint, remote_path, local_path);
         self.sync_transfer_telemetry();
+    }
+
+    fn enqueue_sftp_download_dir(&mut self, remote_path: String, dir_name: String) -> Task<Message> {
+        let Some(session_id) = self.resolve_sftp_session_id() else {
+            self.sftp_drawer.set_browser_error(Some(
+                "Connect an SSH Session before downloading folders.".to_string(),
+            ));
+            return Task::none();
+        };
+        let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
+            return Task::none();
+        };
+        self.reset_transfer_conflict_override_if_idle();
+        let local_dir = self.sftp_drawer.download_dir().join(&dir_name);
+        let endpoint = slot.sftp_endpoint(&self.vault);
+        let queue = self.transfer_queue.clone();
+        Task::perform(
+            async move {
+                queue
+                    .enqueue_download_dir(endpoint, remote_path, local_dir)
+                    .await
+                    .map_err(|err| err.to_string())
+            },
+            |result| Message::SftpDirEnqueueResult { result },
+        )
     }
 
     fn sync_transfer_telemetry(&mut self) {

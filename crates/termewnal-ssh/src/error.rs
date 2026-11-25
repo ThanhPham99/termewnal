@@ -89,6 +89,10 @@ pub enum SshError {
     #[error("SSH session is disconnected")]
     Disconnected,
 
+    /// `Transfer Transport` or SFTP stream dropped unexpectedly mid-transfer.
+    #[error("transfer transport dropped: {0}")]
+    TransferTransportDropped(String),
+
     /// Underlying `russh` protocol error.
     #[error("SSH protocol error: {0}")]
     Russh(#[from] russh::Error),
@@ -102,6 +106,23 @@ pub enum SshError {
     Io(#[from] std::io::Error),
 }
 
+fn is_sftp_client_transport_drop(err: &russh_sftp::client::error::Error) -> bool {
+    match err {
+        russh_sftp::client::error::Error::IO(_) | russh_sftp::client::error::Error::Timeout => true,
+        russh_sftp::client::error::Error::UnexpectedBehavior(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("sender dropped")
+                || lower.contains("senderror")
+                || lower.contains("recverror")
+                || lower.contains("eof")
+                || lower.contains("closed")
+                || lower.contains("reset")
+                || lower.contains("broken pipe")
+        }
+        _ => false,
+    }
+}
+
 impl From<russh_sftp::client::error::Error> for SshError {
     fn from(err: russh_sftp::client::error::Error) -> Self {
         match err {
@@ -109,7 +130,38 @@ impl From<russh_sftp::client::error::Error> for SshError {
                 status_code: status.status_code,
                 message: status.error_message,
             },
+            other if is_sftp_client_transport_drop(&other) => {
+                Self::TransferTransportDropped(other.to_string())
+            }
             other => Self::Sftp(other.to_string()),
         }
+    }
+}
+
+/// Classifies an `io::Error` returned by remote `russh_sftp::client::fs::File` read/write/close
+/// operations so remote transport drops are cleanly distinguished from local filesystem `Io` errors.
+pub(crate) fn map_remote_sftp_io_error(err: std::io::Error) -> SshError {
+    if let Some(sftp_err) = err
+        .get_ref()
+        .and_then(|inner| inner.downcast_ref::<russh_sftp::client::error::Error>())
+    {
+        return match sftp_err {
+            russh_sftp::client::error::Error::Status(status) => SshError::SftpStatus {
+                status_code: status.status_code,
+                message: status.error_message.clone(),
+            },
+            other if is_sftp_client_transport_drop(other) => {
+                SshError::TransferTransportDropped(other.to_string())
+            }
+            other => SshError::Sftp(other.to_string()),
+        };
+    }
+    match err.kind() {
+        std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::TimedOut => SshError::TransferTransportDropped(err.to_string()),
+        _ => SshError::Sftp(err.to_string()),
     }
 }
