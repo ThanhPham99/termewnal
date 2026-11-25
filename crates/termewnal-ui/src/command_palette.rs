@@ -141,6 +141,7 @@ pub enum PaletteAction {
     CloseFocusedPane,
     OpenQuickConnectPrompt,
     OpenTabbyImporter,
+    OpenTunnelCreator,
     ReloadSystemSsh,
     QuickConnect(QuickConnectTarget),
     ProbeReconnectAll,
@@ -659,6 +660,21 @@ fn workspace_command_items() -> Vec<PaletteItem> {
             ],
             shortcut: Some("Ctrl+Shift+E".to_string()),
             action: PaletteAction::ToggleSftpDrawer,
+        },
+        PaletteItem {
+            id: "cmd:new-tunnel".to_string(),
+            category: PaletteCategory::Command,
+            title: "New SSH Tunnel (-L / -D)...".to_string(),
+            subtitle: "Define a Local (-L) or Dynamic SOCKS5 (-D) Tunnel (Session or Standalone)"
+                .to_string(),
+            keywords: vec![
+                "tunnel".to_string(),
+                "socks5".to_string(),
+                "forward".to_string(),
+                "standalone".to_string(),
+            ],
+            shortcut: None,
+            action: PaletteAction::OpenTunnelCreator,
         },
         PaletteItem {
             id: "cmd:close-pane".to_string(),
