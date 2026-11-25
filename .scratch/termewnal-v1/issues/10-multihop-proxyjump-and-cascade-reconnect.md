@@ -4,9 +4,13 @@
 
 **Blocked by:** 08: Read-Only ~/.ssh/config & Tabby config.yaml Importer, 09: Connection Supervisor (Keepalive, Wake Probe, Backoff & Mux Recovery)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] `Profile`s (including cloned/parsed `~/.ssh/config` hosts) support ordered multi-hop `ProxyJump` chains over nested `russh` `direct-tcpip` streams (`connect_stream`).
-- [ ] Each hop authenticates using its own `Profile`/OpenSSH credentials (`Vault`, SSH Agent, or interactive prompt) and enforces strict `known_hosts` verification per hop.
-- [ ] When any upstream hop in an active chain disconnects or fails keepalive, Connection Supervisor tears down all dependent inner hops cleanly before rebuilding the chain from the outermost hop inward (`A -> B -> C`).
-- [ ] Multi-hop in-process `russh` chain tests verify initial end-to-end connection and clean cascade recovery when the bastion hop drops mid-session.
+- [x] `Profile`s (including cloned/parsed `~/.ssh/config` hosts) support ordered multi-hop `ProxyJump` chains over nested `russh` `direct-tcpip` streams (`connect_stream`).
+- [x] Each hop authenticates using its own `Profile`/OpenSSH credentials (`Vault`, SSH Agent, or interactive prompt) and enforces strict `known_hosts` verification per hop.
+- [x] When any upstream hop in an active chain disconnects or fails keepalive, Connection Supervisor tears down all dependent inner hops cleanly before rebuilding the chain from the outermost hop inward (`A -> B -> C`).
+- [x] Multi-hop in-process `russh` chain tests verify initial end-to-end connection and clean cascade recovery when the bastion hop drops mid-session.
+
+## Comments
+
+- Resolved on integration branch `feat/termewnal-v1` (merged at `769c4c2`, post-review fixes at `66ecbb3`, verified with `cargo check --workspace --all-targets` and `cargo test --workspace` — 154 passed, 0 failed, 0 ignored).

@@ -4,10 +4,14 @@
 
 **Blocked by:** 02: Workspace Tabs, Split Panes, Pane Zoom & Broadcast Input
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Pressing `Ctrl+B` toggles the Left Sidebar, displaying Saved `Profile`s organized by group/tag alongside placeholders/sections for System SSH `Profile`s and Active `Tunnel`s.
-- [ ] Pressing `Ctrl+K` or `Ctrl+Shift+P` opens a searchable Command Palette supporting `Profile` launching, Quick Connect triggering, active `Session` switching, and workspace commands.
-- [ ] Clicking or selecting a Saved `Profile` opens a new `Session` in the active tab or split pane using its configured settings.
-- [ ] A persistent bottom Status Bar renders active `Session` status slots and exposes clean state hooks for future `Transport`, `Tunnel`, and `Transfer` controls.
-- [ ] Top-level `iced` `update()` tests verify sidebar toggling, Command Palette fuzzy filtering/execution, and `Profile` launch actions.
+- [x] Pressing `Ctrl+B` toggles the Left Sidebar, displaying Saved `Profile`s organized by group/tag alongside placeholders/sections for System SSH `Profile`s and Active `Tunnel`s.
+- [x] Pressing `Ctrl+K` or `Ctrl+Shift+P` opens a searchable Command Palette supporting `Profile` launching, Quick Connect triggering, active `Session` switching, and workspace commands.
+- [x] Clicking or selecting a Saved `Profile` opens a new `Session` in the active tab or split pane using its configured settings.
+- [x] A persistent bottom Status Bar renders active `Session` status slots and exposes clean state hooks for future `Transport`, `Tunnel`, and `Transfer` controls.
+- [x] Top-level `iced` `update()` tests verify sidebar toggling, Command Palette fuzzy filtering/execution, and `Profile` launch actions.
+
+## Comments
+
+- Resolved on integration branch `feat/termewnal-v1` (merged at `ee5f1b3`, post-review fixes at `66ecbb3`, verified with `cargo check --workspace --all-targets` and `cargo test --workspace` — 154 passed, 0 failed, 0 ignored).

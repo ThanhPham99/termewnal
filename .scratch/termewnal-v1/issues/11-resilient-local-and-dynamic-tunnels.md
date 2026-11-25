@@ -4,10 +4,14 @@
 
 **Blocked by:** 04: Command Palette, Collapsible Sidebar & Status Bar, 05: Single-Instance IPC, Multi-Window, Workspace Restore & Close Guard, 09: Connection Supervisor (Keepalive, Wake Probe, Backoff & Mux Recovery)
 
-**Status:** ready-for-agent
+**Status:** resolved
 
-- [ ] Users can define and toggle Local (`-L`) and Dynamic SOCKS5 (`-D`) `Tunnel`s attached to a `Profile`/`Session` or running Standalone in the background independently of open terminal tabs.
-- [ ] Local listeners bind `127.0.0.1` by default and require explicit opt-in accompanied by a clear security warning before binding `0.0.0.0`.
-- [ ] During transient `Transport` disconnects and reconnects, the `Tunnel` keeps its local `TcpListener` bound (preventing `EADDRINUSE`) and holds incoming local client sockets up to a configurable 10-second grace timeout before resetting cleanly if recovery fails or is cancelled.
-- [ ] Active Standalone `Tunnel`s report to the Close Guard from ticket 05 and expose live state and 1-click toggle/reconnect controls in the Status Bar and Left Sidebar.
-- [ ] In-process `russh` integration tests verify Local and SOCKS5 traffic forwarding, zero `EADDRINUSE` across simulated disconnects, and seamless hold-and-flush for a local TCP client connecting mid-reconnect.
+- [x] Users can define and toggle Local (`-L`) and Dynamic SOCKS5 (`-D`) `Tunnel`s attached to a `Profile`/`Session` or running Standalone in the background independently of open terminal tabs.
+- [x] Local listeners bind `127.0.0.1` by default and require explicit opt-in accompanied by a clear security warning before binding `0.0.0.0`.
+- [x] During transient `Transport` disconnects and reconnects, the `Tunnel` keeps its local `TcpListener` bound (preventing `EADDRINUSE`) and holds incoming local client sockets up to a configurable 10-second grace timeout before resetting cleanly if recovery fails or is cancelled.
+- [x] Active Standalone `Tunnel`s report to the Close Guard from ticket 05 and expose live state and 1-click toggle/reconnect controls in the Status Bar and Left Sidebar.
+- [x] In-process `russh` integration tests verify Local and SOCKS5 traffic forwarding, zero `EADDRINUSE` across simulated disconnects, and seamless hold-and-flush for a local TCP client connecting mid-reconnect.
+
+## Comments
+
+- Resolved on integration branch `feat/termewnal-v1` (merged at `58008a0`, post-review fixes at `66ecbb3`, verified with `cargo check --workspace --all-targets` and `cargo test --workspace` — 154 passed, 0 failed, 0 ignored).
