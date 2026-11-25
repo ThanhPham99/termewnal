@@ -37,6 +37,7 @@ impl Write for ChannelWriteSink {
 
 /// Interactive PTY-backed SSH `Session` streaming terminal I/O into [`TerminalBuffer`].
 pub struct SshSession {
+    transport: Arc<SshTransport>,
     buffer: Arc<TerminalBuffer>,
     cmd_tx: mpsc::UnboundedSender<SessionCmd>,
     status: Arc<Mutex<TransportStatus>>,
@@ -90,6 +91,7 @@ impl SshSession {
         let rows = rows.max(1);
         buffer.resize(cols, rows);
 
+        let transport = Arc::new(transport);
         let channel = transport.open_session_channel().await?;
         let (mut rx, tx) = channel.split();
 
@@ -110,7 +112,7 @@ impl SshSession {
         let used_interactive_auth = transport.used_interactive_auth();
 
         spawn_channel_pump(
-            transport,
+            Arc::clone(&transport),
             rx,
             tx,
             cmd_rx,
@@ -119,11 +121,17 @@ impl SshSession {
         );
 
         Ok(Self {
+            transport,
             buffer,
             cmd_tx,
             status,
             used_interactive_auth,
         })
+    }
+
+    /// Returns the active SSH `Primary Transport` backing this `Session`.
+    pub fn primary_transport(&self) -> &Arc<SshTransport> {
+        &self.transport
     }
 
     /// Returns the shared [`TerminalBuffer`] fed by this SSH session.
@@ -233,7 +241,7 @@ async fn await_channel_reply(
 }
 
 fn spawn_channel_pump(
-    transport: SshTransport,
+    transport: Arc<SshTransport>,
     mut rx: russh::ChannelReadHalf,
     tx: russh::ChannelWriteHalf<ClientMsg>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
@@ -299,6 +307,6 @@ fn spawn_channel_pump(
             *guard = TransportStatus::Disconnected;
         }
         buffer.mark_exited(exit_code);
-        let _ = transport.disconnect().await;
+        let _ = transport.disconnect_shared().await;
     });
 }

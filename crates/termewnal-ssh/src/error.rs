@@ -74,6 +74,17 @@ pub enum SshError {
     #[error("SSH channel error: {0}")]
     Channel(String),
 
+    /// SFTP protocol or remote filesystem operation error.
+    #[error("SFTP error: {0}")]
+    Sftp(String),
+
+    /// Remote SFTP server returned an explicit `SSH_FXP_STATUS` failure.
+    #[error("SFTP status {status_code:?}: {message}")]
+    SftpStatus {
+        status_code: russh_sftp::protocol::StatusCode,
+        message: String,
+    },
+
     /// `Session` or `Transport` is disconnected.
     #[error("SSH session is disconnected")]
     Disconnected,
@@ -89,4 +100,16 @@ pub enum SshError {
     /// Local filesystem or socket I/O error.
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+impl From<russh_sftp::client::error::Error> for SshError {
+    fn from(err: russh_sftp::client::error::Error) -> Self {
+        match err {
+            russh_sftp::client::error::Error::Status(status) => Self::SftpStatus {
+                status_code: status.status_code,
+                message: status.error_message,
+            },
+            other => Self::Sftp(other.to_string()),
+        }
+    }
 }
