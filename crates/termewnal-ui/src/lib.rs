@@ -5,6 +5,7 @@ pub mod close_guard;
 pub mod command_palette;
 pub mod config_reload_ui;
 pub mod ipc;
+pub mod sftp_drawer;
 pub mod sidebar;
 pub mod split_view;
 pub mod ssh_ui;
@@ -29,6 +30,10 @@ pub use command_palette::{
 };
 pub use config_reload_ui::ConfigReloadUiState;
 pub use ipc::{IpcCommand, IpcError, IpcServerHandle, LaunchOutcome, acquire_or_forward, send_command};
+pub use sftp_drawer::{
+    DEFAULT_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH, MIN_SFTP_DRAWER_WIDTH, SftpDrawerDock,
+    SftpDrawerState, render_sftp_drawer,
+};
 pub use sidebar::{
     ActiveTunnelEntry, ProfileGroupView, SidebarSection, SidebarState, SystemSshProfile,
     TunnelRuntimeState, UNGROUPED_LABEL,

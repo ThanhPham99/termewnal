@@ -273,10 +273,15 @@ impl SshTransport {
     }
 
     /// Sends an SSH `SSH_MSG_DISCONNECT` cleanly and shuts down the transport.
-    pub async fn disconnect(self) -> Result<(), SshError> {
+    pub async fn disconnect_shared(&self) -> Result<(), SshError> {
         self.handle
             .disconnect(Disconnect::ByApplication, "closed by user", "en")
             .await?;
         Ok(())
+    }
+
+    /// Sends an SSH `SSH_MSG_DISCONNECT` cleanly and shuts down the transport.
+    pub async fn disconnect(self) -> Result<(), SshError> {
+        self.disconnect_shared().await
     }
 }

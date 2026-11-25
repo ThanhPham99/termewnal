@@ -614,8 +614,9 @@ fn workspace_shortcuts_map_cleanly_without_hijacking_terminal_keys() {
         Some(Message::MoveFocus(FocusDirection::Right))
     ));
 
-    // Regular shell control keys and reserved shortcuts (Ctrl+F, Ctrl+Shift+E)
-    // must NOT be hijacked by workspace shortcuts; Ctrl+B toggles Sidebar and Ctrl+K opens Command Palette.
+    // Regular shell control keys and Ctrl+F (handled separately by window_shortcut_event)
+    // must NOT be hijacked by workspace shortcuts; Ctrl+B toggles Sidebar, Ctrl+K opens Command Palette,
+    // and Ctrl+Shift+E toggles the SFTP Drawer.
     assert!(shortcut_for_key_event(&Key::Character("c".into()), Modifiers::CTRL, tab).is_none());
     assert!(shortcut_for_key_event(&Key::Character("d".into()), Modifiers::CTRL, tab).is_none());
     assert!(matches!(
@@ -627,5 +628,8 @@ fn workspace_shortcuts_map_cleanly_without_hijacking_terminal_keys() {
         shortcut_for_key_event(&Key::Character("k".into()), Modifiers::CTRL, tab),
         Some(Message::ToggleCommandPalette)
     ));
-    assert!(shortcut_for_key_event(&Key::Character("E".into()), ctrl_shift, tab).is_none());
+    assert!(matches!(
+        shortcut_for_key_event(&Key::Character("E".into()), ctrl_shift, tab),
+        Some(Message::ToggleSftpDrawer)
+    ));
 }
