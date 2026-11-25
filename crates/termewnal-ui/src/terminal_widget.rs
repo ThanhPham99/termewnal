@@ -23,6 +23,7 @@ pub struct TerminalViewport {
     snapshot: Arc<TerminalSnapshot>,
     font: Font,
     font_size: f32,
+    explicit_focus: Option<bool>,
 }
 
 impl TerminalViewport {
@@ -37,6 +38,23 @@ impl TerminalViewport {
             snapshot,
             font: Font::MONOSPACE,
             font_size: font_size.max(6.0),
+            explicit_focus: None,
+        })
+    }
+
+    /// Creates a [`TerminalViewport`] element whose focus state is explicitly controlled by a parent pane.
+    pub fn with_focus(
+        session_id: SessionId,
+        snapshot: Arc<TerminalSnapshot>,
+        font_size: f32,
+        focused: bool,
+    ) -> Element<'static, Message, Theme, iced::Renderer> {
+        Element::new(Self {
+            session_id,
+            snapshot,
+            font: Font::MONOSPACE,
+            font_size: font_size.max(6.0),
+            explicit_focus: Some(focused),
         })
     }
 }
@@ -90,6 +108,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<ViewportState>();
+        let is_focused = self.explicit_focus.unwrap_or(state.focused);
         let bounds = layout.bounds();
         let cell_size = measure_cell_size(self.font, self.font_size);
 
@@ -114,23 +133,25 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 }
 
                 if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
-                    if state.focused {
+                    if is_focused {
                         let cursor_rect = cursor_pixel_rect(&self.snapshot, bounds, cell_size);
                         shell.request_input_method::<&str>(&InputMethod::Enabled {
                             cursor: cursor_rect,
                             purpose: input_method::Purpose::Terminal,
                             preedit: None,
                         });
-                    } else {
+                    } else if self.explicit_focus.is_none() {
                         shell.request_input_method::<&str>(&InputMethod::Disabled);
                     }
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let was_focused = state.focused;
-                state.focused = cursor.is_over(bounds);
-                if state.focused != was_focused {
-                    shell.request_redraw();
+                if self.explicit_focus.is_none() {
+                    let was_focused = state.focused;
+                    state.focused = cursor.is_over(bounds);
+                    if state.focused != was_focused {
+                        shell.request_redraw();
+                    }
                 }
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
@@ -140,7 +161,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 text,
                 ..
             }) => {
-                if state.focused {
+                if is_focused {
                     let bytes =
                         key_event_to_bytes(key, modified_key, *modifiers, text.as_deref());
                     if !bytes.is_empty() {
@@ -160,7 +181,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                     shell.request_redraw();
                 }
                 input_method::Event::Commit(committed) => {
-                    if state.focused && !committed.is_empty() {
+                    if is_focused && !committed.is_empty() {
                         shell.publish(Message::TerminalInput {
                             session_id: self.session_id,
                             bytes: committed.as_bytes().to_vec(),
@@ -202,6 +223,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         use iced::advanced::text::Renderer as _;
 
         let state = tree.state.downcast_ref::<ViewportState>();
+        let is_focused = self.explicit_focus.unwrap_or(state.focused);
         let bounds = layout.bounds();
         let Some(clip_bounds) = bounds.intersection(viewport) else {
             return;
@@ -323,7 +345,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         {
             let cursor_rect = cursor_pixel_rect(&self.snapshot, bounds, cell_size);
             let cursor_color = Color {
-                a: if state.focused { 0.75 } else { 0.35 },
+                a: if is_focused { 0.75 } else { 0.35 },
                 ..palette.cursor
             };
 
