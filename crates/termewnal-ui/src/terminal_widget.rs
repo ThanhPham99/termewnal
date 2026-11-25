@@ -203,6 +203,7 @@ pub struct TerminalViewport {
     font: Font,
     search_matches: Arc<[GridSearchMatch]>,
     active_search_match: Option<usize>,
+    explicit_focus: Option<bool>,
 }
 
 impl TerminalViewport {
@@ -214,10 +215,45 @@ impl TerminalViewport {
         search_matches: Arc<[GridSearchMatch]>,
         active_search_match: Option<usize>,
     ) -> Element<'static, Message, Theme, iced::Renderer> {
+        Self::build(
+            session_id,
+            snapshot,
+            options,
+            search_matches,
+            active_search_match,
+            None,
+        )
+    }
+
+    /// Creates a [`TerminalViewport`] element whose focus state is explicitly controlled by a parent pane.
+    pub fn with_focus(
+        session_id: SessionId,
+        snapshot: Arc<TerminalSnapshot>,
+        options: TerminalViewOptions,
+        search_matches: Arc<[GridSearchMatch]>,
+        active_search_match: Option<usize>,
+        focused: bool,
+    ) -> Element<'static, Message, Theme, iced::Renderer> {
+        Self::build(
+            session_id,
+            snapshot,
+            options,
+            search_matches,
+            active_search_match,
+            Some(focused),
+        )
+    }
+
+    fn build(
+        session_id: SessionId,
+        snapshot: Arc<TerminalSnapshot>,
+        mut options: TerminalViewOptions,
+        search_matches: Arc<[GridSearchMatch]>,
+        active_search_match: Option<usize>,
+        explicit_focus: Option<bool>,
+    ) -> Element<'static, Message, Theme, iced::Renderer> {
         let font = resolve_font(&options.font_family);
-        let font_size = options.font_size.max(6.0);
-        let mut options = options;
-        options.font_size = font_size;
+        options.font_size = options.font_size.max(6.0);
 
         Element::new(Self {
             session_id,
@@ -226,6 +262,7 @@ impl TerminalViewport {
             font,
             search_matches,
             active_search_match,
+            explicit_focus,
         })
     }
 }
@@ -291,6 +328,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<ViewportState>();
+        let is_focused = self.explicit_focus.unwrap_or(state.focused);
         let bounds = layout.bounds();
         let cell_size = measure_cell_size(self.font, self.options.font_size);
 
@@ -315,7 +353,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 }
 
                 if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
-                    if self.options.ime_enabled && state.focused {
+                    if self.options.ime_enabled && is_focused {
                         let cursor_rect = ime_cursor_anchor_rect(&self.snapshot, bounds, cell_size);
                         let preedit = state.ime.to_iced_preedit(self.options.font_size);
                         shell.request_input_method(&InputMethod::Enabled {
@@ -323,14 +361,14 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                             purpose: input_method::Purpose::Terminal,
                             preedit,
                         });
-                    } else if self.options.ime_enabled && !state.focused {
+                    } else if self.options.ime_enabled && self.explicit_focus.is_none() && !is_focused {
                         shell.request_input_method::<&str>(&InputMethod::Disabled);
                     }
                 }
             }
             Event::Window(window::Event::FileDropped(path)) => {
                 let over_pane = cursor.is_over(bounds)
-                    || (matches!(cursor, mouse::Cursor::Unavailable) && state.focused);
+                    || (matches!(cursor, mouse::Cursor::Unavailable) && is_focused);
                 if over_pane {
                     shell.publish(Message::FileDropped {
                         session_id: self.session_id,
@@ -373,14 +411,17 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 }
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                let was_focused = state.focused;
-                state.focused = cursor.is_over(bounds);
-                if !state.focused {
-                    state.ime.clear();
-                    state.dragging_selection = false;
-                    if was_focused {
+                let clicked_inside = cursor.is_over(bounds);
+                if self.explicit_focus.is_none() {
+                    let was_focused = state.focused;
+                    state.focused = clicked_inside;
+                    if state.focused != was_focused {
                         shell.request_redraw();
                     }
+                }
+                if !clicked_inside {
+                    state.ime.clear();
+                    state.dragging_selection = false;
                     return;
                 }
 
@@ -411,9 +452,6 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                         selection_type,
                     });
                     shell.capture_event();
-                }
-                if state.focused != was_focused {
-                    shell.request_redraw();
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
@@ -470,7 +508,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 ..
             }) => {
                 state.modifiers = *modifiers;
-                if self.options.ime_enabled && state.focused {
+                if self.options.ime_enabled && is_focused {
                     if modifiers.control()
                         && !modifiers.shift()
                         && !modifiers.alt()
@@ -549,7 +587,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 }
             }
             Event::InputMethod(ev) => {
-                if !self.options.ime_enabled || !state.focused {
+                if !self.options.ime_enabled || !is_focused {
                     if matches!(ev, input_method::Event::Closed) {
                         state.ime.clear();
                     }
@@ -612,6 +650,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         use iced::advanced::text::Renderer as _;
 
         let state = tree.state.downcast_ref::<ViewportState>();
+        let is_focused = self.explicit_focus.unwrap_or(state.focused);
         let bounds = layout.bounds();
         let Some(clip_bounds) = bounds.intersection(viewport) else {
             return;
@@ -769,7 +808,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         {
             let cursor_rect = ime_cursor_anchor_rect(&self.snapshot, bounds, cell_size);
             let cursor_color = Color {
-                a: if state.focused { 0.75 } else { 0.35 },
+                a: if is_focused { 0.75 } else { 0.35 },
                 ..palette.cursor
             };
 
@@ -820,7 +859,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         }
 
         // Render active Vietnamese/CJK IME pre-edit overlay inline at the cursor cell.
-        if state.focused && !state.ime.content.is_empty() {
+        if is_focused && !state.ime.content.is_empty() {
             draw_ime_preedit(
                 renderer,
                 &state.ime.content,

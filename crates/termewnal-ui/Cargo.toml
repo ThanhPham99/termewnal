@@ -12,6 +12,7 @@ termewnal-core = { path = "../termewnal-core" }
 termewnal-pty = { path = "../termewnal-pty" }
 termewnal-ssh = { path = "../termewnal-ssh" }
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -12,6 +12,7 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const PROFILES_FILE_NAME: &str = "profiles.toml";
+const VAULT_FILE_NAME: &str = "vault.enc";
 
 /// Standard XDG/OS directory locations for Termewnal configuration and runtime state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +75,11 @@ impl ConfigPaths {
     /// Path to `profiles.toml`.
     pub fn profiles_file(&self) -> PathBuf {
         self.config_dir.join(PROFILES_FILE_NAME)
+    }
+
+    /// Path to the optional local encrypted `Vault` file under `data_local_dir()`.
+    pub fn vault_file(&self) -> PathBuf {
+        self.data_local_dir.join(VAULT_FILE_NAME)
     }
 }
 
@@ -150,6 +156,36 @@ impl Default for WindowConfig {
     }
 }
 
+/// Secret storage backend preference stored in `config.toml` (contains no secrets).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum VaultBackend {
+    /// Store credentials in the native OS keyring (`Secret Service` / `Keychain` / `Credential Manager`).
+    #[default]
+    Keyring,
+    /// Store credentials in a local Argon2id + AES-256-GCM encrypted `Vault` file.
+    EncryptedFile,
+}
+
+/// Non-secret `Vault` preferences stored in `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VaultConfig {
+    /// Active secret storage backend.
+    pub backend: VaultBackend,
+    /// Idle/sleep auto-lock timeout in minutes for the encrypted local `Vault` (`0` disables auto-lock).
+    pub auto_lock_minutes: u64,
+}
+
+impl Default for VaultConfig {
+    fn default() -> Self {
+        Self {
+            backend: VaultBackend::Keyring,
+            auto_lock_minutes: 30,
+        }
+    }
+}
+
 /// Non-secret application configuration persisted to `config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -157,6 +193,7 @@ pub struct AppConfig {
     pub schema_version: u32,
     pub terminal: TerminalConfig,
     pub window: WindowConfig,
+    pub vault: VaultConfig,
 }
 
 impl Default for AppConfig {
@@ -165,6 +202,7 @@ impl Default for AppConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
             terminal: TerminalConfig::default(),
             window: WindowConfig::default(),
+            vault: VaultConfig::default(),
         }
     }
 }
