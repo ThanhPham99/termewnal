@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use iced::widget::{Id, button, column, container, opaque, row, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Theme};
 use termewnal_core::{CursorStyle, RgbColor, ThemePalette};
-use termewnal_pty::{CursorShape, GridSearchMatch, PtySession, shell_escape_path};
+use termewnal_pty::{CursorShape, GridSearchMatch, PtySession, TerminalBuffer, shell_escape_path};
 
 use crate::app::{Message, SessionId};
 
@@ -167,9 +167,14 @@ pub struct SearchBarState {
 impl SearchBarState {
     /// Opens the search bar and refreshes matches against `session` if a query is already present.
     pub fn open(&mut self, session: Option<&PtySession>) -> Option<GridSearchMatch> {
+        self.open_buffer(session.map(|pty| pty.buffer().as_ref()))
+    }
+
+    /// Opens the search bar against a shared [`TerminalBuffer`] (local or SSH `Session`).
+    pub fn open_buffer(&mut self, buffer: Option<&TerminalBuffer>) -> Option<GridSearchMatch> {
         self.open = true;
         self.input_focused = true;
-        self.refresh_matches(session, true)
+        self.refresh_matches_buffer(buffer, true)
     }
 
     /// Closes the search bar and clears active match highlights.
@@ -186,8 +191,17 @@ impl SearchBarState {
         query: String,
         session: Option<&PtySession>,
     ) -> Option<GridSearchMatch> {
+        self.set_query_buffer(query, session.map(|pty| pty.buffer().as_ref()))
+    }
+
+    /// Updates the incremental search `query` against a [`TerminalBuffer`].
+    pub fn set_query_buffer(
+        &mut self,
+        query: String,
+        buffer: Option<&TerminalBuffer>,
+    ) -> Option<GridSearchMatch> {
         self.query = query;
-        self.refresh_matches(session, true)
+        self.refresh_matches_buffer(buffer, true)
     }
 
     /// Re-evaluates search matches against `session` (e.g. when new PTY output arrives).
@@ -196,14 +210,23 @@ impl SearchBarState {
         session: Option<&PtySession>,
         reset_to_first: bool,
     ) -> Option<GridSearchMatch> {
+        self.refresh_matches_buffer(session.map(|pty| pty.buffer().as_ref()), reset_to_first)
+    }
+
+    /// Re-evaluates search matches against a [`TerminalBuffer`].
+    pub fn refresh_matches_buffer(
+        &mut self,
+        buffer: Option<&TerminalBuffer>,
+        reset_to_first: bool,
+    ) -> Option<GridSearchMatch> {
         if !self.open || self.query.is_empty() {
             self.matches.clear();
             self.active_index = None;
             return None;
         }
 
-        self.matches = session
-            .map(|pty| pty.search_scrollback(&self.query))
+        self.matches = buffer
+            .map(|buf| buf.search_scrollback(&self.query))
             .unwrap_or_default();
 
         if self.matches.is_empty() {

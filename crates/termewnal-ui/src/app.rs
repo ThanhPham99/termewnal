@@ -22,9 +22,9 @@ use termewnal_core::{
 };
 use termewnal_pty::{
     GridSearchMatch, PtyEvent, PtySession, PtySpawnConfig, Scroll, SelectionType, ShellSpec, Side,
-    TerminalSnapshot, detect_default_shell,
+    TerminalBuffer, TerminalSnapshot, detect_default_shell,
 };
-use termewnal_ssh::TransportStatus;
+use termewnal_ssh::{OsAgentConnector, SshConnectConfig, SshSession, TransportStatus};
 use tokio::sync::mpsc;
 use tracing::{error, warn};
 use zeroize::Zeroize;
@@ -43,6 +43,7 @@ use crate::sidebar::{
     ActiveTunnelEntry, SidebarSection, SidebarState, SystemSshProfile, render_sidebar,
 };
 use crate::split_view::{CapturedEventGate, PaneFrame, ShortcutInterceptor, SplitView};
+use crate::ssh_ui::{SshTargetSpec, SshUiEvent, SshUiState, connect_ssh_task};
 use crate::status_bar::{
     SessionKindLabel, SessionStatusHook, StatusBarAction, StatusBarSnapshot, StatusBarState,
     TransferSummaryHook, TunnelSummaryHook, render_status_bar,
@@ -73,7 +74,7 @@ pub enum LaunchDisposition {
     Split(SplitAxis),
 }
 
-/// Target metadata for an SSH `Session` slot ready for Ticket 07 `russh` `Primary Transport` wiring.
+/// Target metadata for an SSH `Session`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SshSessionTarget {
     pub profile_id: Option<String>,
@@ -92,18 +93,82 @@ impl SshSessionTarget {
     pub fn display_addr(&self) -> String {
         format!("{}@{}:{}", self.username, self.host, self.port)
     }
+
+    fn from_target_spec(spec: &SshTargetSpec) -> Self {
+        Self {
+            profile_id: spec.profile_id.clone(),
+            name: spec.title.clone(),
+            host: spec.connect_config.host.clone(),
+            port: spec.connect_config.port,
+            username: spec.connect_config.username.clone(),
+            auth: spec.connect_config.auth.clone(),
+            proxy_jump: Vec::new(),
+            auto_connect_on_startup: spec.auto_connect_on_startup,
+            tmux_reattach: None,
+        }
+    }
+
+    fn to_target_spec(
+        &self,
+        title: &str,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+    ) -> SshTargetSpec {
+        SshTargetSpec {
+            profile_id: self.profile_id.clone(),
+            title: title.to_string(),
+            connect_config: SshConnectConfig {
+                host: self.host.clone(),
+                port: self.port,
+                username: self.username.clone(),
+                auth: self.auth.clone(),
+                known_hosts_path: None,
+                nodelay: true,
+                term_name: "xterm-256color".to_string(),
+                cols: cols.max(1),
+                rows: rows.max(1),
+                scrollback_lines,
+            },
+            agent_connector: Arc::new(OsAgentConnector::default()),
+            auto_connect_on_startup: self.auto_connect_on_startup,
+        }
+    }
 }
 
-/// Runtime slot representing an SSH `Session` before/during `russh` `Primary Transport` attachment.
-#[derive(Debug, Clone)]
+/// Runtime slot representing an SSH `Session` and its `russh` `Primary Transport`.
+#[derive(Clone)]
 pub struct SshSessionSlot {
     id: SessionId,
     title: String,
     target: SshSessionTarget,
+    spec: SshTargetSpec,
     transport_status: TransportStatus,
     status_message: String,
     cols: u16,
     rows: u16,
+    buffer: Arc<TerminalBuffer>,
+    snapshot: Arc<TerminalSnapshot>,
+    exited: Option<Option<i32>>,
+    generation: u64,
+    active: Option<Arc<SshSession>>,
+    last_error: Option<String>,
+}
+
+impl std::fmt::Debug for SshSessionSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SshSessionSlot")
+            .field("id", &self.id)
+            .field("title", &self.title)
+            .field("target", &self.target)
+            .field("transport_status", &self.transport_status)
+            .field("status_message", &self.status_message)
+            .field("cols", &self.cols)
+            .field("rows", &self.rows)
+            .field("generation", &self.generation)
+            .field("connected", &self.active.is_some())
+            .finish()
+    }
 }
 
 impl SshSessionSlot {
@@ -135,6 +200,41 @@ impl SshSessionSlot {
     /// Returns the tracked `(cols, rows)` terminal grid dimensions for this SSH slot.
     pub fn dimensions(&self) -> (u16, u16) {
         (self.cols, self.rows)
+    }
+
+    /// Returns the shared [`TerminalBuffer`] backing this SSH `Session`.
+    pub fn buffer(&self) -> &Arc<TerminalBuffer> {
+        &self.buffer
+    }
+
+    /// Returns the most recent terminal grid snapshot for this SSH `Session`.
+    pub fn snapshot(&self) -> &Arc<TerminalSnapshot> {
+        &self.snapshot
+    }
+
+    /// Returns `Some(exit_code)` once the remote shell channel has exited.
+    pub fn exited(&self) -> Option<Option<i32>> {
+        self.exited
+    }
+
+    /// Returns the current SSH connection attempt generation counter.
+    pub fn ssh_generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Returns the active [`SshSession`] handle if this SSH `Session` is currently connected.
+    pub fn ssh_session(&self) -> Option<&Arc<SshSession>> {
+        self.active.as_ref()
+    }
+
+    /// Returns the [`SshTargetSpec`] used to connect this SSH `Session`.
+    pub fn spec(&self) -> &SshTargetSpec {
+        &self.spec
+    }
+
+    /// Returns the last connection/MITM error recorded on this SSH `Session`, if any.
+    pub fn last_error(&self) -> Option<&str> {
+        self.last_error.as_deref()
     }
 }
 
@@ -171,12 +271,17 @@ impl LocalSession {
         &self.pty
     }
 
+    /// Returns the shared [`TerminalBuffer`] backing this `Session`.
+    pub fn buffer(&self) -> &Arc<TerminalBuffer> {
+        self.pty.buffer()
+    }
+
     /// Returns the most recent terminal grid snapshot.
     pub fn snapshot(&self) -> &Arc<TerminalSnapshot> {
         &self.snapshot
     }
 
-    /// Returns the SSH `TransportStatus` (`Disconnected` for local shell sessions).
+    /// Returns the `TransportStatus` (`Disconnected` for local shell sessions).
     pub fn transport_status(&self) -> &TransportStatus {
         &self.transport_status
     }
@@ -226,14 +331,23 @@ impl SessionEntry {
         }
     }
 
-    fn as_local(&self) -> Option<&LocalSession> {
+    fn buffer(&self) -> Option<&Arc<TerminalBuffer>> {
         match self {
-            Self::Local(s) => Some(s),
-            Self::Remote(_) | Self::Ssh(_) => None,
+            Self::Local(s) => Some(s.pty.buffer()),
+            Self::Ssh(s) => Some(&s.buffer),
+            Self::Remote(_) => None,
         }
     }
 
-    fn as_local_mut(&mut self) -> Option<&mut LocalSession> {
+    fn refresh_snapshot(&mut self) {
+        match self {
+            Self::Local(s) => s.snapshot = Arc::new(s.pty.snapshot()),
+            Self::Ssh(s) => s.snapshot = Arc::new(s.buffer.snapshot()),
+            Self::Remote(_) => {}
+        }
+    }
+
+    fn as_local(&self) -> Option<&LocalSession> {
         match self {
             Self::Local(s) => Some(s),
             Self::Remote(_) | Self::Ssh(_) => None,
@@ -244,6 +358,13 @@ impl SessionEntry {
         match self {
             Self::Remote(s) => Some(s),
             Self::Local(_) | Self::Ssh(_) => None,
+        }
+    }
+
+    fn as_ssh(&self) -> Option<&SshSessionSlot> {
+        match self {
+            Self::Ssh(s) => Some(s),
+            Self::Local(_) | Self::Remote(_) => None,
         }
     }
 }
@@ -386,12 +507,31 @@ pub enum Message {
         alias: String,
         disposition: LaunchDisposition,
     },
+    OpenSshProfile(Profile),
+    RestoreSshProfile(Profile),
+    QuickConnectSsh(SshTargetSpec),
     SetSessionTransportStatus {
         session_id: SessionId,
         status: TransportStatus,
     },
     ConnectSshSession(SessionId),
     DisconnectSshSession(SessionId),
+    SshEvent {
+        session_id: SessionId,
+        event: SshUiEvent,
+    },
+    RespondHostKeyPrompt {
+        session_id: SessionId,
+        accept: bool,
+    },
+    SshAuthInputChanged {
+        session_id: SessionId,
+        index: usize,
+        value: String,
+    },
+    SubmitSshAuthPrompt(SessionId),
+    CancelSshAuthPrompt(SessionId),
+    DismissMitmAlert(SessionId),
     OpenCommandPalette,
     OpenQuickConnectPalette,
     CloseCommandPalette,
@@ -423,6 +563,7 @@ pub struct AppState {
     profiles: ProfilesConfig,
     vault: Arc<VaultSession>,
     reload_ui: ConfigReloadUiState,
+    ssh_ui: SshUiState,
     windows: BTreeSet<window::Id>,
     window_workspaces: BTreeMap<window::Id, WindowState>,
     pending_windows: VecDeque<WindowState>,
@@ -537,6 +678,7 @@ impl AppState {
             profiles,
             vault,
             reload_ui: ConfigReloadUiState::default(),
+            ssh_ui: SshUiState::default(),
             windows: BTreeSet::new(),
             window_workspaces: BTreeMap::new(),
             pending_windows: VecDeque::new(),
@@ -838,10 +980,30 @@ impl AppState {
         Ok(id)
     }
 
+    /// Creates a new SSH `Session` tab from `spec`, connecting immediately when `auto_connect` is
+    /// `true` or waiting in `Disconnected` state until user action otherwise.
+    pub fn open_ssh_session(
+        &mut self,
+        spec: SshTargetSpec,
+        auto_connect: bool,
+    ) -> (SessionId, Task<Message>) {
+        let target = SshSessionTarget::from_target_spec(&spec);
+        let tab_title = (!spec.title.trim().is_empty()).then(|| spec.title.clone());
+        let id = self.insert_ssh_session_slot(target, spec);
+        let _ = self.open_session_with_disposition(None, id, tab_title, LaunchDisposition::NewTab);
+
+        if auto_connect {
+            let task = self.start_ssh_connect(id);
+            (id, task)
+        } else {
+            (id, Task::none())
+        }
+    }
+
     fn insert_ssh_session_slot(
         &mut self,
         target: SshSessionTarget,
-        status: TransportStatus,
+        spec: SshTargetSpec,
     ) -> SessionId {
         let id = SessionId(self.next_session_id);
         self.next_session_id += 1;
@@ -850,18 +1012,76 @@ impl AppState {
         } else {
             target.name.clone()
         };
+        let cols = spec.connect_config.cols.max(1);
+        let rows = spec.connect_config.rows.max(1);
+        let buffer = Arc::new(TerminalBuffer::new_with_cursor_shape(
+            cols,
+            rows,
+            spec.connect_config.scrollback_lines,
+            cursor_style_to_shape(self.config.terminal.cursor_style),
+        ));
+        let snapshot = Arc::new(buffer.snapshot());
+        let status = TransportStatus::Disconnected;
         let status_message = format_ssh_slot_message(&target, &status);
         let slot = SshSessionSlot {
             id,
             title,
             target,
+            spec,
             transport_status: status,
             status_message,
-            cols: 80,
-            rows: 24,
+            cols,
+            rows,
+            buffer,
+            snapshot,
+            exited: None,
+            generation: 0,
+            active: None,
+            last_error: None,
         };
         self.sessions.insert(id, SessionEntry::Ssh(slot));
         id
+    }
+
+    fn start_ssh_connect(&mut self, session_id: SessionId) -> Task<Message> {
+        self.ssh_ui.clear_session_prompts(session_id);
+        let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) else {
+            return Task::none();
+        };
+
+        if let Some(prev) = slot.active.take() {
+            prev.disconnect();
+        }
+        slot.generation = slot.generation.wrapping_add(1);
+        slot.last_error = None;
+        slot.exited = None;
+
+        let (cols, rows) = slot.buffer.dimensions();
+        slot.cols = cols;
+        slot.rows = rows;
+        slot.spec.connect_config.cols = cols;
+        slot.spec.connect_config.rows = rows;
+        slot.transport_status = TransportStatus::Connecting;
+        slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
+
+        connect_ssh_task(
+            session_id,
+            slot.generation,
+            slot.spec.clone(),
+            Arc::clone(&slot.buffer),
+            Arc::clone(&self.vault),
+        )
+    }
+
+    fn disconnect_ssh_session(&mut self, session_id: SessionId) {
+        self.ssh_ui.clear_session_prompts(session_id);
+        if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) {
+            if let Some(ssh) = slot.active.take() {
+                ssh.disconnect();
+            }
+            slot.transport_status = TransportStatus::Disconnected;
+            slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
+        }
     }
 
     fn open_session_with_disposition(
@@ -870,14 +1090,15 @@ impl AppState {
         session_id: SessionId,
         tab_title: Option<String>,
         disposition: LaunchDisposition,
-    ) {
+    ) -> bool {
         let Some(ws) = self.target_workspace_mut(window_scope) else {
             self.remove_session(session_id);
-            return;
+            return false;
         };
         match disposition {
             LaunchDisposition::NewTab => {
                 ws.create_tab(session_id, tab_title);
+                true
             }
             LaunchDisposition::Split(axis) => {
                 if let Some((tab_id, target_pane)) =
@@ -885,9 +1106,13 @@ impl AppState {
                 {
                     if ws.split_pane(tab_id, target_pane, axis, session_id).is_none() {
                         self.remove_session(session_id);
+                        false
+                    } else {
+                        true
                     }
                 } else {
                     ws.create_tab(session_id, tab_title);
+                    true
                 }
             }
         }
@@ -898,7 +1123,7 @@ impl AppState {
         window_scope: Option<window::Id>,
         profile: &Profile,
         disposition: LaunchDisposition,
-    ) {
+    ) -> Task<Message> {
         match &profile.target {
             ProfileTarget::LocalShell {
                 shell,
@@ -914,13 +1139,19 @@ impl AppState {
                     Some(profile.id.clone()),
                 ) {
                     Ok(sid) => {
-                        self.open_session_with_disposition(window_scope, sid, title, disposition)
+                        let _ = self.open_session_with_disposition(
+                            window_scope,
+                            sid,
+                            title,
+                            disposition,
+                        );
                     }
                     Err(err) => {
                         error!(profile_id = %profile.id, error = %err, "failed to launch local Profile");
                         self.last_error = Some(err);
                     }
                 }
+                Task::none()
             }
             ProfileTarget::Ssh {
                 host,
@@ -942,9 +1173,19 @@ impl AppState {
                     auto_connect_on_startup: *auto_connect_on_startup,
                     tmux_reattach: tmux_reattach.clone(),
                 };
-                let sid = self.insert_ssh_session_slot(target, TransportStatus::Connecting);
                 let tab_title = (!profile.name.trim().is_empty()).then(|| profile.name.clone());
-                self.open_session_with_disposition(window_scope, sid, tab_title, disposition);
+                let spec = target.to_target_spec(
+                    &profile.name,
+                    80,
+                    24,
+                    self.config.terminal.scrollback_lines,
+                );
+                let sid = self.insert_ssh_session_slot(target, spec);
+                if self.open_session_with_disposition(window_scope, sid, tab_title, disposition) {
+                    self.start_ssh_connect(sid)
+                } else {
+                    Task::none()
+                }
             }
         }
     }
@@ -953,7 +1194,7 @@ impl AppState {
         &mut self,
         window_scope: Option<window::Id>,
         target: QuickConnectTarget,
-    ) {
+    ) -> Task<Message> {
         let label = target.display_addr();
         let ssh_target = SshSessionTarget {
             profile_id: None,
@@ -966,13 +1207,23 @@ impl AppState {
             auto_connect_on_startup: false,
             tmux_reattach: None,
         };
-        let sid = self.insert_ssh_session_slot(ssh_target, TransportStatus::Connecting);
-        self.open_session_with_disposition(
+        let spec = ssh_target.to_target_spec(
+            &label,
+            80,
+            24,
+            self.config.terminal.scrollback_lines,
+        );
+        let sid = self.insert_ssh_session_slot(ssh_target, spec);
+        if self.open_session_with_disposition(
             window_scope,
             sid,
             Some(label),
             LaunchDisposition::NewTab,
-        );
+        ) {
+            self.start_ssh_connect(sid)
+        } else {
+            Task::none()
+        }
     }
 
     fn launch_system_ssh_entry(
@@ -980,7 +1231,7 @@ impl AppState {
         window_scope: Option<window::Id>,
         alias: &str,
         disposition: LaunchDisposition,
-    ) {
+    ) -> Task<Message> {
         let Some(host) = self
             .sidebar
             .system_ssh_profiles()
@@ -988,7 +1239,7 @@ impl AppState {
             .find(|h| h.alias == alias)
             .cloned()
         else {
-            return;
+            return Task::none();
         };
         let target = SshSessionTarget {
             profile_id: None,
@@ -1001,13 +1252,23 @@ impl AppState {
             auto_connect_on_startup: false,
             tmux_reattach: None,
         };
-        let sid = self.insert_ssh_session_slot(target, TransportStatus::Connecting);
-        self.open_session_with_disposition(
+        let spec = target.to_target_spec(
+            &host.alias,
+            80,
+            24,
+            self.config.terminal.scrollback_lines,
+        );
+        let sid = self.insert_ssh_session_slot(target, spec);
+        if self.open_session_with_disposition(
             window_scope,
             sid,
             Some(host.alias),
             disposition,
-        );
+        ) {
+            self.start_ssh_connect(sid)
+        } else {
+            Task::none()
+        }
     }
 
     fn handle_command_palette_confirm(&mut self, window_scope: Option<window::Id>) -> Task<Message> {
@@ -1018,12 +1279,12 @@ impl AppState {
                 {
                     self.last_error = None;
                     self.command_palette.close();
-                    self.launch_quick_connect(window_scope, target);
+                    self.launch_quick_connect(window_scope, target)
                 } else {
                     self.last_error =
                         Some("Invalid Quick Connect target (expected user@host[:port])".to_string());
+                    Task::none()
                 }
-                Task::none()
             }
             CommandPaletteMode::Search => {
                 let items = self.command_palette_items();
@@ -1044,12 +1305,9 @@ impl AppState {
                 Task::none()
             }
             StatusBarAction::OpenCommandPalette => self.update(Message::OpenCommandPalette),
-            StatusBarAction::ReconnectSession(session_id) => {
-                self.update_ssh_slot_status(session_id, TransportStatus::Connecting);
-                Task::none()
-            }
+            StatusBarAction::ReconnectSession(session_id) => self.start_ssh_connect(session_id),
             StatusBarAction::CancelReconnect(session_id) => {
-                self.update_ssh_slot_status(session_id, TransportStatus::Disconnected);
+                self.disconnect_ssh_session(session_id);
                 Task::none()
             }
             StatusBarAction::ToggleTunnelsView => {
@@ -1101,8 +1359,7 @@ impl AppState {
             }
             PaletteAction::QuickConnect(target) => {
                 self.command_palette.close();
-                self.launch_quick_connect(window_scope, target);
-                Task::none()
+                self.launch_quick_connect(window_scope, target)
             }
             PaletteAction::SwitchSession(session_id) => {
                 self.command_palette.close();
@@ -1137,8 +1394,15 @@ impl AppState {
     }
 
     fn remove_session(&mut self, session_id: SessionId) {
-        if let Some(SessionEntry::Local(session)) = self.sessions.remove(&session_id) {
-            session.pty.terminate();
+        self.ssh_ui.clear_session_prompts(session_id);
+        match self.sessions.remove(&session_id) {
+            Some(SessionEntry::Local(session)) => session.pty.terminate(),
+            Some(SessionEntry::Ssh(slot)) => {
+                if let Some(ssh) = slot.active {
+                    ssh.disconnect();
+                }
+            }
+            Some(SessionEntry::Remote(_)) | None => {}
         }
     }
 
@@ -1583,6 +1847,18 @@ impl AppState {
                 Task::none()
             }
             Message::TerminalInput { session_id, bytes } => {
+                let targets = self
+                    .workspace_for_session_mut(session_id)
+                    .map(|ws| ws.input_targets_for_session(session_id))
+                    .unwrap_or_else(|| vec![session_id]);
+                if targets.len() == 1
+                    && (bytes.contains(&b'\r') || bytes.contains(&b'\n'))
+                    && let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id)
+                    && slot.active.is_none()
+                    && slot.transport_status == TransportStatus::Disconnected
+                {
+                    return self.start_ssh_connect(session_id);
+                }
                 self.dispatch_bytes_with_broadcast(session_id, &bytes);
                 Task::none()
             }
@@ -1603,6 +1879,19 @@ impl AppState {
                     Some(SessionEntry::Ssh(slot)) => {
                         slot.cols = cols.max(1);
                         slot.rows = rows.max(1);
+                        if let Some(ssh) = &slot.active {
+                            if let Err(err) = ssh.resize(cols, rows) {
+                                error!(
+                                    session = session_id.0,
+                                    error = %err,
+                                    "failed to resize SSH channel"
+                                );
+                                self.last_error = Some(err.to_string());
+                            }
+                        } else {
+                            slot.buffer.resize(cols, rows);
+                        }
+                        slot.snapshot = Arc::new(slot.buffer.snapshot());
                     }
                     Some(SessionEntry::Remote(_)) | None => {}
                 }
@@ -1610,27 +1899,41 @@ impl AppState {
             }
             Message::PtyEvent { session_id, event } => {
                 let is_active_session = Some(session_id) == self.active_session_id();
-                if let Some(SessionEntry::Local(session)) = self.sessions.get_mut(&session_id) {
+                if let Some(entry) = self.sessions.get_mut(&session_id) {
                     match event {
                         PtyEvent::Output => {
-                            session.snapshot = Arc::new(session.pty.snapshot());
+                            entry.refresh_snapshot();
                             if is_active_session
                                 && self.search.open
                                 && !self.search.query.is_empty()
                             {
-                                let pty = Arc::clone(&session.pty);
-                                self.search.refresh_matches(Some(pty.as_ref()), false);
+                                let buf = entry.buffer().cloned();
+                                self.search.refresh_matches_buffer(buf.as_deref(), false);
                             }
                         }
                         PtyEvent::Title(title) => {
                             if !title.is_empty() {
-                                session.title = title;
+                                match entry {
+                                    SessionEntry::Local(s) => s.title = title,
+                                    SessionEntry::Ssh(s) => s.title = title,
+                                    SessionEntry::Remote(_) => {}
+                                }
                             }
                         }
                         PtyEvent::Bell => {}
                         PtyEvent::Exited(code) => {
-                            session.snapshot = Arc::new(session.pty.snapshot());
-                            session.exited = Some(code);
+                            entry.refresh_snapshot();
+                            match entry {
+                                SessionEntry::Local(s) => s.exited = Some(code),
+                                SessionEntry::Ssh(slot) => {
+                                    slot.exited = Some(code);
+                                    slot.active = None;
+                                    slot.transport_status = TransportStatus::Disconnected;
+                                    slot.status_message =
+                                        format_ssh_slot_message(&slot.target, &slot.transport_status);
+                                }
+                                SessionEntry::Remote(_) => {}
+                            }
                         }
                     }
                 }
@@ -1642,12 +1945,12 @@ impl AppState {
                 Task::none()
             }
             Message::OpenSearch => {
-                let active_pty = self
+                let active_buf = self
                     .active_session_id()
                     .and_then(|id| self.sessions.get(&id))
-                    .and_then(SessionEntry::as_local)
-                    .map(|s| s.pty.as_ref());
-                let target = self.search.open(active_pty);
+                    .and_then(SessionEntry::buffer)
+                    .cloned();
+                let target = self.search.open_buffer(active_buf.as_deref());
                 self.focus_search_match(target);
                 operation::focus(search_input_id())
             }
@@ -1656,12 +1959,12 @@ impl AppState {
                 Task::none()
             }
             Message::SearchQueryChanged(query) => {
-                let active_pty = self
+                let active_buf = self
                     .active_session_id()
                     .and_then(|id| self.sessions.get(&id))
-                    .and_then(SessionEntry::as_local)
-                    .map(|s| s.pty.as_ref());
-                let target = self.search.set_query(query, active_pty);
+                    .and_then(SessionEntry::buffer)
+                    .cloned();
+                let target = self.search.set_query_buffer(query, active_buf.as_deref());
                 self.focus_search_match(target);
                 Task::none()
             }
@@ -1696,35 +1999,29 @@ impl AppState {
                 session_id,
                 delta_lines,
             } => {
-                if let Some(session) = self
-                    .sessions
-                    .get_mut(&session_id)
-                    .and_then(SessionEntry::as_local_mut)
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
                 {
-                    session.pty.scroll_display(Scroll::Delta(delta_lines));
-                    session.snapshot = Arc::new(session.pty.snapshot());
+                    buf.scroll_display(Scroll::Delta(delta_lines));
+                    entry.refresh_snapshot();
                 }
                 Task::none()
             }
             Message::ScrollToTop(session_id) => {
-                if let Some(session) = self
-                    .sessions
-                    .get_mut(&session_id)
-                    .and_then(SessionEntry::as_local_mut)
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
                 {
-                    session.pty.scroll_display(Scroll::Top);
-                    session.snapshot = Arc::new(session.pty.snapshot());
+                    buf.scroll_display(Scroll::Top);
+                    entry.refresh_snapshot();
                 }
                 Task::none()
             }
             Message::ScrollToBottom(session_id) => {
-                if let Some(session) = self
-                    .sessions
-                    .get_mut(&session_id)
-                    .and_then(SessionEntry::as_local_mut)
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
                 {
-                    session.pty.scroll_to_bottom();
-                    session.snapshot = Arc::new(session.pty.snapshot());
+                    buf.scroll_to_bottom();
+                    entry.refresh_snapshot();
                 }
                 Task::none()
             }
@@ -1735,15 +2032,11 @@ impl AppState {
                 side,
                 selection_type,
             } => {
-                if let Some(session) = self
-                    .sessions
-                    .get_mut(&session_id)
-                    .and_then(SessionEntry::as_local_mut)
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
                 {
-                    session
-                        .pty
-                        .start_selection(col, row, side, selection_type);
-                    session.snapshot = Arc::new(session.pty.snapshot());
+                    buf.start_selection(col, row, side, selection_type);
+                    entry.refresh_snapshot();
                 }
                 Task::none()
             }
@@ -1753,24 +2046,20 @@ impl AppState {
                 row,
                 side,
             } => {
-                if let Some(session) = self
-                    .sessions
-                    .get_mut(&session_id)
-                    .and_then(SessionEntry::as_local_mut)
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
                 {
-                    session.pty.update_selection(col, row, side);
-                    session.snapshot = Arc::new(session.pty.snapshot());
+                    buf.update_selection(col, row, side);
+                    entry.refresh_snapshot();
                 }
                 Task::none()
             }
             Message::SelectionFinish { session_id } => {
-                let copied = if let Some(session) = self
-                    .sessions
-                    .get_mut(&session_id)
-                    .and_then(SessionEntry::as_local_mut)
+                let copied = if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
                 {
-                    let selected = session.pty.finish_selection();
-                    session.snapshot = Arc::new(session.pty.snapshot());
+                    let selected = buf.finish_selection();
+                    entry.refresh_snapshot();
                     if self.config.terminal.copy_on_select {
                         selected
                     } else {
@@ -1790,8 +2079,8 @@ impl AppState {
                 let copied = self
                     .sessions
                     .get(&session_id)
-                    .and_then(SessionEntry::as_local)
-                    .and_then(|session| session.pty.selection_text());
+                    .and_then(SessionEntry::buffer)
+                    .and_then(|buf| buf.selection_text());
                 if let Some(text) = copied {
                     self.copy_text_to_clipboard(text)
                 } else {
@@ -1835,7 +2124,12 @@ impl AppState {
                 path,
                 shift_held,
             } => {
-                let action = classify_file_drop(session_id, &path, false, shift_held, false);
+                let is_ssh = self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(SessionEntry::as_ssh)
+                    .is_some();
+                let action = classify_file_drop(session_id, &path, is_ssh, shift_held, false);
                 match action {
                     FileDropAction::InsertShellPath {
                         session_id,
@@ -2084,6 +2378,73 @@ impl AppState {
                 }
                 Task::none()
             }
+            Message::OpenSshProfile(profile) => {
+                match SshTargetSpec::from_profile(
+                    &profile,
+                    80,
+                    24,
+                    self.config.terminal.scrollback_lines,
+                ) {
+                    Ok(spec) => {
+                        let (_sid, task) = self.open_ssh_session(spec, true);
+                        task
+                    }
+                    Err(err) => {
+                        self.last_error = Some(err.to_string());
+                        Task::none()
+                    }
+                }
+            }
+            Message::RestoreSshProfile(profile) => {
+                match SshTargetSpec::from_profile(
+                    &profile,
+                    80,
+                    24,
+                    self.config.terminal.scrollback_lines,
+                ) {
+                    Ok(spec) => {
+                        let auto_connect = spec.auto_connect_on_startup;
+                        let (_sid, task) = self.open_ssh_session(spec, auto_connect);
+                        task
+                    }
+                    Err(err) => {
+                        self.last_error = Some(err.to_string());
+                        Task::none()
+                    }
+                }
+            }
+            Message::QuickConnectSsh(spec) => {
+                let (_sid, task) = self.open_ssh_session(spec, true);
+                task
+            }
+            Message::SshEvent { session_id, event } => {
+                self.handle_ssh_event(session_id, event);
+                Task::none()
+            }
+            Message::RespondHostKeyPrompt { session_id, accept } => {
+                self.ssh_ui.respond_host_key(session_id, accept);
+                Task::none()
+            }
+            Message::SshAuthInputChanged {
+                session_id,
+                index,
+                value,
+            } => {
+                self.ssh_ui.set_auth_draft(session_id, index, value);
+                Task::none()
+            }
+            Message::SubmitSshAuthPrompt(session_id) => {
+                self.ssh_ui.submit_auth_prompt(session_id);
+                Task::none()
+            }
+            Message::CancelSshAuthPrompt(session_id) => {
+                self.ssh_ui.cancel_auth_prompt(session_id);
+                Task::none()
+            }
+            Message::DismissMitmAlert(session_id) => {
+                self.ssh_ui.dismiss_mitm_alert(session_id);
+                Task::none()
+            }
             Message::ToggleSidebar => {
                 self.sidebar.toggle();
                 Task::none()
@@ -2130,27 +2491,23 @@ impl AppState {
                     .find(|p| p.id == profile_id)
                     .cloned()
                 {
-                    self.launch_profile_entry(window_scope, &profile, disposition);
+                    self.launch_profile_entry(window_scope, &profile, disposition)
                 } else {
                     self.last_error = Some(format!("unknown profile id: {profile_id}"));
+                    Task::none()
                 }
-                Task::none()
             }
             Message::LaunchSystemSsh { alias, disposition } => {
                 self.command_palette.close();
-                self.launch_system_ssh_entry(window_scope, &alias, disposition);
-                Task::none()
+                self.launch_system_ssh_entry(window_scope, &alias, disposition)
             }
             Message::SetSessionTransportStatus { session_id, status } => {
                 self.update_ssh_slot_status(session_id, status);
                 Task::none()
             }
-            Message::ConnectSshSession(session_id) => {
-                self.update_ssh_slot_status(session_id, TransportStatus::Connecting);
-                Task::none()
-            }
+            Message::ConnectSshSession(session_id) => self.start_ssh_connect(session_id),
             Message::DisconnectSshSession(session_id) => {
-                self.update_ssh_slot_status(session_id, TransportStatus::Disconnected);
+                self.disconnect_ssh_session(session_id);
                 Task::none()
             }
             Message::OpenCommandPalette => {
@@ -2204,8 +2561,7 @@ impl AppState {
             }
             Message::QuickConnect(target) => {
                 self.command_palette.close();
-                self.launch_quick_connect(window_scope, target);
-                Task::none()
+                self.launch_quick_connect(window_scope, target)
             }
             Message::SetTunnelSummary(summary) => {
                 self.status_bar.set_tunnels(summary);
@@ -2219,36 +2575,101 @@ impl AppState {
         }
     }
 
+    fn handle_ssh_event(&mut self, session_id: SessionId, event: SshUiEvent) {
+        let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) else {
+            return;
+        };
+
+        let event_gen = match &event {
+            SshUiEvent::Connected { generation, .. }
+            | SshUiEvent::HostKeyPrompt { generation, .. }
+            | SshUiEvent::AuthPrompt { generation, .. }
+            | SshUiEvent::MitmBlocked { generation, .. }
+            | SshUiEvent::Disconnected { generation, .. } => *generation,
+        };
+        if event_gen != slot.generation {
+            return;
+        }
+
+        match event {
+            SshUiEvent::Connected { session: ssh, .. } => {
+                slot.active = Some(ssh);
+                slot.last_error = None;
+                slot.exited = None;
+                slot.transport_status = TransportStatus::Connected { latency_ms: None };
+                slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
+                slot.snapshot = Arc::new(slot.buffer.snapshot());
+            }
+            SshUiEvent::HostKeyPrompt {
+                prompt, responder, ..
+            } => {
+                self.ssh_ui
+                    .push_host_key_prompt(session_id, prompt, responder);
+            }
+            SshUiEvent::AuthPrompt {
+                prompt, responder, ..
+            } => {
+                self.ssh_ui.push_auth_prompt(session_id, prompt, responder);
+            }
+            SshUiEvent::MitmBlocked { alert, .. } => {
+                slot.active = None;
+                slot.transport_status = TransportStatus::Disconnected;
+                let msg = format!(
+                    "HOST KEY VERIFICATION FAILED for {}:{} (known_hosts line {}): expected {}, received {}",
+                    alert.host,
+                    alert.port,
+                    alert.line,
+                    alert.expected_fingerprint,
+                    alert.received_fingerprint
+                );
+                slot.last_error = Some(msg.clone());
+                slot.status_message = msg.clone();
+                self.last_error = Some(msg);
+                self.ssh_ui.record_mitm_alert(alert);
+            }
+            SshUiEvent::Disconnected { error, .. } => {
+                slot.active = None;
+                slot.transport_status = TransportStatus::Disconnected;
+                slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
+                self.ssh_ui.clear_session_prompts(session_id);
+                if let Some(err) = error {
+                    slot.last_error = Some(err.clone());
+                    slot.status_message = err.clone();
+                    self.last_error = Some(err);
+                }
+            }
+        }
+    }
+
     fn sync_terminal_options_to_sessions(&mut self) {
         let shape = cursor_style_to_shape(self.config.terminal.cursor_style);
         let scrollback = self.config.terminal.scrollback_lines;
-        for session in self
-            .sessions
-            .values_mut()
-            .filter_map(SessionEntry::as_local_mut)
-        {
-            session.pty.apply_options(scrollback, shape);
-            session.snapshot = Arc::new(session.pty.snapshot());
+        for entry in self.sessions.values_mut() {
+            if let Some(buf) = entry.buffer() {
+                buf.apply_options(scrollback, shape);
+                entry.refresh_snapshot();
+            }
         }
         if self.search.open && !self.search.query.is_empty() {
-            let active_pty = self
+            let active_buf = self
                 .active_session_id()
                 .and_then(|id| self.sessions.get(&id))
-                .and_then(SessionEntry::as_local)
-                .map(|s| s.pty.as_ref());
-            self.search.refresh_matches(active_pty, false);
+                .and_then(SessionEntry::buffer)
+                .cloned();
+            self.search
+                .refresh_matches_buffer(active_buf.as_deref(), false);
         }
     }
 
     fn focus_search_match(&mut self, target: Option<GridSearchMatch>) {
         if let Some(matched) = target
-            && let Some(session) = self
+            && let Some(entry) = self
                 .active_session_id()
                 .and_then(|id| self.sessions.get_mut(&id))
-                .and_then(SessionEntry::as_local_mut)
+            && let Some(buf) = entry.buffer().cloned()
         {
-            session.pty.scroll_to_match(matched);
-            session.snapshot = Arc::new(session.pty.snapshot());
+            buf.scroll_to_match(matched);
+            entry.refresh_snapshot();
         }
     }
 
@@ -2261,14 +2682,14 @@ impl AppState {
     }
 
     fn dispatch_paste_to_session(&mut self, session_id: SessionId, text: &str) {
-        let Some(session) = self
+        let Some(buf) = self
             .sessions
             .get(&session_id)
-            .and_then(SessionEntry::as_local)
+            .and_then(SessionEntry::buffer)
         else {
             return;
         };
-        let bytes = format_paste_bytes(text, session.pty.is_bracketed_paste());
+        let bytes = format_paste_bytes(text, buf.is_bracketed_paste());
         self.write_bytes_to_session(session_id, &bytes);
     }
 
@@ -2282,14 +2703,15 @@ impl AppState {
             .unwrap_or_else(|| vec![session_id]);
         let is_broadcast = targets.len() > 1;
         for target_id in targets {
-            if is_broadcast
-                && self
-                    .sessions
-                    .get(&target_id)
-                    .and_then(SessionEntry::as_local)
-                    .is_some_and(|session| session.exited.is_some())
-            {
-                continue;
+            if is_broadcast {
+                let skip = match self.sessions.get(&target_id) {
+                    Some(SessionEntry::Local(s)) => s.exited.is_some(),
+                    Some(SessionEntry::Ssh(s)) => s.active.is_none(),
+                    Some(SessionEntry::Remote(_)) | None => true,
+                };
+                if skip {
+                    continue;
+                }
             }
             self.write_bytes_to_session(target_id, bytes);
         }
@@ -2299,23 +2721,32 @@ impl AppState {
         if bytes.is_empty() {
             return;
         }
-        let Some(session) = self
-            .sessions
-            .get_mut(&session_id)
-            .and_then(SessionEntry::as_local_mut)
-        else {
+        let Some(entry) = self.sessions.get_mut(&session_id) else {
             return;
         };
-        if let Err(err) = session.pty.write_bytes(bytes) {
-            error!(session = session_id.0, error = %err, "failed to write PTY input");
-            self.last_error = Some(err.to_string());
-        } else if session.pty.display_offset() > 0 {
-            session.pty.scroll_to_bottom();
-            session.snapshot = Arc::new(session.pty.snapshot());
+        let write_result = match entry {
+            SessionEntry::Local(session) => session.pty.write_bytes(bytes).map_err(|e| e.to_string()),
+            SessionEntry::Ssh(slot) => {
+                if let Some(ssh) = &slot.active {
+                    ssh.write_bytes(bytes).map_err(|e| e.to_string())
+                } else {
+                    return;
+                }
+            }
+            SessionEntry::Remote(_) => return,
+        };
+        if let Err(err) = write_result {
+            error!(session = session_id.0, error = %err, "failed to write terminal input");
+            self.last_error = Some(err);
+        } else if let Some(buf) = entry.buffer().cloned()
+            && buf.display_offset() > 0
+        {
+            buf.scroll_to_bottom();
+            entry.refresh_snapshot();
         }
     }
 
-    /// Renders the workspace tab strip, collapsible Left Sidebar, status/reload/Vault banners,
+    /// Renders the workspace tab strip, collapsible Left Sidebar, status/reload/Vault/SSH banners,
     /// active split panes, Status Bar, Search/Paste overlays, Command Palette, and Close Guard modal.
     pub fn view(&self, window_id: window::Id) -> Element<'_, Message, Theme, iced::Renderer> {
         let ws = self.window_workspaces.get(&window_id).map(|w| &w.workspace);
@@ -2325,6 +2756,16 @@ impl AppState {
 
         if let Some(banner_text) = ws.and_then(Self::broadcast_banner_for_workspace) {
             main_pane_col = main_pane_col.push(render_broadcast_banner(banner_text));
+        }
+
+        if let Some(mitm) = self.ssh_ui.view_mitm_alerts() {
+            main_pane_col = main_pane_col.push(mitm);
+        }
+        if let Some(tofu) = self.ssh_ui.view_tofu_modal() {
+            main_pane_col = main_pane_col.push(tofu);
+        }
+        if let Some(auth_prompt) = self.ssh_ui.view_auth_prompt() {
+            main_pane_col = main_pane_col.push(auth_prompt);
         }
 
         if let Some(toasts) = self.reload_ui.view_reload_toasts() {
@@ -2649,7 +3090,31 @@ impl AppState {
                 terminal_focused,
             ),
             Some(SessionEntry::Remote(remote)) => render_remote_placeholder(remote),
-            Some(SessionEntry::Ssh(slot)) => render_ssh_session_slot(slot),
+            Some(SessionEntry::Ssh(slot)) => {
+                let viewport = TerminalViewport::with_focus(
+                    slot.id,
+                    Arc::clone(&slot.snapshot),
+                    options,
+                    matches,
+                    active_match,
+                    terminal_focused,
+                );
+                if slot.transport_status == TransportStatus::Disconnected {
+                    let bar = SshUiState::view_disconnected_ssh_bar(
+                        slot.id,
+                        &slot.target.host,
+                        slot.target.port,
+                        self.ssh_ui.mitm_alert(slot.id).is_some(),
+                        slot.last_error.as_deref(),
+                    );
+                    column![bar, viewport]
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    viewport
+                }
+            }
             None => container("Missing terminal session")
                 .width(Length::Fill)
                 .height(Length::Fill)
@@ -2772,12 +3237,12 @@ impl AppState {
             config_watch_stream,
         );
 
-        let pty_subs = self.sessions.values().filter_map(|entry| {
-            let session = entry.as_local()?;
+        let pty_subs = self.sessions.iter().filter_map(|(&session_id, entry)| {
+            let buffer = entry.buffer()?;
             Some(Subscription::run_with(
                 PtySubKey {
-                    session_id: session.id,
-                    pty: Arc::clone(&session.pty),
+                    session_id,
+                    buffer: Arc::clone(buffer),
                 },
                 pty_event_stream,
             ))
@@ -2927,9 +3392,9 @@ impl AppState {
                     kind: SessionKindLabel::Ssh,
                     title: slot.title.clone(),
                     target: slot.target.display_addr(),
-                    cols: slot.cols,
-                    rows: slot.rows,
-                    exited: None,
+                    cols: slot.snapshot.cols,
+                    rows: slot.snapshot.rows,
+                    exited: slot.exited,
                     transport_status: slot.transport_status.clone(),
                     zoomed,
                     broadcast,
@@ -3035,6 +3500,11 @@ impl AppState {
         Some(format!(
             "BROADCAST INPUT ACTIVE — Keystrokes are mirrored to {count} {noun} in this tab"
         ))
+    }
+
+    /// Returns the SSH TOFU, MITM, and interactive auth prompt UI state.
+    pub fn ssh_ui(&self) -> &SshUiState {
+        &self.ssh_ui
     }
 
     /// Returns the warning banner copy when Broadcast Input is active in the current tab.
@@ -3338,7 +3808,7 @@ fn config_watch_stream(
 #[derive(Clone)]
 struct PtySubKey {
     session_id: SessionId,
-    pty: Arc<PtySession>,
+    buffer: Arc<TerminalBuffer>,
 }
 
 impl Hash for PtySubKey {
@@ -3351,9 +3821,9 @@ fn pty_event_stream(
     key: &PtySubKey,
 ) -> std::pin::Pin<Box<dyn Stream<Item = Message> + Send>> {
     let session_id = key.session_id;
-    let pty = Arc::clone(&key.pty);
+    let buffer = Arc::clone(&key.buffer);
     Box::pin(iced::stream::channel(64, async move |mut output| {
-        if let Some(mut rx) = pty.take_event_receiver() {
+        if let Some(mut rx) = buffer.take_event_receiver() {
             while let Some(event) = rx.recv().await {
                 if output
                     .send(Message::PtyEvent { session_id, event })
@@ -3573,10 +4043,10 @@ fn format_ssh_slot_message(target: &SshSessionTarget, status: &TransportStatus) 
     let addr = target.display_addr();
     match status {
         TransportStatus::Disconnected => format!("Disconnected ({addr})"),
-        TransportStatus::Connecting => {
-            format!("SSH transport ready for Ticket 07 wiring ({addr})")
-        }
-        TransportStatus::Connected { latency_ms: Some(ms) } => {
+        TransportStatus::Connecting => format!("Connecting to {addr}..."),
+        TransportStatus::Connected {
+            latency_ms: Some(ms),
+        } => {
             format!("Connected to {addr} ({ms} ms)")
         }
         TransportStatus::Connected { latency_ms: None } => format!("Connected to {addr}"),
@@ -3588,55 +4058,4 @@ fn format_ssh_slot_message(target: &SshSessionTarget, status: &TransportStatus) 
             next_retry_secs,
         } => format!("Reconnecting attempt #{attempt} in {next_retry_secs}s..."),
     }
-}
-
-fn render_ssh_session_slot(
-    slot: &SshSessionSlot,
-) -> Element<'static, Message, Theme, iced::Renderer> {
-    let addr = slot.target.display_addr();
-    let mut details = column![
-        text(format!("SSH Session: {}", slot.title)).size(16),
-        text(format!("Target: {addr}")).size(13),
-        text(format!("Transport: {}", slot.transport_status.label())).size(13),
-        text(slot.status_message.clone())
-            .size(12)
-            .color(Color::from_rgb8(148, 163, 184)),
-    ]
-    .spacing(6);
-
-    if !slot.target.proxy_jump.is_empty() {
-        details = details.push(
-            text(format!("ProxyJump: {}", slot.target.proxy_jump.join(" -> ")))
-                .size(12)
-                .color(Color::from_rgb8(148, 163, 184)),
-        );
-    }
-    if let Some(tmux) = &slot.target.tmux_reattach {
-        details = details.push(
-            text(format!("Multiplexer attach: {tmux}"))
-                .size(12)
-                .color(Color::from_rgb8(148, 163, 184)),
-        );
-    }
-
-    let action_btn = match slot.transport_status {
-        TransportStatus::Disconnected => button(text("Connect").size(12))
-            .padding([6, 12])
-            .style(button::primary)
-            .on_press(Message::ConnectSshSession(slot.id)),
-        _ => button(text("Disconnect").size(12))
-            .padding([6, 12])
-            .style(button::secondary)
-            .on_press(Message::DisconnectSshSession(slot.id)),
-    };
-
-    details = details.push(action_btn);
-
-    container(details)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .padding(20)
-        .into()
 }

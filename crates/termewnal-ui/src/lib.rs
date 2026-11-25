@@ -7,6 +7,7 @@ pub mod config_reload_ui;
 pub mod ipc;
 pub mod sidebar;
 pub mod split_view;
+pub mod ssh_ui;
 pub mod status_bar;
 pub mod terminal_ergonomics;
 pub mod terminal_widget;
@@ -31,9 +32,13 @@ pub use sidebar::{
     ActiveTunnelEntry, ProfileGroupView, SidebarSection, SidebarState, SystemSshProfile,
     TunnelRuntimeState, UNGROUPED_LABEL,
 };
+pub use ssh_ui::{
+    AuthPromptResponder, HostKeyResponder, MitmAlert, SshAuthPrompt, SshTargetSpec, SshUiEvent,
+    SshUiState, drive_ssh_connect,
+};
 pub use status_bar::{
     SessionKindLabel, SessionStatusHook, StatusBarAction, StatusBarSnapshot, StatusBarState,
-    TransferSummaryHook, TunnelSummaryHook,
+    TransferSummaryHook, TunnelSummaryHook, render_status_bar,
 };
 pub use terminal_ergonomics::{
     FileDropAction, PendingPaste, SearchBarState, classify_file_drop, format_paste_bytes,
