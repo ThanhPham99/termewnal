@@ -6,12 +6,13 @@ use std::sync::{Arc, Mutex};
 use iced::futures::SinkExt;
 use iced::widget::{button, column, container, row, space, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Task, Theme};
-use termewnal_core::{AppConfig, Profile, VaultSession, vault::SecretStore};
+use termewnal_core::{AppConfig, OpenSshHost, Profile, VaultSession, vault::SecretStore};
 use termewnal_pty::TerminalBuffer;
 use termewnal_ssh::{
     AgentConnector, BoxFuture, ConnectionSupervisor, HostKeyDecision, HostKeyPrompt,
-    InteractivePromptItem, KeyboardInteractiveChallenge, OsAgentConnector, SshConnectConfig,
-    SshInteractionHandler, SshSession, SupervisorConfig, SupervisorEvent, TransportStatus,
+    InteractivePromptItem, JumpHopSpec, KeyboardInteractiveChallenge, OsAgentConnector,
+    SshConnectConfig, SshInteractionHandler, SshSession, SupervisorConfig, SupervisorEvent,
+    TransportStatus,
 };
 use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize, Zeroizing};
@@ -68,8 +69,36 @@ impl SshTargetSpec {
         rows: u16,
         scrollback_lines: usize,
     ) -> Result<Self, termewnal_ssh::SshError> {
-        let connect_config =
-            SshConnectConfig::from_profile(profile, cols, rows, scrollback_lines)?;
+        Self::from_profile_with_sources(
+            profile,
+            app_config,
+            &[],
+            &[],
+            cols,
+            rows,
+            scrollback_lines,
+        )
+    }
+
+    /// Builds an [`SshTargetSpec`] from a saved SSH [`Profile`], resolving `ProxyJump` aliases
+    /// against Saved [`Profile`]s and `~/.ssh/config` [`OpenSshHost`] entries.
+    pub fn from_profile_with_sources(
+        profile: &Profile,
+        app_config: &AppConfig,
+        saved_profiles: &[Profile],
+        openssh_hosts: &[OpenSshHost],
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+    ) -> Result<Self, termewnal_ssh::SshError> {
+        let connect_config = SshConnectConfig::from_profile_with_sources(
+            profile,
+            saved_profiles,
+            openssh_hosts,
+            cols,
+            rows,
+            scrollback_lines,
+        )?;
         let supervisor_config = SupervisorConfig::from_configs(app_config, profile);
         Ok(Self {
             profile_id: Some(profile.id.clone()),
@@ -79,6 +108,12 @@ impl SshTargetSpec {
             agent_connector: Arc::new(OsAgentConnector::default()),
             auto_connect_on_startup: profile.auto_connect_on_startup(),
         })
+    }
+
+    /// Overrides the resolved `ProxyJump` hop list on this target specification.
+    pub fn with_proxy_jump(mut self, proxy_jump: Vec<JumpHopSpec>) -> Self {
+        self.connect_config.proxy_jump = proxy_jump;
+        self
     }
 
     /// Creates a Quick Connect [`SshTargetSpec`] from explicit [`SshConnectConfig`].
