@@ -206,3 +206,19 @@ pub fn load_profiles(paths: &ConfigPaths) -> Result<ProfilesConfig, CoreError> {
 pub fn save_profiles(paths: &ConfigPaths, profiles: &ProfilesConfig) -> Result<(), CoreError> {
     save_toml_atomic(&paths.profiles_file(), profiles, profiles.schema_version)
 }
+
+/// Returns a case-trimmed unique display name not colliding with any existing `Profile` name.
+pub(crate) fn unique_profile_name(existing: &[Profile], desired: &str) -> String {
+    let base = desired.trim();
+    let base = if base.is_empty() { "Imported Profile" } else { base };
+    if !existing.iter().any(|p| p.name == base) {
+        return base.to_string();
+    }
+    for suffix in 2_usize.. {
+        let candidate = format!("{base} ({suffix})");
+        if !existing.iter().any(|p| p.name == candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("unbounded suffix range always finds a unique name")
+}

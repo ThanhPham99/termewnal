@@ -139,6 +139,8 @@ pub enum PaletteAction {
     ToggleSidebar,
     CloseFocusedPane,
     OpenQuickConnectPrompt,
+    OpenTabbyImporter,
+    ReloadSystemSsh,
     QuickConnect(QuickConnectTarget),
     SwitchSession(SessionId),
     LaunchProfile {
@@ -532,6 +534,36 @@ fn workspace_command_items() -> Vec<PaletteItem> {
             ],
             shortcut: None,
             action: PaletteAction::OpenQuickConnectPrompt,
+        },
+        PaletteItem {
+            id: "cmd:import-tabby".to_string(),
+            category: PaletteCategory::Command,
+            title: "Import Tabby config.yaml...".to_string(),
+            subtitle: "Migrate Tabby Profiles, groups/tags, and Tunnel rules into profiles.toml"
+                .to_string(),
+            keywords: vec![
+                "tabby".to_string(),
+                "import".to_string(),
+                "yaml".to_string(),
+                "migrate".to_string(),
+                "profiles".to_string(),
+            ],
+            shortcut: None,
+            action: PaletteAction::OpenTabbyImporter,
+        },
+        PaletteItem {
+            id: "cmd:reload-openssh".to_string(),
+            category: PaletteCategory::Command,
+            title: "Reload ~/.ssh/config".to_string(),
+            subtitle: "Re-scan OpenSSH hosts in read-only mode".to_string(),
+            keywords: vec![
+                "openssh".to_string(),
+                "ssh".to_string(),
+                "config".to_string(),
+                "reload".to_string(),
+            ],
+            shortcut: None,
+            action: PaletteAction::ReloadSystemSsh,
         },
         PaletteItem {
             id: "cmd:new-tab".to_string(),

@@ -26,6 +26,7 @@ keyring = "4.2"
 keyring-core = "1.1"
 notify = { version = "9.0", features = ["tokio"] }
 notify-debouncer-mini = { version = "0.8", features = ["tokio"] }
+noyalib = "0.0.64"
 open = "5.4"
 portable-pty = "0.9"
 rand = "0.10"
@@ -33,6 +34,7 @@ regex = "1.13"
 russh = "0.65.4"
 serde = { version = "1.0", features = ["derive"] }
 sha1 = "0.11"
+ssh2-config = "0.9"
 tempfile = "3.27"
 thiserror = "2.0"
 tokio = { version = "1.54", features = ["full"] }

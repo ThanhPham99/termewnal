@@ -1,8 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use iced::widget::{Id, button, column, container, row, rule, scrollable, space, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
-use termewnal_core::{Profile, ProfileTarget, TunnelDirection};
+use termewnal_core::{OpenSshHost, Profile, ProfileTarget, TunnelDirection};
 
 use crate::app::{LaunchDisposition, Message, SessionId};
 use crate::workspace::SplitAxis;
@@ -51,6 +52,40 @@ impl SystemSshProfile {
         match self.user.as_deref().filter(|u| !u.is_empty()) {
             Some(user) => format!("{user}@{host}:{}", self.port),
             None => format!("{host}:{}", self.port),
+        }
+    }
+
+    /// Converts this sidebar System SSH entry into an [`OpenSshHost`] for cloning to `profiles.toml`.
+    pub fn to_openssh_host(&self) -> OpenSshHost {
+        OpenSshHost {
+            alias: self.alias.clone(),
+            host_name: self.host_name.clone(),
+            port: self.port,
+            user: self.user.clone(),
+            identity_files: self
+                .identity_file
+                .as_deref()
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| vec![PathBuf::from(p)])
+                .unwrap_or_default(),
+            proxy_jump: self.proxy_jump.clone(),
+            forward_agent: None,
+        }
+    }
+}
+
+impl From<&OpenSshHost> for SystemSshProfile {
+    fn from(host: &OpenSshHost) -> Self {
+        Self {
+            alias: host.alias.clone(),
+            host_name: host.host_name.clone(),
+            port: host.port,
+            user: host.user.clone(),
+            identity_file: host
+                .primary_identity_file()
+                .map(|p| p.to_string_lossy().into_owned()),
+            proxy_jump: host.proxy_jump.clone(),
         }
     }
 }
@@ -335,6 +370,10 @@ pub fn render_sidebar<'a>(
     let header = row![
         text("Profiles & Tunnels").size(14),
         space::horizontal(),
+        button(text("Import").size(11))
+            .padding([2, 6])
+            .style(button::secondary)
+            .on_press(Message::OpenTabbyImportModal),
         button(text("+ SSH").size(11))
             .padding([2, 6])
             .style(button::secondary)
@@ -531,32 +570,71 @@ fn render_system_ssh_section(state: &SidebarState) -> Element<'_, Message, Theme
         return col.into();
     }
 
-    if state.system_ssh_profiles().is_empty() {
+    let needle = state.filter_query().trim().to_ascii_lowercase();
+    let matching: Vec<&SystemSshProfile> = state
+        .system_ssh_profiles()
+        .iter()
+        .filter(|host| {
+            needle.is_empty()
+                || host.alias.to_ascii_lowercase().contains(&needle)
+                || host
+                    .host_name
+                    .as_deref()
+                    .is_some_and(|h| h.to_ascii_lowercase().contains(&needle))
+                || host
+                    .user
+                    .as_deref()
+                    .is_some_and(|u| u.to_ascii_lowercase().contains(&needle))
+                || host
+                    .proxy_jump
+                    .iter()
+                    .any(|j| j.to_ascii_lowercase().contains(&needle))
+        })
+        .collect();
+
+    if matching.is_empty() {
+        let empty_msg = if state.system_ssh_profiles().is_empty() {
+            "Read-only ~/.ssh/config hosts appear here"
+        } else {
+            "No matching System SSH hosts"
+        };
         col = col.push(
-            text("Read-only ~/.ssh/config hosts appear here")
+            text(empty_msg)
                 .size(11)
                 .color(Color::from_rgb8(148, 163, 184)),
         );
         return col.into();
     }
 
-    for host in state.system_ssh_profiles() {
+    for host in matching {
+        let subtitle = if host.proxy_jump.is_empty() {
+            host.display_target()
+        } else {
+            format!("{} · via {}", host.display_target(), host.proxy_jump.join(","))
+        };
         let item = column![
             text(format!("[RO] {}", host.alias)).size(12),
-            text(host.display_target())
+            text(subtitle)
                 .size(11)
                 .color(Color::from_rgb8(148, 163, 184)),
         ]
         .spacing(2);
+        let launch_btn = button(item)
+            .padding([4, 8])
+            .width(Length::Fill)
+            .style(button::subtle)
+            .on_press(Message::LaunchSystemSsh {
+                alias: host.alias.clone(),
+                disposition: LaunchDisposition::NewTab,
+            });
+        let clone_btn = button(text("Clone").size(11))
+            .padding([4, 6])
+            .style(button::secondary)
+            .on_press(Message::CloneSystemSshToProfile(host.alias.clone()));
         col = col.push(
-            button(item)
-                .padding([4, 8])
-                .width(Length::Fill)
-                .style(button::subtle)
-                .on_press(Message::LaunchSystemSsh {
-                    alias: host.alias.clone(),
-                    disposition: LaunchDisposition::NewTab,
-                }),
+            row![launch_btn, clone_btn]
+                .spacing(4)
+                .align_y(Alignment::Center),
         );
     }
 

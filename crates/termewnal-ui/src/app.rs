@@ -15,11 +15,13 @@ use iced::{
 };
 use termewnal_core::{
     AppConfig, CURRENT_SCHEMA_VERSION, ConfigFileKind, ConfigPaths, ConfigWatchEvent,
-    ConfigWatcher, LayoutSplitAxis, LayoutSplitNode, Profile, ProfileTarget, ProfilesConfig,
-    SessionDescriptor, SshAuthMethod, TabLayout, TerminalConfig, ThemePalette, TomlReloadError,
-    VaultBackend, VaultSession, WindowLayout, WorkspaceLayout, ensure_config_files, load_layout,
-    save_layout,
+    ConfigWatcher, LayoutSplitAxis, LayoutSplitNode, OpenSshHost, Profile, ProfileTarget,
+    ProfilesConfig, SessionDescriptor, SshAuthMethod, TabLayout, TerminalConfig, ThemePalette,
+    TomlReloadError, VaultBackend, VaultSession, WindowLayout, WorkspaceLayout,
+    ensure_config_files, import_tabby_config_file_into_profiles, load_layout,
+    load_system_ssh_hosts, save_cloned_openssh_profile, save_layout,
 };
+use termewnal_core::vault::SecretStore;
 use termewnal_pty::{
     GridSearchMatch, PtyEvent, PtySession, PtySpawnConfig, Scroll, SelectionType, ShellSpec, Side,
     TerminalBuffer, TerminalSnapshot, detect_default_shell,
@@ -48,6 +50,7 @@ use crate::status_bar::{
     SessionKindLabel, SessionStatusHook, StatusBarAction, StatusBarSnapshot, StatusBarState,
     TransferSummaryHook, TunnelSummaryHook, render_status_bar,
 };
+use crate::tabby_import_ui::{TabbyImportUiState, tabby_import_path_input_id};
 use crate::terminal_ergonomics::{
     FileDropAction, PendingPaste, SearchBarState, classify_file_drop, cursor_style_to_shape,
     format_paste_bytes, iced_theme_from_name, is_multiline_paste, open_url_with_system,
@@ -498,6 +501,8 @@ pub enum Message {
     SidebarToggleGroup(String),
     SidebarToggleSection(SidebarSection),
     SetSystemSshProfiles(Vec<SystemSshProfile>),
+    ReloadSystemSshConfig,
+    CloneSystemSshToProfile(String),
     SetActiveTunnels(Vec<ActiveTunnelEntry>),
     LaunchProfile {
         profile_id: String,
@@ -548,6 +553,16 @@ pub enum Message {
     SetTunnelSummary(TunnelSummaryHook),
     SetTransferSummary(TransferSummaryHook),
     StatusBarAction(StatusBarAction),
+    OpenTabbyImportModal,
+    CloseTabbyImportModal,
+    TabbyImportPathChanged(String),
+    SubmitTabbyImport,
+    ImportTabbyConfigFromPath(PathBuf),
+    TabbyVaultCredentialChanged {
+        profile_id: String,
+        value: String,
+    },
+    SaveTabbyVaultCredential(String),
 }
 
 struct WindowState {
@@ -573,8 +588,10 @@ pub struct AppState {
     workspace_ids: WorkspaceIds,
     sessions: BTreeMap<SessionId, SessionEntry>,
     pending_remote_connects: Vec<RemoteConnectIntent>,
+    openssh_hosts: Vec<OpenSshHost>,
     sidebar: SidebarState,
     command_palette: CommandPaletteState,
+    tabby_import: TabbyImportUiState,
     status_bar: StatusBarState,
     next_session_id: u64,
     last_error: Option<String>,
@@ -688,8 +705,10 @@ impl AppState {
             workspace_ids,
             sessions: BTreeMap::new(),
             pending_remote_connects: Vec::new(),
+            openssh_hosts: Vec::new(),
             sidebar: SidebarState::new(),
             command_palette: CommandPaletteState::new(),
+            tabby_import: TabbyImportUiState::default(),
             status_bar: StatusBarState::new(),
             next_session_id: 1,
             last_error: None,
@@ -718,6 +737,7 @@ impl AppState {
         if !restored {
             state.push_default_pending_window()?;
         }
+        state.reload_system_ssh_config();
         Ok(state)
     }
 
@@ -1226,6 +1246,51 @@ impl AppState {
         }
     }
 
+    fn reload_system_ssh_config(&mut self) {
+        match load_system_ssh_hosts(&self.paths) {
+            Ok(hosts) => {
+                let entries = hosts.iter().map(SystemSshProfile::from).collect();
+                self.openssh_hosts = hosts;
+                self.sidebar.set_system_ssh_profiles(entries);
+            }
+            Err(err) => {
+                warn!(error = %err, "failed to load read-only ~/.ssh/config");
+                self.last_error = Some(err.to_string());
+            }
+        }
+    }
+
+    fn clone_system_ssh_to_profile(&mut self, alias: &str) {
+        let host = self
+            .openssh_hosts
+            .iter()
+            .find(|h| h.alias == alias)
+            .cloned()
+            .or_else(|| {
+                self.sidebar
+                    .system_ssh_profiles()
+                    .iter()
+                    .find(|h| h.alias == alias)
+                    .map(SystemSshProfile::to_openssh_host)
+            });
+
+        let Some(host) = host else {
+            self.last_error = Some(format!("unknown System SSH host: {alias}"));
+            return;
+        };
+
+        match save_cloned_openssh_profile(&self.paths, &host, &default_os_username()) {
+            Ok(profile) => {
+                self.profiles.profiles.push(profile);
+                self.last_error = None;
+            }
+            Err(err) => {
+                error!(alias = %alias, error = %err, "failed to clone System SSH host to Profile");
+                self.last_error = Some(err.to_string());
+            }
+        }
+    }
+
     fn launch_system_ssh_entry(
         &mut self,
         window_scope: Option<window::Id>,
@@ -1241,13 +1306,25 @@ impl AppState {
         else {
             return Task::none();
         };
+        let auth = match host
+            .identity_file
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+        {
+            Some(path) => SshAuthMethod::PublicKey {
+                key_path: Some(PathBuf::from(path)),
+                vault_secret_ref: None,
+            },
+            None => SshAuthMethod::Agent,
+        };
         let target = SshSessionTarget {
             profile_id: None,
             name: host.alias.clone(),
             host: host.host_name.unwrap_or_else(|| host.alias.clone()),
             port: host.port,
             username: host.user.unwrap_or_else(default_os_username),
-            auth: SshAuthMethod::Agent,
+            auth,
             proxy_jump: host.proxy_jump,
             auto_connect_on_startup: false,
             tmux_reattach: None,
@@ -1332,6 +1409,14 @@ impl AppState {
             PaletteAction::OpenQuickConnectPrompt => {
                 self.command_palette.enter_quick_connect("");
                 operation::focus(quick_connect_input_id())
+            }
+            PaletteAction::OpenTabbyImporter => {
+                self.command_palette.close();
+                self.update_in_window(window_scope, Message::OpenTabbyImportModal)
+            }
+            PaletteAction::ReloadSystemSsh => {
+                self.command_palette.close();
+                self.update_in_window(window_scope, Message::ReloadSystemSshConfig)
             }
             PaletteAction::NewTab => {
                 self.command_palette.close();
@@ -1983,6 +2068,10 @@ impl AppState {
                     self.command_palette.close();
                     return Task::none();
                 }
+                if self.tabby_import.is_open() {
+                    self.tabby_import.close();
+                    return Task::none();
+                }
                 if self.pending_paste.take().is_some() {
                     return Task::none();
                 }
@@ -2470,7 +2559,19 @@ impl AppState {
                 Task::none()
             }
             Message::SetSystemSshProfiles(entries) => {
+                self.openssh_hosts = entries
+                    .iter()
+                    .map(SystemSshProfile::to_openssh_host)
+                    .collect();
                 self.sidebar.set_system_ssh_profiles(entries);
+                Task::none()
+            }
+            Message::ReloadSystemSshConfig => {
+                self.reload_system_ssh_config();
+                Task::none()
+            }
+            Message::CloneSystemSshToProfile(alias) => {
+                self.clone_system_ssh_to_profile(&alias);
                 Task::none()
             }
             Message::SetActiveTunnels(entries) => {
@@ -2572,6 +2673,90 @@ impl AppState {
                 Task::none()
             }
             Message::StatusBarAction(action) => self.handle_status_bar_action(action),
+            Message::OpenTabbyImportModal => {
+                self.command_palette.close();
+                self.tabby_import.open();
+                operation::focus(tabby_import_path_input_id())
+            }
+            Message::CloseTabbyImportModal => {
+                self.tabby_import.close();
+                Task::none()
+            }
+            Message::TabbyImportPathChanged(path) => {
+                self.tabby_import.set_path_input(path);
+                Task::none()
+            }
+            Message::SubmitTabbyImport => {
+                let path = PathBuf::from(self.tabby_import.path_input().trim());
+                self.run_tabby_import(path);
+                Task::none()
+            }
+            Message::ImportTabbyConfigFromPath(path) => {
+                self.command_palette.close();
+                self.tabby_import
+                    .open_with_path(path.to_string_lossy().into_owned());
+                self.run_tabby_import(path);
+                Task::none()
+            }
+            Message::TabbyVaultCredentialChanged { profile_id, value } => {
+                self.tabby_import.set_credential_draft(&profile_id, value);
+                Task::none()
+            }
+            Message::SaveTabbyVaultCredential(profile_id) => {
+                self.save_tabby_vault_credential(&profile_id);
+                Task::none()
+            }
+        }
+    }
+
+    fn run_tabby_import(&mut self, path: PathBuf) {
+        if path.as_os_str().is_empty() {
+            self.tabby_import
+                .set_import_error("Please enter the path to Tabby's config.yaml file");
+            return;
+        }
+        match import_tabby_config_file_into_profiles(
+            &path,
+            &self.paths,
+            &default_os_username(),
+            Some(self.vault.as_ref()),
+        ) {
+            Ok(outcome) => {
+                self.profiles = outcome.updated_profiles.clone();
+                self.tabby_import.record_outcome(path, &outcome);
+                self.last_error = None;
+            }
+            Err(err) => {
+                warn!(path = %path.display(), error = %err, "Tabby config.yaml import failed");
+                self.tabby_import.set_import_error(err.to_string());
+            }
+        }
+    }
+
+    fn save_tabby_vault_credential(&mut self, profile_id: &str) {
+        let Some((secret_ref, draft)) = self.tabby_import.credential_entry(profile_id) else {
+            return;
+        };
+        let secret_ref = secret_ref.to_string();
+        let draft = zeroize::Zeroizing::new(draft.to_string());
+
+        if draft.is_empty() {
+            self.tabby_import
+                .set_credential_error(profile_id, "Credential must not be empty");
+            return;
+        }
+        if self.vault.requires_unlock() {
+            self.tabby_import.set_credential_error(
+                profile_id,
+                "Termewnal Vault is locked — unlock Vault first before saving secrets",
+            );
+            return;
+        }
+        match self.vault.set_secret(&secret_ref, draft.as_str()) {
+            Ok(()) => self.tabby_import.mark_credential_saved(profile_id),
+            Err(err) => self
+                .tabby_import
+                .set_credential_error(profile_id, err.to_string()),
         }
     }
 
@@ -2811,6 +2996,9 @@ impl AppState {
         }
         if let Some(pending) = &self.pending_paste {
             layers = layers.push(paste_confirm_modal_view(pending, &palette));
+        }
+        if self.tabby_import.is_open() {
+            layers = layers.push(self.tabby_import.view(&palette, self.vault.requires_unlock()));
         }
         if self.command_palette.is_open() {
             let items = self.command_palette_items();
@@ -3064,8 +3252,10 @@ impl AppState {
         broadcast: bool,
         show_border: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
-        let terminal_focused = focused && !self.command_palette.is_open();
+        let terminal_focused =
+            focused && !self.command_palette.is_open() && !self.tabby_import.is_open();
         let ime_enabled = !self.command_palette.is_open()
+            && !self.tabby_import.is_open()
             && self.pending_paste.is_none()
             && !(self.search.open && self.search.input_focused);
         let options = TerminalViewOptions::from_config(&self.config.terminal, ime_enabled);
@@ -3339,6 +3529,11 @@ impl AppState {
     /// Returns the Command Palette modal state.
     pub fn command_palette(&self) -> &CommandPaletteState {
         &self.command_palette
+    }
+
+    /// Returns the Tabby `config.yaml` importer modal state.
+    pub fn tabby_import(&self) -> &TabbyImportUiState {
+        &self.tabby_import
     }
 
     /// Computes an inspectable [`StatusBarSnapshot`] from the active `Session`, `Tunnel`, and `Transfer` state.
