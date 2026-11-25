@@ -132,7 +132,7 @@ fn rotate_backups(target: &Path, parent: &Path) -> Result<(), CoreError> {
     Ok(())
 }
 
-fn stage_temp_file(parent: &Path, bytes: &[u8]) -> Result<NamedTempFile, CoreError> {
+pub(crate) fn stage_temp_file(parent: &Path, bytes: &[u8]) -> Result<NamedTempFile, CoreError> {
     let mut tmp = NamedTempFile::new_in(parent).map_err(|source| CoreError::Io {
         path: parent.to_path_buf(),
         source,
@@ -149,11 +149,11 @@ fn stage_temp_file(parent: &Path, bytes: &[u8]) -> Result<NamedTempFile, CoreErr
 }
 
 #[cfg(unix)]
-fn sync_parent_dir(dir: &Path) {
+pub(crate) fn sync_parent_dir(dir: &Path) {
     if let Ok(dir_file) = fs::File::open(dir) {
         let _ = dir_file.sync_all();
     }
 }
 
 #[cfg(not(unix))]
-fn sync_parent_dir(_dir: &Path) {}
+pub(crate) fn sync_parent_dir(_dir: &Path) {}
