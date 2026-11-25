@@ -10,6 +10,7 @@ pub mod sidebar;
 pub mod split_view;
 pub mod ssh_ui;
 pub mod status_bar;
+pub mod tabby_import_ui;
 pub mod terminal_ergonomics;
 pub mod terminal_widget;
 pub mod workspace;
@@ -44,6 +45,9 @@ pub use ssh_ui::{
 pub use status_bar::{
     SessionKindLabel, SessionStatusHook, StatusBarAction, StatusBarSnapshot, StatusBarState,
     TransferSummaryHook, TunnelSummaryHook, render_status_bar,
+};
+pub use tabby_import_ui::{
+    TabbyCredentialPromptRow, TabbyImportSummary, TabbyImportUiState, tabby_import_path_input_id,
 };
 pub use terminal_ergonomics::{
     FileDropAction, PendingPaste, SearchBarState, classify_file_drop, format_paste_bytes,
