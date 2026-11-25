@@ -12,6 +12,8 @@ pub const CURRENT_SCHEMA_VERSION: u32 = 1;
 
 const CONFIG_FILE_NAME: &str = "config.toml";
 const PROFILES_FILE_NAME: &str = "profiles.toml";
+const LAYOUT_FILE_NAME: &str = "layout.toml";
+const IPC_SOCKET_FILE_NAME: &str = "termewnal.sock";
 const VAULT_FILE_NAME: &str = "vault.enc";
 
 /// Standard XDG/OS directory locations for Termewnal configuration and runtime state.
@@ -75,6 +77,19 @@ impl ConfigPaths {
     /// Path to `profiles.toml`.
     pub fn profiles_file(&self) -> PathBuf {
         self.config_dir.join(PROFILES_FILE_NAME)
+    }
+
+    /// Path to `layout.toml` storing persisted workspace windows, tabs, and split geometry.
+    pub fn layout_file(&self) -> PathBuf {
+        self.data_local_dir.join(LAYOUT_FILE_NAME)
+    }
+
+    /// Path to the single-instance local IPC socket (`runtime_dir` with `data_local_dir` fallback).
+    pub fn ipc_socket_file(&self) -> PathBuf {
+        self.runtime_dir
+            .as_deref()
+            .unwrap_or(&self.data_local_dir)
+            .join(IPC_SOCKET_FILE_NAME)
     }
 
     /// Path to the optional local encrypted `Vault` file under `data_local_dir()`.

@@ -83,6 +83,28 @@ impl Profile {
             tunnels: Vec::new(),
         }
     }
+
+    /// Returns whether this `Profile` is configured to auto-connect on startup (SSH targets only).
+    pub fn auto_connect_on_startup(&self) -> bool {
+        match &self.target {
+            ProfileTarget::Ssh {
+                auto_connect_on_startup,
+                ..
+            } => *auto_connect_on_startup,
+            ProfileTarget::LocalShell { .. } => false,
+        }
+    }
+
+    /// Sets `auto_connect_on_startup` on SSH `Profile`s (no-op for local shell profiles).
+    pub fn set_auto_connect_on_startup(&mut self, enabled: bool) {
+        if let ProfileTarget::Ssh {
+            auto_connect_on_startup,
+            ..
+        } = &mut self.target
+        {
+            *auto_connect_on_startup = enabled;
+        }
+    }
 }
 
 /// Connection target for a `Profile`.
