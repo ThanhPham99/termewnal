@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/termewnal-core",
+    "crates/termewnal-pty",
+    "crates/termewnal-ssh",
+    "crates/termewnal-ui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+
+[workspace.dependencies]
+alacritty_terminal = "0.26"
+directories = "6.0"
+iced = { version = "0.14", features = ["tokio", "advanced", "svg", "image", "sysinfo", "sipper"] }
+portable-pty = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+tempfile = "3.27"
+thiserror = "2.0"
+tokio = { version = "1.54", features = ["full"] }
+toml = "1.2"
+tracing = "0.1"
+uuid = { version = "1.29", features = ["v4", "serde"] }
