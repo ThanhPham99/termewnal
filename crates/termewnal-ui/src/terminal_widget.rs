@@ -78,6 +78,20 @@ impl ImeComposition {
     }
 }
 
+/// Inner padding (in logical pixels) around the terminal grid so text never hugs window borders.
+pub const TERMINAL_INNER_PAD: f32 = 8.0;
+
+fn content_bounds(bounds: Rectangle) -> Rectangle {
+    let pad = TERMINAL_INNER_PAD;
+    if bounds.width <= pad * 2.0 + 8.0 || bounds.height <= pad * 2.0 + 8.0 {
+        return bounds;
+    }
+    Rectangle::new(
+        Point::new(bounds.x + pad, bounds.y + pad),
+        Size::new(bounds.width - pad * 2.0, bounds.height - pad * 2.0),
+    )
+}
+
 /// Computes the pixel anchor rectangle for the OS IME candidate popup at the active cursor cell.
 pub fn ime_cursor_anchor_rect(
     snapshot: &TerminalSnapshot,
@@ -330,6 +344,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         let state = tree.state.downcast_mut::<ViewportState>();
         let is_focused = self.explicit_focus.unwrap_or(state.focused);
         let bounds = layout.bounds();
+        let inner = content_bounds(bounds);
         let cell_size = measure_cell_size(self.font, self.options.font_size);
 
         match event {
@@ -339,8 +354,8 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 | window::Event::Rescaled(_)
                 | window::Event::RedrawRequested(_),
             ) => {
-                let cols = (bounds.width / cell_size.width).floor().max(1.0) as u16;
-                let rows = (bounds.height / cell_size.height).floor().max(1.0) as u16;
+                let cols = (inner.width / cell_size.width).floor().max(1.0) as u16;
+                let rows = (inner.height / cell_size.height).floor().max(1.0) as u16;
                 if (cols, rows) == (self.snapshot.cols, self.snapshot.rows) {
                     state.last_requested_size = Some((cols, rows));
                 } else if state.last_requested_size != Some((cols, rows)) {
@@ -354,7 +369,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
 
                 if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
                     if self.options.ime_enabled && is_focused {
-                        let cursor_rect = ime_cursor_anchor_rect(&self.snapshot, bounds, cell_size);
+                        let cursor_rect = ime_cursor_anchor_rect(&self.snapshot, inner, cell_size);
                         let preedit = state.ime.to_iced_preedit(self.options.font_size);
                         shell.request_input_method(&InputMethod::Enabled {
                             cursor: cursor_rect,
@@ -381,7 +396,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 let prev_hover = state.hovered_url.clone();
                 if bounds.contains(*position) {
-                    let (col, row, side) = point_to_cell(*position, bounds, cell_size, &self.snapshot);
+                    let (col, row, side) = point_to_cell(*position, inner, cell_size, &self.snapshot);
                     state.cursor_cell = Some((col, row));
                     state.hovered_url = if state.modifiers.control() {
                         url_at_cell(&self.snapshot, col, row)
@@ -428,7 +443,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 shell.publish(Message::TerminalFocused);
                 if let Some(pos) = cursor.position_in(bounds) {
                     let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);
-                    let (col, row, side) = point_to_cell(abs, bounds, cell_size, &self.snapshot);
+                    let (col, row, side) = point_to_cell(abs, inner, cell_size, &self.snapshot);
                     if state.modifiers.control()
                         && let Some(detected) = url_at_cell(&self.snapshot, col, row)
                     {
@@ -652,6 +667,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         let state = tree.state.downcast_ref::<ViewportState>();
         let is_focused = self.explicit_focus.unwrap_or(state.focused);
         let bounds = layout.bounds();
+        let inner = content_bounds(bounds);
         let Some(clip_bounds) = bounds.intersection(viewport) else {
             return;
         };
@@ -679,7 +695,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         let rows = self.snapshot.rows as usize;
 
         for row in 0..rows {
-            let y = bounds.y + (row as f32) * cell_size.height;
+            let y = inner.y + (row as f32) * cell_size.height;
             if y >= clip_bounds.y + clip_bounds.height {
                 break;
             }
@@ -707,7 +723,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 } else {
                     1.0
                 };
-                let x = bounds.x + (col as f32) * cell_size.width;
+                let x = inner.x + (col as f32) * cell_size.width;
 
                 if bg != palette.background {
                     renderer.fill_quad(
@@ -762,11 +778,11 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                         }
                     }
 
-                    let run_x = bounds.x + (run_start_col as f32) * cell_size.width;
+                    let run_x = inner.x + (run_start_col as f32) * cell_size.width;
                     renderer.fill_text(
                         Text {
                             content: run,
-                            bounds: Size::new(bounds.width, cell_size.height),
+                            bounds: Size::new(inner.width, cell_size.height),
                             size: Pixels(self.options.font_size),
                             line_height: LineHeight::Absolute(Pixels(cell_size.height)),
                             font: self.font,
@@ -788,8 +804,8 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         // Underline hovered URL on Ctrl+Hover.
         if let Some(hovered) = &state.hovered_url {
             for span in &hovered.spans {
-                let y = bounds.y + (span.row as f32 + 1.0) * cell_size.height - 2.0;
-                let x = bounds.x + (span.start_col as f32) * cell_size.width;
+                let y = inner.y + (span.row as f32 + 1.0) * cell_size.height - 2.0;
+                let x = inner.x + (span.start_col as f32) * cell_size.width;
                 let width = ((span.end_col - span.start_col + 1) as f32) * cell_size.width;
                 renderer.fill_quad(
                     Quad {
@@ -806,7 +822,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         if let Some(cursor_snap) = self.snapshot.cursor
             && cursor_snap.shape != CursorShape::Hidden
         {
-            let cursor_rect = ime_cursor_anchor_rect(&self.snapshot, bounds, cell_size);
+            let cursor_rect = ime_cursor_anchor_rect(&self.snapshot, inner, cell_size);
             let cursor_color = Color {
                 a: if is_focused { 0.75 } else { 0.35 },
                 ..palette.cursor
@@ -858,6 +874,37 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             renderer.fill_quad(quad, fill);
         }
 
+        // Subtle scrollbar thumb and scrollback offset badge when scrolled up in history.
+        if self.snapshot.history_size > 0 && bounds.height > 24.0 && bounds.width > 20.0 {
+            let total_lines = (self.snapshot.history_size + rows).max(1) as f32;
+            let track_h = (bounds.height - 8.0).max(12.0);
+            let thumb_h = ((rows as f32 / total_lines) * track_h).clamp(18.0, track_h);
+            let scroll_ratio = (self.snapshot.display_offset as f32
+                / self.snapshot.history_size.max(1) as f32)
+                .clamp(0.0, 1.0);
+            let thumb_y = bounds.y + 4.0 + (1.0 - scroll_ratio) * (track_h - thumb_h);
+            let thumb_alpha = if self.snapshot.display_offset > 0 { 0.55 } else { 0.22 };
+            renderer.fill_quad(
+                Quad {
+                    bounds: Rectangle::new(
+                        Point::new(bounds.x + bounds.width - 6.0, thumb_y),
+                        Size::new(3.0, thumb_h),
+                    ),
+                    border: Border {
+                        color: Color::TRANSPARENT,
+                        width: 0.0,
+                        radius: 2.0.into(),
+                    },
+                    shadow: Shadow::default(),
+                    snap: true,
+                },
+                Background::Color(Color {
+                    a: thumb_alpha,
+                    ..palette.foreground
+                }),
+            );
+        }
+
         // Render active Vietnamese/CJK IME pre-edit overlay inline at the cursor cell.
         if is_focused && !state.ime.content.is_empty() {
             draw_ime_preedit(
@@ -866,7 +913,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 self.font,
                 self.options.font_size,
                 cell_size,
-                bounds,
+                inner,
                 clip_bounds,
                 &self.snapshot,
                 palette,

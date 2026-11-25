@@ -5,8 +5,10 @@ use std::sync::{Arc, Mutex};
 
 use iced::futures::SinkExt;
 use iced::widget::{button, column, container, row, space, text, text_input};
-use iced::{Alignment, Background, Border, Color, Element, Length, Task, Theme};
-use termewnal_core::{AppConfig, OpenSshHost, Profile, VaultSession, vault::SecretStore};
+use iced::{Alignment, Background, Border, Element, Length, Task, Theme};
+use termewnal_core::{
+    AppConfig, OpenSshHost, Profile, ThemePalette, VaultSession, vault::SecretStore,
+};
 use termewnal_pty::TerminalBuffer;
 use termewnal_ssh::{
     AgentConnector, BoxFuture, ConnectionSupervisor, HostKeyDecision, HostKeyPrompt,
@@ -18,6 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{Message, SessionId};
+use crate::ui_theme::{ChromePalette, PillTone, pill_button_style, status_dot, styled_input_style};
 
 /// Shared oneshot responder resolving a TOFU unknown-host prompt.
 pub type HostKeyResponder = Arc<Mutex<Option<oneshot::Sender<HostKeyDecision>>>>;
@@ -452,10 +455,14 @@ impl SshUiState {
     }
 
     /// Renders persistent red MITM hard-block alert banners.
-    pub fn view_mitm_alerts(&self) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
+    pub fn view_mitm_alerts(
+        &self,
+        palette: &ThemePalette,
+    ) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
         if self.mitm_alerts.is_empty() {
             return None;
         }
+        let chrome = ChromePalette::from_palette(palette);
 
         let mut list = column![].spacing(6).width(Length::Fill);
         for alert in self.mitm_alerts.values() {
@@ -470,19 +477,29 @@ impl SshUiState {
             );
             let banner = container(
                 row![
-                    text(summary).size(13).color(Color::WHITE),
+                    status_dot(chrome.danger),
+                    text(summary).size(12).color(chrome.text_primary),
                     space::horizontal(),
-                    button(text("Dismiss").size(12))
+                    button(text("Dismiss").size(11))
                         .padding([4, 10])
-                        .style(button::secondary)
+                        .style(pill_button_style(chrome, PillTone::Subtle))
                         .on_press(Message::DismissMitmAlert(alert.session_id)),
                 ]
-                .spacing(12)
+                .spacing(10)
                 .align_y(Alignment::Center),
             )
             .width(Length::Fill)
             .padding([8, 12])
-            .style(mitm_banner_style);
+            .style(move |_| container::Style {
+                background: Some(Background::Color(chrome.danger_soft)),
+                border: Border {
+                    color: chrome.danger,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                text_color: Some(chrome.text_primary),
+                ..Default::default()
+            });
             list = list.push(banner);
         }
 
@@ -490,30 +507,42 @@ impl SshUiState {
     }
 
     /// Renders the interactive Trust On First Use (TOFU) host key confirmation panel.
-    pub fn view_tofu_modal(&self) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
+    pub fn view_tofu_modal(
+        &self,
+        palette: &ThemePalette,
+    ) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
         let entry = self.host_key_queue.front()?;
+        let chrome = ChromePalette::from_palette(palette);
         let prompt = &entry.prompt;
         let sid = entry.session_id;
 
         let card = container(
             column![
-                text(format!(
-                    "Unknown SSH Host Key: {}:{} ({})",
-                    prompt.host, prompt.port, prompt.key_type
-                ))
-                .size(14),
-                text(format!("SHA256 Fingerprint: {}", prompt.fingerprint_sha256)).size(13),
                 row![
-                    button(text("Trust & Save to known_hosts").size(13))
-                        .padding([6, 12])
-                        .style(button::primary)
+                    status_dot(chrome.warning),
+                    text(format!(
+                        "Unknown SSH Host Key: {}:{} ({})",
+                        prompt.host, prompt.port, prompt.key_type
+                    ))
+                    .size(13)
+                    .color(chrome.text_primary),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                text(format!("SHA256 Fingerprint: {}", prompt.fingerprint_sha256))
+                    .size(12)
+                    .color(chrome.text_secondary),
+                row![
+                    button(text("Trust & Save to known_hosts").size(12))
+                        .padding([5, 12])
+                        .style(pill_button_style(chrome, PillTone::Primary))
                         .on_press(Message::RespondHostKeyPrompt {
                             session_id: sid,
                             accept: true,
                         }),
-                    button(text("Reject").size(13))
-                        .padding([6, 12])
-                        .style(button::danger)
+                    button(text("Reject").size(12))
+                        .padding([5, 12])
+                        .style(pill_button_style(chrome, PillTone::Danger))
                         .on_press(Message::RespondHostKeyPrompt {
                             session_id: sid,
                             accept: false,
@@ -526,14 +555,27 @@ impl SshUiState {
         )
         .width(Length::Fill)
         .padding([10, 14])
-        .style(prompt_panel_style);
+        .style(move |_| container::Style {
+            background: Some(Background::Color(chrome.panel_bg)),
+            border: Border {
+                color: chrome.accent,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            text_color: Some(chrome.text_primary),
+            ..Default::default()
+        });
 
         Some(card.into())
     }
 
     /// Renders the active interactive passphrase, password, or 2FA/OTP prompt bar.
-    pub fn view_auth_prompt(&self) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
+    pub fn view_auth_prompt(
+        &self,
+        palette: &ThemePalette,
+    ) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
         let entry = self.auth_queue.front()?;
+        let chrome = ChromePalette::from_palette(palette);
         let sid = entry.session_id;
 
         let header = match &entry.prompt {
@@ -558,7 +600,15 @@ impl SshUiState {
             }
         };
 
-        let mut col = column![text(header).size(14)].spacing(6);
+        let mut col = column![
+            row![
+                status_dot(chrome.accent),
+                text(header).size(13).color(chrome.text_primary),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+        ]
+        .spacing(8);
         for (idx, item) in entry.items.iter().enumerate() {
             let val = entry
                 .drafts
@@ -568,6 +618,9 @@ impl SshUiState {
             let input = text_input(item.prompt.trim(), val)
                 .secure(!item.echo)
                 .width(Length::Fixed(280.0))
+                .size(12)
+                .padding([5, 8])
+                .style(styled_input_style(chrome))
                 .on_input(move |v| Message::SshAuthInputChanged {
                     session_id: sid,
                     index: idx,
@@ -575,21 +628,26 @@ impl SshUiState {
                 })
                 .on_submit(Message::SubmitSshAuthPrompt(sid));
             col = col.push(
-                row![text(item.prompt.as_str()).size(13), input]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
+                row![
+                    text(item.prompt.as_str())
+                        .size(12)
+                        .color(chrome.text_secondary),
+                    input
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
             );
         }
 
         col = col.push(
             row![
-                button(text("Submit").size(13))
+                button(text("Submit").size(12))
                     .padding([5, 12])
-                    .style(button::primary)
+                    .style(pill_button_style(chrome, PillTone::Primary))
                     .on_press(Message::SubmitSshAuthPrompt(sid)),
-                button(text("Cancel").size(13))
+                button(text("Cancel").size(12))
                     .padding([5, 12])
-                    .style(button::secondary)
+                    .style(pill_button_style(chrome, PillTone::Subtle))
                     .on_press(Message::CancelSshAuthPrompt(sid)),
             ]
             .spacing(8)
@@ -600,7 +658,16 @@ impl SshUiState {
             container(col)
                 .width(Length::Fill)
                 .padding([10, 14])
-                .style(prompt_panel_style)
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(chrome.panel_bg)),
+                    border: Border {
+                        color: chrome.accent,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    text_color: Some(chrome.text_primary),
+                    ..Default::default()
+                })
                 .into(),
         )
     }
@@ -612,7 +679,9 @@ impl SshUiState {
         port: u16,
         blocked_by_mitm: bool,
         last_error: Option<&str>,
+        palette: &ThemePalette,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
+        let chrome = ChromePalette::from_palette(palette);
         let copy = if blocked_by_mitm {
             format!("SSH blocked for {host}:{port} — host key mismatch detected (see MITM alert)")
         } else if let Some(err) = last_error {
@@ -621,23 +690,40 @@ impl SshUiState {
             format!("SSH Disconnected ({host}:{port}) — Press Enter or click Connect")
         };
 
-        let mut bar = row![text(copy).size(12), space::horizontal()]
-            .spacing(8)
-            .align_y(Alignment::Center);
+        let mut bar = row![
+            status_dot(if blocked_by_mitm {
+                chrome.danger
+            } else {
+                chrome.warning
+            }),
+            text(copy).size(12).color(chrome.text_primary),
+            space::horizontal(),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
 
         if !blocked_by_mitm {
             bar = bar.push(
-                button(text("Connect").size(12))
-                    .padding([3, 10])
-                    .style(button::primary)
+                button(text("Connect").size(11))
+                    .padding([4, 12])
+                    .style(pill_button_style(chrome, PillTone::Primary))
                     .on_press(Message::ConnectSshSession(session_id)),
             );
         }
 
         container(bar)
             .width(Length::Fill)
-            .padding([5, 10])
-            .style(disconnected_bar_style)
+            .padding([6, 12])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(chrome.panel_bg)),
+                border: Border {
+                    color: chrome.border_subtle,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                text_color: Some(chrome.text_primary),
+                ..Default::default()
+            })
             .into()
     }
 }
@@ -895,39 +981,4 @@ pub async fn drive_ssh_connect(
         });
     }
     supervisor.disconnect();
-}
-
-fn mitm_banner_style(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(Color::from_rgb8(153, 27, 27))),
-        border: Border {
-            color: Color::from_rgb8(248, 113, 113),
-            width: 1.0,
-            radius: 0.0.into(),
-        },
-        text_color: Some(Color::WHITE),
-        ..Default::default()
-    }
-}
-
-fn prompt_panel_style(_theme: &Theme) -> container::Style {
-    container::Style::default()
-        .background(Color::from_rgb8(0x28, 0x30, 0x3d))
-        .color(Color::from_rgb8(0xe5, 0xe9, 0xf0))
-        .border(Border {
-            color: Color::from_rgb8(0x5e, 0x81, 0xac),
-            width: 1.0,
-            radius: 4.0.into(),
-        })
-}
-
-fn disconnected_bar_style(_theme: &Theme) -> container::Style {
-    container::Style::default()
-        .background(Color::from_rgb8(0x2e, 0x34, 0x40))
-        .color(Color::from_rgb8(0xd8, 0xde, 0xe9))
-        .border(Border {
-            color: Color::from_rgb8(0x4c, 0x56, 0x6a),
-            width: 1.0,
-            radius: 0.0.into(),
-        })
 }

@@ -1,10 +1,7 @@
 use std::path::PathBuf;
 
-use iced::widget::{
-    Id, button, column, container, mouse_area, opaque, row, rule, scrollable, space, text,
-    text_input,
-};
-use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Theme, Vector};
+use iced::widget::{Id, button, column, container, row, rule, scrollable, space, text, text_input};
+use iced::{Alignment, Background, Border, Element, Length, Theme};
 use termewnal_core::{
     TabbyCredentialKind, TabbyImportOutcome, TabbyVaultStatus, ThemePalette,
     default_tabby_config_path,
@@ -12,6 +9,10 @@ use termewnal_core::{
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::Message;
+use crate::ui_theme::{
+    ChromePalette, PillTone, card_container_style, modal_card_style, modal_overlay,
+    pill_button_style, styled_input_style,
+};
 
 const MODAL_WIDTH: f32 = 580.0;
 
@@ -218,19 +219,16 @@ impl TabbyImportUiState {
         palette: &ThemePalette,
         vault_requires_unlock: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
-        let fg = Color::from_rgb8(
-            palette.foreground.r,
-            palette.foreground.g,
-            palette.foreground.b,
-        );
-        let muted = Color { a: 0.78, ..fg };
+        let chrome = ChromePalette::from_palette(palette);
 
         let header = row![
-            text("Import Tabby config.yaml").size(16).color(fg),
+            text("Import Tabby config.yaml")
+                .size(16)
+                .color(chrome.text_primary),
             space::horizontal(),
             button(text("Close").size(12))
-                .padding([3, 10])
-                .style(button::subtle)
+                .padding([4, 10])
+                .style(pill_button_style(chrome, PillTone::Ghost))
                 .on_press(Message::CloseTabbyImportModal),
         ]
         .align_y(Alignment::Center);
@@ -242,10 +240,11 @@ impl TabbyImportUiState {
                 .on_submit(Message::SubmitTabbyImport)
                 .size(13)
                 .padding([7, 10])
+                .style(styled_input_style(chrome))
                 .width(Length::Fill),
-            button(text("Import").size(13))
+            button(text("Import").size(12))
                 .padding([7, 14])
-                .style(button::primary)
+                .style(pill_button_style(chrome, PillTone::Primary))
                 .on_press(Message::SubmitTabbyImport),
         ]
         .spacing(8)
@@ -255,66 +254,31 @@ impl TabbyImportUiState {
             header,
             text("Migrates SSH & Local Profiles, groups/tags, and Tunnel rules into profiles.toml (ignores plugin settings).")
                 .size(12)
-                .color(muted),
+                .color(chrome.text_muted),
             path_row,
         ]
         .spacing(10);
 
         if let Some(err) = &self.import_error {
-            body = body.push(
-                text(err.as_str())
-                    .size(12)
-                    .color(Color::from_rgb8(248, 113, 113)),
-            );
+            body = body.push(text(err.as_str()).size(12).color(chrome.danger));
         }
 
         if let Some(summary) = &self.summary {
-            body = body.push(self.view_summary(summary, fg, vault_requires_unlock));
+            body = body.push(self.view_summary(summary, chrome, vault_requires_unlock));
         }
 
-        let card = opaque(
-            container(body)
-                .width(Length::Fixed(MODAL_WIDTH))
-                .padding(16)
-                .style(|theme: &Theme| {
-                    let ext = theme.extended_palette();
-                    container::Style {
-                        background: Some(Background::Color(ext.background.base.color)),
-                        border: Border {
-                            color: ext.primary.strong.color,
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        shadow: Shadow {
-                            color: Color::from_rgba(0.0, 0.0, 0.0, 0.45),
-                            offset: Vector::new(0.0, 8.0),
-                            blur_radius: 20.0,
-                        },
-                        ..Default::default()
-                    }
-                }),
-        );
+        let card = container(body)
+            .width(Length::Fixed(MODAL_WIDTH))
+            .padding(16)
+            .style(move |_theme: &Theme| modal_card_style(chrome, true));
 
-        let backdrop = container(card)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .center_x(Length::Fill)
-            .center_y(Length::Fill)
-            .padding(24)
-            .style(|_theme: &Theme| container::Style {
-                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
-                ..Default::default()
-            });
-
-        mouse_area(backdrop)
-            .on_press(Message::CloseTabbyImportModal)
-            .into()
+        modal_overlay(card.into(), Some(Message::CloseTabbyImportModal), 24.0)
     }
 
     fn view_summary<'a>(
         &'a self,
         summary: &'a TabbyImportSummary,
-        fg: Color,
+        chrome: ChromePalette,
         vault_requires_unlock: bool,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
         let mut section = column![
@@ -326,29 +290,25 @@ impl TabbyImportUiState {
                 summary.skipped_duplicate_count,
                 summary.skipped_unsupported_count
             ))
-            .size(13)
-            .color(fg),
+            .size(12)
+            .color(chrome.success),
         ]
         .spacing(10);
 
         if let Some(notice) = &summary.vault_notice {
             section = section.push(
-                container(
-                    text(notice.as_str())
-                        .size(12)
-                        .color(Color::from_rgb8(253, 224, 71)),
-                )
-                .width(Length::Fill)
-                .padding([8, 10])
-                .style(|_theme: &Theme| container::Style {
-                    background: Some(Background::Color(Color::from_rgba(0.6, 0.45, 0.05, 0.22))),
-                    border: Border {
-                        color: Color::from_rgb8(234, 179, 8),
-                        width: 1.0,
-                        radius: 4.0.into(),
-                    },
-                    ..Default::default()
-                }),
+                container(text(notice.as_str()).size(12).color(chrome.warning))
+                    .width(Length::Fill)
+                    .padding([8, 10])
+                    .style(move |_theme: &Theme| container::Style {
+                        background: Some(Background::Color(chrome.warning_soft)),
+                        border: Border {
+                            color: chrome.warning,
+                            width: 1.0,
+                            radius: 6.0.into(),
+                        },
+                        ..Default::default()
+                    }),
             );
         }
 
@@ -356,14 +316,14 @@ impl TabbyImportUiState {
             section = section.push(
                 text("Termewnal's local Vault is locked — unlock it in the top banner before saving secrets.")
                     .size(12)
-                    .color(Color::from_rgb8(248, 113, 113)),
+                    .color(chrome.danger),
             );
         }
 
         if !self.credential_rows.is_empty() {
             let mut rows_col = column![].spacing(8);
             for row_item in &self.credential_rows {
-                rows_col = rows_col.push(view_credential_row(row_item, fg));
+                rows_col = rows_col.push(view_credential_row(row_item, chrome));
             }
             section = section.push(
                 scrollable(rows_col)
@@ -378,7 +338,7 @@ impl TabbyImportUiState {
 
 fn view_credential_row<'a>(
     row_item: &'a TabbyCredentialPromptRow,
-    fg: Color,
+    chrome: ChromePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
     let (kind_label, placeholder) = match row_item.kind {
         TabbyCredentialKind::Password => ("Password", "Enter SSH password..."),
@@ -388,14 +348,11 @@ fn view_credential_row<'a>(
     let pid_save = pid.clone();
 
     let action_elem: Element<'_, Message, Theme, iced::Renderer> = if row_item.saved {
-        text("Saved to Vault")
-            .size(12)
-            .color(Color::from_rgb8(74, 222, 128))
-            .into()
+        text("Saved to Vault").size(12).color(chrome.success).into()
     } else {
         button(text("Save to Vault").size(12))
             .padding([5, 10])
-            .style(button::primary)
+            .style(pill_button_style(chrome, PillTone::Primary))
             .on_press(Message::SaveTabbyVaultCredential(pid_save))
             .into()
     };
@@ -404,7 +361,8 @@ fn view_credential_row<'a>(
         text_input(placeholder, row_item.secret_draft.as_str())
             .secure(true)
             .size(12)
-            .padding([5, 8])
+            .padding([6, 8])
+            .style(styled_input_style(chrome))
             .width(Length::Fill)
             .on_input(move |value| Message::TabbyVaultCredentialChanged {
                 profile_id: pid.clone(),
@@ -422,18 +380,18 @@ fn view_credential_row<'a>(
             row_item.profile_name, row_item.target_display
         ))
         .size(12)
-        .color(fg),
+        .color(chrome.text_primary),
         input_row,
     ]
-    .spacing(4);
+    .spacing(6);
 
     if let Some(err) = &row_item.error {
-        entry_col = entry_col.push(
-            text(err.as_str())
-                .size(11)
-                .color(Color::from_rgb8(248, 113, 113)),
-        );
+        entry_col = entry_col.push(text(err.as_str()).size(11).color(chrome.danger));
     }
 
-    entry_col.into()
+    container(entry_col)
+        .padding([8, 10])
+        .width(Length::Fill)
+        .style(move |_| card_container_style(chrome, false))
+        .into()
 }

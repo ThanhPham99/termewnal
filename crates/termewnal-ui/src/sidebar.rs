@@ -2,16 +2,20 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use iced::widget::{Id, button, column, container, row, rule, scrollable, space, text, text_input};
-use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
-use termewnal_core::{OpenSshHost, Profile, ProfileTarget, TunnelDirection};
+use iced::{Alignment, Background, Color, Element, Length, Theme};
+use termewnal_core::{OpenSshHost, Profile, ProfileTarget, ThemePalette, TunnelDirection};
 
 use crate::app::{LaunchDisposition, Message, SessionId};
+use crate::ui_theme::{
+    ChromePalette, PillTone, badge_pill, card_container_style, pill_button_style, status_dot,
+    styled_input_style,
+};
 use crate::workspace::SplitAxis;
 
 /// Group heading used when a saved `Profile` has no explicit group assigned.
 pub const UNGROUPED_LABEL: &str = "Ungrouped";
 
-const SIDEBAR_WIDTH: f32 = 270.0;
+const SIDEBAR_WIDTH: f32 = 280.0;
 
 /// Returns the static widget [`Id`] for the Left Sidebar profile filter input.
 pub const fn sidebar_filter_input_id() -> Id {
@@ -384,33 +388,50 @@ pub fn profile_target_summary(profile: &Profile) -> String {
 pub fn render_sidebar<'a>(
     state: &'a SidebarState,
     profiles: &'a [Profile],
+    palette: &ThemePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
+    let chrome = ChromePalette::from_palette(palette);
+
     let header = row![
-        text("Profiles & Tunnels").size(14),
+        text("Profiles & Tunnels")
+            .size(13)
+            .color(chrome.text_primary),
         space::horizontal(),
         button(text("Import").size(11))
-            .padding([2, 6])
-            .style(button::secondary)
+            .padding([3, 8])
+            .style(pill_button_style(chrome, PillTone::Ghost))
             .on_press(Message::OpenTabbyImportModal),
-        button(text("+ SSH").size(11))
-            .padding([2, 6])
-            .style(button::secondary)
-            .on_press(Message::OpenQuickConnectPalette),
-        button(text("x").size(12))
+        button(text("×").size(13))
             .padding([2, 7])
-            .style(button::subtle)
+            .style(pill_button_style(chrome, PillTone::Ghost))
             .on_press(Message::SetSidebarOpen(false)),
     ]
     .spacing(4)
+    .align_y(Alignment::Center);
+
+    let quick_row = row![
+        button(text("+ New Profile").size(11))
+            .padding([5, 8])
+            .width(Length::Fill)
+            .style(pill_button_style(chrome, PillTone::Primary))
+            .on_press(Message::OpenNewProfileModal),
+        button(text("+ Quick SSH").size(11))
+            .padding([5, 8])
+            .width(Length::Fill)
+            .style(pill_button_style(chrome, PillTone::Subtle))
+            .on_press(Message::OpenQuickConnectPalette),
+    ]
+    .spacing(6)
     .align_y(Alignment::Center);
 
     let filter_input = text_input("Filter profiles...", state.filter_query())
         .id(sidebar_filter_input_id())
         .on_input(Message::SidebarFilterChanged)
         .size(12)
-        .padding([5, 8]);
+        .padding([6, 9])
+        .style(styled_input_style(chrome));
 
-    let mut content = column![header, filter_input].spacing(8);
+    let mut content = column![header, quick_row, filter_input].spacing(8);
 
     let tags = state.available_tags(profiles);
     if !tags.is_empty() {
@@ -419,12 +440,15 @@ pub fn render_sidebar<'a>(
             let active = state.selected_tag() == Some(tag.as_str());
             tag_row = tag_row.push(
                 button(text(format!("#{tag}")).size(11))
-                    .padding([2, 6])
-                    .style(if active {
-                        button::primary
-                    } else {
-                        button::subtle
-                    })
+                    .padding([2, 7])
+                    .style(pill_button_style(
+                        chrome,
+                        if active {
+                            PillTone::ActiveAccent
+                        } else {
+                            PillTone::Subtle
+                        },
+                    ))
                     .on_press(Message::SidebarToggleTagFilter(tag)),
             );
         }
@@ -435,11 +459,11 @@ pub fn render_sidebar<'a>(
     }
 
     let mut sections = column![].spacing(10);
-    sections = sections.push(render_saved_profiles_section(state, profiles));
+    sections = sections.push(render_saved_profiles_section(state, profiles, chrome));
     sections = sections.push(rule::horizontal(1));
-    sections = sections.push(render_system_ssh_section(state));
+    sections = sections.push(render_system_ssh_section(state, chrome));
     sections = sections.push(rule::horizontal(1));
-    sections = sections.push(render_tunnels_section(state));
+    sections = sections.push(render_tunnels_section(state, chrome));
 
     content = content.push(
         scrollable(sections)
@@ -447,35 +471,43 @@ pub fn render_sidebar<'a>(
             .height(Length::Fill),
     );
 
-    container(content.padding(10))
+    let body = container(content.padding(10))
         .width(Length::Fixed(SIDEBAR_WIDTH))
         .height(Length::Fill)
-        .style(|theme: &Theme| {
-            let ext = theme.extended_palette();
-            container::Style {
-                background: Some(Background::Color(ext.background.weak.color)),
-                border: Border {
-                    color: ext.background.strong.color,
-                    width: 1.0,
-                    radius: 0.0.into(),
-                },
-                ..Default::default()
-            }
-        })
+        .style(move |_theme: &Theme| container::Style {
+            background: Some(Background::Color(chrome.chrome_bg)),
+            text_color: Some(chrome.text_primary),
+            ..Default::default()
+        });
+
+    let right_hairline = container(space::vertical().width(1))
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(chrome.border_subtle)),
+            ..Default::default()
+        });
+
+    row![body, right_hairline]
+        .height(Length::Fill)
         .into()
 }
 
 fn render_saved_profiles_section<'a>(
     state: &'a SidebarState,
     profiles: &'a [Profile],
+    chrome: ChromePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
     let collapsed = state.is_section_collapsed(SidebarSection::SavedProfiles);
-    let prefix = if collapsed { ">" } else { "v" };
-    let header = button(text(format!("{prefix} SAVED PROFILES ({})", profiles.len())).size(11))
-        .padding([3, 4])
-        .width(Length::Fill)
-        .style(button::subtle)
-        .on_press(Message::SidebarToggleSection(SidebarSection::SavedProfiles));
+    let prefix = if collapsed { "▸" } else { "▾" };
+    let header = button(
+        text(format!("{prefix} SAVED PROFILES ({})", profiles.len()))
+            .size(11)
+            .color(chrome.text_muted),
+    )
+    .padding([3, 4])
+    .width(Length::Fill)
+    .style(pill_button_style(chrome, PillTone::Ghost))
+    .on_press(Message::SidebarToggleSection(SidebarSection::SavedProfiles));
 
     let mut col = column![header].spacing(6);
     if collapsed {
@@ -486,20 +518,20 @@ fn render_saved_profiles_section<'a>(
     if groups.is_empty() {
         col = col.push(
             text("No matching saved profiles")
-                .size(12)
-                .color(Color::from_rgb8(148, 163, 184)),
+                .size(11)
+                .color(chrome.text_muted),
         );
         return col.into();
     }
 
     for group in groups {
-        let group_prefix = if group.collapsed { ">" } else { "v" };
+        let group_prefix = if group.collapsed { "▸" } else { "▾" };
         let group_title = format!("{group_prefix} {} ({})", group.name, group.profiles.len());
         col = col.push(
-            button(text(group_title).size(12))
-                .padding([3, 6])
+            button(text(group_title).size(11).color(chrome.text_secondary))
+                .padding([4, 6])
                 .width(Length::Fill)
-                .style(button::secondary)
+                .style(pill_button_style(chrome, PillTone::Subtle))
                 .on_press(Message::SidebarToggleGroup(group.name.clone())),
         );
 
@@ -508,16 +540,18 @@ fn render_saved_profiles_section<'a>(
         }
 
         for profile in group.profiles {
-            let kind_badge = match profile.target {
-                ProfileTarget::LocalShell { .. } => "LOCAL",
-                ProfileTarget::Ssh { .. } => "SSH",
+            let is_ssh = matches!(profile.target, ProfileTarget::Ssh { .. });
+            let (kind_badge, dot_color, badge_fg, badge_bg) = if is_ssh {
+                ("SSH", chrome.accent, chrome.accent, chrome.accent_soft)
+            } else {
+                ("LOCAL", chrome.success, chrome.success, chrome.success_soft)
             };
             let subtitle = profile_target_summary(profile);
             let tags_suffix = if profile.tags.is_empty() {
                 String::new()
             } else {
                 format!(
-                    "  [{}]",
+                    " · {}",
                     profile
                         .tags
                         .iter()
@@ -528,42 +562,65 @@ fn render_saved_profiles_section<'a>(
             };
 
             let item_label = column![
-                text(format!("[{kind_badge}] {}", profile.name)).size(12),
+                row![
+                    status_dot(dot_color),
+                    badge_pill(kind_badge, badge_fg, badge_bg, Color::TRANSPARENT),
+                    text(profile.name.as_str())
+                        .size(12)
+                        .color(chrome.text_primary),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
                 text(format!("{subtitle}{tags_suffix}"))
                     .size(11)
-                    .color(Color::from_rgb8(148, 163, 184)),
+                    .color(chrome.text_muted),
             ]
-            .spacing(2);
+            .spacing(3);
 
             let launch_btn = button(item_label)
-                .padding([4, 8])
+                .padding([5, 6])
                 .width(Length::Fill)
-                .style(button::subtle)
+                .style(pill_button_style(chrome, PillTone::Ghost))
                 .on_press(Message::LaunchProfile {
                     profile_id: profile.id.clone(),
                     disposition: LaunchDisposition::NewTab,
                 });
 
-            let split_v_btn = button(text("|").size(11))
-                .padding([4, 5])
-                .style(button::subtle)
-                .on_press(Message::LaunchProfile {
-                    profile_id: profile.id.clone(),
-                    disposition: LaunchDisposition::Split(SplitAxis::Vertical),
-                });
-
-            let split_h_btn = button(text("-").size(11))
-                .padding([4, 5])
-                .style(button::subtle)
-                .on_press(Message::LaunchProfile {
-                    profile_id: profile.id.clone(),
-                    disposition: LaunchDisposition::Split(SplitAxis::Horizontal),
-                });
+            let action_col = column![
+                row![
+                    button(text("|").size(10))
+                        .padding([2, 6])
+                        .style(pill_button_style(chrome, PillTone::Ghost))
+                        .on_press(Message::LaunchProfile {
+                            profile_id: profile.id.clone(),
+                            disposition: LaunchDisposition::Split(SplitAxis::Vertical),
+                        }),
+                    button(text("-").size(10))
+                        .padding([2, 6])
+                        .style(pill_button_style(chrome, PillTone::Ghost))
+                        .on_press(Message::LaunchProfile {
+                            profile_id: profile.id.clone(),
+                            disposition: LaunchDisposition::Split(SplitAxis::Horizontal),
+                        }),
+                ]
+                .spacing(2),
+                button(text("Edit").size(10))
+                    .padding([2, 6])
+                    .style(pill_button_style(chrome, PillTone::Subtle))
+                    .on_press(Message::OpenEditProfileModal(profile.id.clone())),
+            ]
+            .spacing(3)
+            .align_x(Alignment::End);
 
             col = col.push(
-                row![launch_btn, split_v_btn, split_h_btn]
-                    .spacing(2)
-                    .align_y(Alignment::Center),
+                container(
+                    row![launch_btn, action_col]
+                        .spacing(4)
+                        .align_y(Alignment::Center),
+                )
+                .padding([3, 6])
+                .width(Length::Fill)
+                .style(move |_| card_container_style(chrome, false)),
             );
         }
     }
@@ -571,17 +628,24 @@ fn render_saved_profiles_section<'a>(
     col.into()
 }
 
-fn render_system_ssh_section(state: &SidebarState) -> Element<'_, Message, Theme, iced::Renderer> {
+fn render_system_ssh_section(
+    state: &SidebarState,
+    chrome: ChromePalette,
+) -> Element<'_, Message, Theme, iced::Renderer> {
     let collapsed = state.is_section_collapsed(SidebarSection::SystemSshProfiles);
-    let prefix = if collapsed { ">" } else { "v" };
+    let prefix = if collapsed { "▸" } else { "▾" };
     let count = state.system_ssh_profiles().len();
-    let header = button(text(format!("{prefix} SYSTEM SSH ({count})")).size(11))
-        .padding([3, 4])
-        .width(Length::Fill)
-        .style(button::subtle)
-        .on_press(Message::SidebarToggleSection(
-            SidebarSection::SystemSshProfiles,
-        ));
+    let header = button(
+        text(format!("{prefix} SYSTEM SSH ({count})"))
+            .size(11)
+            .color(chrome.text_muted),
+    )
+    .padding([3, 4])
+    .width(Length::Fill)
+    .style(pill_button_style(chrome, PillTone::Ghost))
+    .on_press(Message::SidebarToggleSection(
+        SidebarSection::SystemSshProfiles,
+    ));
 
     let mut col = column![header].spacing(6);
     if collapsed {
@@ -616,11 +680,7 @@ fn render_system_ssh_section(state: &SidebarState) -> Element<'_, Message, Theme
         } else {
             "No matching System SSH hosts"
         };
-        col = col.push(
-            text(empty_msg)
-                .size(11)
-                .color(Color::from_rgb8(148, 163, 184)),
-        );
+        col = col.push(text(empty_msg).size(11).color(chrome.text_muted));
         return col.into();
     }
 
@@ -631,46 +691,63 @@ fn render_system_ssh_section(state: &SidebarState) -> Element<'_, Message, Theme
             format!("{} · via {}", host.display_target(), host.proxy_jump.join(","))
         };
         let item = column![
-            text(format!("[RO] {}", host.alias)).size(12),
-            text(subtitle)
-                .size(11)
-                .color(Color::from_rgb8(148, 163, 184)),
+            row![
+                badge_pill("SSH CFG", chrome.text_secondary, chrome.card_hover, Color::TRANSPARENT),
+                text(host.alias.as_str())
+                    .size(12)
+                    .color(chrome.text_primary),
+            ]
+            .spacing(5)
+            .align_y(Alignment::Center),
+            text(subtitle).size(11).color(chrome.text_muted),
         ]
-        .spacing(2);
+        .spacing(3);
         let launch_btn = button(item)
-            .padding([4, 8])
+            .padding([5, 6])
             .width(Length::Fill)
-            .style(button::subtle)
+            .style(pill_button_style(chrome, PillTone::Ghost))
             .on_press(Message::LaunchSystemSsh {
                 alias: host.alias.clone(),
                 disposition: LaunchDisposition::NewTab,
             });
-        let clone_btn = button(text("Clone").size(11))
-            .padding([4, 6])
-            .style(button::secondary)
+        let clone_btn = button(text("Clone").size(10))
+            .padding([3, 7])
+            .style(pill_button_style(chrome, PillTone::Subtle))
             .on_press(Message::CloneSystemSshToProfile(host.alias.clone()));
         col = col.push(
-            row![launch_btn, clone_btn]
-                .spacing(4)
-                .align_y(Alignment::Center),
+            container(
+                row![launch_btn, clone_btn]
+                    .spacing(4)
+                    .align_y(Alignment::Center),
+            )
+            .padding([3, 6])
+            .width(Length::Fill)
+            .style(move |_| card_container_style(chrome, false)),
         );
     }
 
     col.into()
 }
 
-fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, iced::Renderer> {
+fn render_tunnels_section(
+    state: &SidebarState,
+    chrome: ChromePalette,
+) -> Element<'_, Message, Theme, iced::Renderer> {
     let collapsed = state.is_section_collapsed(SidebarSection::ActiveTunnels);
-    let prefix = if collapsed { ">" } else { "v" };
+    let prefix = if collapsed { "▸" } else { "▾" };
     let count = state.active_tunnels().len();
-    let header_btn = button(text(format!("{prefix} ACTIVE TUNNELS ({count})")).size(11))
-        .padding([3, 4])
-        .width(Length::Fill)
-        .style(button::subtle)
-        .on_press(Message::SidebarToggleSection(SidebarSection::ActiveTunnels));
-    let new_btn = button(text("+ Tunnel").size(11))
-        .padding([2, 6])
-        .style(button::secondary)
+    let header_btn = button(
+        text(format!("{prefix} ACTIVE TUNNELS ({count})"))
+            .size(11)
+            .color(chrome.text_muted),
+    )
+    .padding([3, 4])
+    .width(Length::Fill)
+    .style(pill_button_style(chrome, PillTone::Ghost))
+    .on_press(Message::SidebarToggleSection(SidebarSection::ActiveTunnels));
+    let new_btn = button(text("+ Tunnel").size(10))
+        .padding([3, 8])
+        .style(pill_button_style(chrome, PillTone::Subtle))
         .on_press(Message::OpenTunnelCreateModal);
     let header = row![header_btn, new_btn]
         .spacing(4)
@@ -682,11 +759,7 @@ fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, i
     }
 
     if state.active_tunnels().is_empty() {
-        col = col.push(
-            text("No active tunnels")
-                .size(11)
-                .color(Color::from_rgb8(148, 163, 184)),
-        );
+        col = col.push(text("No active tunnels").size(11).color(chrome.text_muted));
         return col.into();
     }
 
@@ -709,28 +782,35 @@ fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, i
                 | TunnelRuntimeState::Reconnecting
                 | TunnelRuntimeState::Retrying { .. }
         );
-        let state_color = match &tunnel.state {
-            TunnelRuntimeState::Active => Color::from_rgb8(74, 222, 128),
+        let (state_fg, state_bg) = match &tunnel.state {
+            TunnelRuntimeState::Active => (chrome.success, chrome.success_soft),
             TunnelRuntimeState::Holding
             | TunnelRuntimeState::Reconnecting
             | TunnelRuntimeState::Retrying { .. }
-            | TunnelRuntimeState::Starting => Color::from_rgb8(251, 191, 36),
-            TunnelRuntimeState::Error(_) => Color::from_rgb8(248, 113, 113),
-            TunnelRuntimeState::Stopped => Color::from_rgb8(148, 163, 184),
+            | TunnelRuntimeState::Starting => (chrome.warning, chrome.warning_soft),
+            TunnelRuntimeState::Error(_) => (chrome.danger, chrome.danger_soft),
+            TunnelRuntimeState::Stopped => (chrome.text_muted, chrome.card_hover),
         };
         let toggle_btn = button(text(if is_running { "Stop" } else { "Start" }).size(10))
-            .padding([2, 6])
-            .style(if is_running {
-                button::secondary
-            } else {
-                button::primary
-            })
+            .padding([3, 7])
+            .style(pill_button_style(
+                chrome,
+                if is_running {
+                    PillTone::Subtle
+                } else {
+                    PillTone::Primary
+                },
+            ))
             .on_press(Message::ToggleTunnel(tunnel.id.clone()));
 
         let mut action_row = row![
-            text(format!("[{dir}] {}", tunnel.name)).size(12),
+            status_dot(state_fg),
+            badge_pill(dir, chrome.accent, chrome.accent_soft, Color::TRANSPARENT),
+            text(tunnel.name.as_str())
+                .size(12)
+                .color(chrome.text_primary),
             space::horizontal(),
-            text(tunnel.state.status_badge()).size(11).color(state_color),
+            badge_pill(tunnel.state.status_badge(), state_fg, state_bg, Color::TRANSPARENT),
             toggle_btn,
         ]
         .spacing(4)
@@ -746,8 +826,8 @@ fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, i
         ) {
             action_row = action_row.push(
                 button(text("Reconnect").size(10))
-                    .padding([2, 6])
-                    .style(button::subtle)
+                    .padding([3, 7])
+                    .style(pill_button_style(chrome, PillTone::Ghost))
                     .on_press(Message::ReconnectTunnel(tunnel.id.clone())),
             );
         }
@@ -756,29 +836,26 @@ fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, i
             action_row,
             text(format!("{} -> {} ({scope})", tunnel.bind_addr, tunnel.target_addr))
                 .size(11)
-                .color(Color::from_rgb8(148, 163, 184)),
+                .color(chrome.text_muted),
         ]
-        .spacing(2);
+        .spacing(3);
 
         match &tunnel.state {
             TunnelRuntimeState::Retrying { reason, .. } => {
-                item = item.push(
-                    text(reason.as_str())
-                        .size(10)
-                        .color(Color::from_rgb8(251, 191, 36)),
-                );
+                item = item.push(text(reason.as_str()).size(10).color(chrome.warning));
             }
             TunnelRuntimeState::Error(err) => {
-                item = item.push(
-                    text(err.as_str())
-                        .size(10)
-                        .color(Color::from_rgb8(248, 113, 113)),
-                );
+                item = item.push(text(err.as_str()).size(10).color(chrome.danger));
             }
             _ => {}
         }
 
-        col = col.push(container(item).padding([4, 8]).width(Length::Fill));
+        col = col.push(
+            container(item)
+                .padding([6, 8])
+                .width(Length::Fill)
+                .style(move |_| card_container_style(chrome, false)),
+        );
     }
 
     col.into()

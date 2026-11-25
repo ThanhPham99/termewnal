@@ -5,6 +5,8 @@ pub mod close_guard;
 pub mod command_palette;
 pub mod config_reload_ui;
 pub mod ipc;
+pub mod profile_ui;
+pub mod settings_ui;
 pub mod sftp_drawer;
 pub mod sidebar;
 pub mod split_view;
@@ -14,6 +16,7 @@ pub mod tabby_import_ui;
 pub mod terminal_ergonomics;
 pub mod terminal_widget;
 pub mod tunnel_ui;
+pub mod ui_theme;
 pub mod workspace;
 
 pub use app::{
@@ -31,6 +34,8 @@ pub use command_palette::{
 };
 pub use config_reload_ui::ConfigReloadUiState;
 pub use ipc::{IpcCommand, IpcError, IpcServerHandle, LaunchOutcome, acquire_or_forward, send_command};
+pub use profile_ui::{ProfileAuthChoice, ProfileEditorState, ProfileKindChoice, SavedProfileDraft};
+pub use settings_ui::{SettingsTab, SettingsUiState};
 pub use sftp_drawer::{
     DEFAULT_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH, MIN_SFTP_DRAWER_WIDTH, SftpDrawerDock,
     SftpDrawerState, render_conflict_resolution_modal, render_sftp_drawer,

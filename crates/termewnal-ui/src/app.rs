@@ -7,20 +7,21 @@ use std::time::Duration;
 use iced::futures::{SinkExt, Stream};
 use iced::keyboard::{self, Key, Modifiers, key::Named};
 use iced::widget::{
-    button, column, container, operation, row, scrollable, space, stack, text,
+    button, column, container, operation, row, rule, scrollable, space, stack, text,
 };
 use iced::{
-    Alignment, Background, Border, Color, Element, Event, Length, Size, Subscription, Task, Theme,
-    clipboard, event, window,
+    Alignment, Background, Border, Color, Element, Event, Length, Padding, Size, Subscription,
+    Task, Theme, clipboard, event, window,
 };
 use termewnal_core::{
-    AppConfig, CURRENT_SCHEMA_VERSION, ConfigFileKind, ConfigPaths, ConfigWatchEvent,
-    ConfigWatcher, LayoutSplitAxis, LayoutSplitNode, OpenSshHost, Profile, ProfileTarget,
-    ProfilesConfig, SecretStore, SessionDescriptor, SshAuthMethod, TabLayout, TerminalConfig,
-    ThemePalette, TomlReloadError, TunnelDirection, TunnelRule, VaultBackend, VaultSession,
-    WindowLayout, WorkspaceLayout, ensure_config_files, import_tabby_config_file_into_profiles,
-    load_layout, load_system_ssh_hosts, resolve_mux_attach_command, save_cloned_openssh_profile,
-    save_layout, save_profiles,
+    AppConfig, BuiltinTheme, CURRENT_SCHEMA_VERSION, ConfigFileKind, ConfigPaths, ConfigWatchEvent,
+    ConfigWatcher, CursorStyle, LayoutSplitAxis, LayoutSplitNode, OpenSshHost, Profile,
+    ProfileTarget, ProfilesConfig, SecretStore, SessionDescriptor, SshAuthMethod, TabLayout,
+    TerminalConfig, ThemePalette, TomlReloadError, TransferConflictPolicy, TunnelDirection,
+    TunnelRule, VaultBackend, VaultSession, WindowLayout, WorkspaceLayout, ensure_config_files,
+    import_tabby_config_file_into_profiles, load_layout, load_system_ssh_hosts,
+    resolve_mux_attach_command, save_cloned_openssh_profile, save_config, save_layout,
+    save_profiles,
 };
 use termewnal_pty::{
     GridSearchMatch, PtyEvent, PtySession, PtySpawnConfig, Scroll, SelectionType, ShellSpec, Side,
@@ -48,11 +49,14 @@ use crate::command_palette::{
 };
 use crate::config_reload_ui::ConfigReloadUiState;
 use crate::ipc::{IpcCommand, IpcServerHandle};
+use crate::profile_ui::{ProfileAuthChoice, ProfileEditorState, ProfileKindChoice};
+use crate::settings_ui::{SettingsTab, SettingsUiState};
 use crate::sftp_drawer::{
     SftpDrawerDock, SftpDrawerState, render_conflict_resolution_modal, render_sftp_drawer,
 };
 use crate::sidebar::{
-    ActiveTunnelEntry, SidebarSection, SidebarState, SystemSshProfile, render_sidebar,
+    ActiveTunnelEntry, SidebarSection, SidebarState, SystemSshProfile, profile_target_summary,
+    render_sidebar,
 };
 use crate::split_view::{CapturedEventGate, PaneFrame, ShortcutInterceptor, SplitView};
 use crate::ssh_ui::{SshTargetSpec, SshUiEvent, SshUiState, connect_ssh_task};
@@ -70,6 +74,10 @@ use crate::terminal_widget::{TerminalViewOptions, TerminalViewport};
 use crate::tunnel_ui::{
     AdHocTunnelRule, TunnelUiState, apply_known_hosts_override, build_active_tunnel_entries,
     tunnel_name_input_id,
+};
+use crate::ui_theme::{
+    ChromePalette, PillTone, card_container_style, keycap_pill, pill_button_style, status_dot,
+    tab_container_style,
 };
 use crate::workspace::{
     ClosePaneOutcome, CycleDirection, FocusDirection, PaneId, SplitAxis, SplitId, SplitNode,
@@ -715,6 +723,47 @@ pub enum Message {
     ReconnectTunnel(String),
     ReconnectAllTunnels,
     TunnelManagerUpdated(TunnelManagerSnapshot),
+    OpenSettingsModal,
+    CloseSettingsModal,
+    SettingsSelectTab(SettingsTab),
+    SettingsThemeSelected(BuiltinTheme),
+    SettingsFontFamilyChanged(String),
+    SettingsFontSizeChanged(String),
+    SettingsStepFontSize(f32),
+    SettingsLigaturesToggled(bool),
+    SettingsCursorStyleSelected(CursorStyle),
+    SettingsShellChanged(String),
+    SettingsScrollbackChanged(String),
+    SettingsCopyOnSelectToggled(bool),
+    SettingsConfirmMultilinePasteToggled(bool),
+    SettingsKeepaliveIntervalChanged(String),
+    SettingsKeepaliveMissedChanged(String),
+    SettingsConflictPolicySelected(TransferConflictPolicy),
+    SettingsFollowSymlinksToggled(bool),
+    SettingsVaultBackendSelected(VaultBackend),
+    SettingsAutoLockChanged(String),
+    SettingsSave,
+    OpenNewProfileModal,
+    OpenEditProfileModal(String),
+    CloseProfileEditor,
+    ProfileFormKindChanged(ProfileKindChoice),
+    ProfileFormNameChanged(String),
+    ProfileFormGroupChanged(String),
+    ProfileFormTagsChanged(String),
+    ProfileFormLocalShellChanged(String),
+    ProfileFormLocalDirChanged(String),
+    ProfileFormHostChanged(String),
+    ProfileFormPortChanged(String),
+    ProfileFormUsernameChanged(String),
+    ProfileFormAuthChanged(ProfileAuthChoice),
+    ProfileFormKeyPathChanged(String),
+    ProfileFormSecretChanged(String),
+    ProfileFormProxyJumpChanged(String),
+    ProfileFormAutoConnectToggled(bool),
+    ProfileFormAutoMuxToggled(bool),
+    ProfileFormMuxCommandChanged(String),
+    ProfileSave,
+    ProfileDelete(String),
     FinalizeExit,
 }
 
@@ -745,6 +794,9 @@ pub struct AppState {
     sidebar: SidebarState,
     command_palette: CommandPaletteState,
     tabby_import: TabbyImportUiState,
+    settings_ui: SettingsUiState,
+    settings_origin_config: Option<AppConfig>,
+    profile_editor: ProfileEditorState,
     status_bar: StatusBarState,
     sftp_manager: SftpManager,
     transfer_queue: TransferQueue,
@@ -885,6 +937,9 @@ impl AppState {
             sftp_drawer: SftpDrawerState::with_download_dir(download_dir),
             tunnel_manager,
             tunnel_ui: TunnelUiState::default(),
+            settings_ui: SettingsUiState::default(),
+            settings_origin_config: None,
+            profile_editor: ProfileEditorState::default(),
             synced_standalone_tunnels: 0,
             known_hosts_override: None,
             next_session_id: 1,
@@ -1671,6 +1726,7 @@ impl AppState {
                 Task::none()
             }
             StatusBarAction::OpenCommandPalette => self.update(Message::OpenCommandPalette),
+            StatusBarAction::OpenSettings => self.update(Message::OpenSettingsModal),
             StatusBarAction::ProbeAll => self.probe_and_reconnect_all(),
             StatusBarAction::ReconnectSession(session_id) => {
                 self.reconnect_ssh_session(session_id)
@@ -1700,6 +1756,14 @@ impl AppState {
             PaletteAction::OpenQuickConnectPrompt => {
                 self.command_palette.enter_quick_connect("");
                 operation::focus(quick_connect_input_id())
+            }
+            PaletteAction::OpenSettings => {
+                self.command_palette.close();
+                self.update_in_window(window_scope, Message::OpenSettingsModal)
+            }
+            PaletteAction::OpenNewProfile => {
+                self.command_palette.close();
+                self.update_in_window(window_scope, Message::OpenNewProfileModal)
             }
             PaletteAction::OpenTabbyImporter => {
                 self.command_palette.close();
@@ -2367,6 +2431,10 @@ impl AppState {
             }
             Message::ApplyTerminalConfig(cfg) => {
                 self.config.terminal = cfg;
+                if self.settings_ui.is_open() {
+                    self.settings_origin_config = Some(self.config.clone());
+                    self.settings_ui.sync_from_config(&self.config);
+                }
                 self.sync_terminal_options_to_sessions();
                 Task::none()
             }
@@ -2405,6 +2473,22 @@ impl AppState {
                 Task::none()
             }
             Message::EscapePressed => {
+                if self.settings_ui.is_open() {
+                    self.close_settings_canceling_preview();
+                    return Task::none();
+                }
+                if self.profile_editor.is_open() {
+                    self.profile_editor.close();
+                    return Task::none();
+                }
+                if self.tunnel_ui.pending_public_bind_warning().is_some() {
+                    self.tunnel_ui.cancel_public_bind();
+                    return Task::none();
+                }
+                if self.tunnel_ui.create_form().open {
+                    self.tunnel_ui.create_form_mut().close();
+                    return Task::none();
+                }
                 if self.command_palette.is_open() {
                     self.command_palette.close();
                     return Task::none();
@@ -2596,6 +2680,10 @@ impl AppState {
                                 self.sync_terminal_options_to_sessions();
                                 self.transfer_queue
                                     .set_transfer_config(self.config.transfer.clone());
+                                if self.settings_ui.is_open() {
+                                    self.settings_origin_config = Some(self.config.clone());
+                                    self.settings_ui.sync_from_config(&self.config);
+                                }
                             }
                             reloaded
                         }
@@ -2630,6 +2718,10 @@ impl AppState {
                             self.sync_terminal_options_to_sessions();
                             self.transfer_queue
                                 .set_transfer_config(self.config.transfer.clone());
+                            if self.settings_ui.is_open() {
+                                self.settings_origin_config = Some(self.config.clone());
+                                self.settings_ui.sync_from_config(&self.config);
+                            }
                         }
                     }
                     Err(err) => {
@@ -3310,7 +3402,329 @@ impl AppState {
                 self.sync_tunnel_telemetry();
                 Task::none()
             }
+            Message::OpenSettingsModal => {
+                self.command_palette.close();
+                self.profile_editor.close();
+                if self.settings_origin_config.is_none() {
+                    self.settings_origin_config = Some(self.config.clone());
+                }
+                self.settings_ui.open_with(&self.config);
+                Task::none()
+            }
+            Message::CloseSettingsModal => {
+                self.close_settings_canceling_preview();
+                Task::none()
+            }
+            Message::SettingsSelectTab(tab) => {
+                self.settings_ui.set_tab(tab);
+                Task::none()
+            }
+            Message::SettingsThemeSelected(theme) => {
+                self.settings_ui.set_theme(theme);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsFontFamilyChanged(family) => {
+                self.settings_ui.set_font_family(family);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsFontSizeChanged(value) => {
+                self.settings_ui.set_font_size_text(value);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsStepFontSize(delta) => {
+                let _ = self.settings_ui.step_font_size(delta);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsLigaturesToggled(enabled) => {
+                self.settings_ui.set_font_ligatures(enabled);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsCursorStyleSelected(style) => {
+                self.settings_ui.set_cursor_style(style);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsShellChanged(value) => {
+                self.settings_ui.set_shell_text(value);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsScrollbackChanged(value) => {
+                self.settings_ui.set_scrollback_text(value);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsCopyOnSelectToggled(enabled) => {
+                self.settings_ui.set_copy_on_select(enabled);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsConfirmMultilinePasteToggled(enabled) => {
+                self.settings_ui.set_confirm_multiline_paste(enabled);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsKeepaliveIntervalChanged(value) => {
+                self.settings_ui.set_keepalive_interval_text(value);
+                Task::none()
+            }
+            Message::SettingsKeepaliveMissedChanged(value) => {
+                self.settings_ui.set_keepalive_missed_text(value);
+                Task::none()
+            }
+            Message::SettingsConflictPolicySelected(policy) => {
+                self.settings_ui.set_conflict_policy(policy);
+                Task::none()
+            }
+            Message::SettingsFollowSymlinksToggled(enabled) => {
+                self.settings_ui.set_follow_symlinks(enabled);
+                Task::none()
+            }
+            Message::SettingsVaultBackendSelected(backend) => {
+                self.settings_ui.set_vault_backend(backend);
+                Task::none()
+            }
+            Message::SettingsAutoLockChanged(value) => {
+                self.settings_ui.set_auto_lock_text(value);
+                Task::none()
+            }
+            Message::SettingsSave => {
+                self.apply_settings_save();
+                Task::none()
+            }
+            Message::OpenNewProfileModal => {
+                self.command_palette.close();
+                self.close_settings_canceling_preview();
+                self.profile_editor.open_new(default_os_username());
+                Task::none()
+            }
+            Message::OpenEditProfileModal(profile_id) => {
+                self.command_palette.close();
+                self.close_settings_canceling_preview();
+                if let Some(profile) = self
+                    .profiles
+                    .profiles
+                    .iter()
+                    .find(|p| p.id == profile_id)
+                {
+                    self.profile_editor.open_edit(profile);
+                }
+                Task::none()
+            }
+            Message::CloseProfileEditor => {
+                self.profile_editor.close();
+                Task::none()
+            }
+            Message::ProfileFormKindChanged(kind) => {
+                self.profile_editor.kind = kind;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormNameChanged(val) => {
+                self.profile_editor.name = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormGroupChanged(val) => {
+                self.profile_editor.group = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormTagsChanged(val) => {
+                self.profile_editor.tags = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormLocalShellChanged(val) => {
+                self.profile_editor.local_shell = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormLocalDirChanged(val) => {
+                self.profile_editor.local_working_dir = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormHostChanged(val) => {
+                self.profile_editor.ssh_host = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormPortChanged(val) => {
+                self.profile_editor.ssh_port = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormUsernameChanged(val) => {
+                self.profile_editor.ssh_username = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormAuthChanged(auth) => {
+                self.profile_editor.auth_choice = auth;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormKeyPathChanged(val) => {
+                self.profile_editor.key_path = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormSecretChanged(val) => {
+                self.profile_editor.secret_draft = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormProxyJumpChanged(val) => {
+                self.profile_editor.proxy_jump = val;
+                self.profile_editor.validation_error = None;
+                Task::none()
+            }
+            Message::ProfileFormAutoConnectToggled(val) => {
+                self.profile_editor.auto_connect_on_startup = val;
+                Task::none()
+            }
+            Message::ProfileFormAutoMuxToggled(val) => {
+                self.profile_editor.auto_attach_mux = val;
+                Task::none()
+            }
+            Message::ProfileFormMuxCommandChanged(val) => {
+                self.profile_editor.mux_attach_command = val;
+                Task::none()
+            }
+            Message::ProfileSave => {
+                self.apply_profile_save();
+                Task::none()
+            }
+            Message::ProfileDelete(profile_id) => {
+                self.apply_profile_delete(&profile_id);
+                Task::none()
+            }
         }
+    }
+
+    fn apply_live_settings_preview(&mut self) {
+        let draft = self.settings_ui.draft().clone();
+        self.config.terminal.theme = draft.terminal.theme;
+        if !draft.terminal.font_family.trim().is_empty() {
+            self.config.terminal.font_family = draft.terminal.font_family;
+        }
+        self.config.terminal.font_size = draft.terminal.font_size;
+        self.config.terminal.font_ligatures = draft.terminal.font_ligatures;
+        self.config.terminal.cursor_style = draft.terminal.cursor_style;
+        self.config.terminal.copy_on_select = draft.terminal.copy_on_select;
+        self.config.terminal.confirm_multiline_paste = draft.terminal.confirm_multiline_paste;
+        self.config.terminal.shell = draft.terminal.shell;
+        self.config.terminal.scrollback_lines = draft.terminal.scrollback_lines;
+        self.sync_terminal_options_to_sessions();
+    }
+
+    fn close_settings_canceling_preview(&mut self) {
+        if let Some(original) = self.settings_origin_config.take() {
+            self.config = original;
+            self.sync_terminal_options_to_sessions();
+            self.transfer_queue
+                .set_transfer_config(self.config.transfer.clone());
+        }
+        self.settings_ui.close();
+    }
+
+    fn apply_settings_save(&mut self) {
+        let next_cfg = match self.settings_ui.build_validated_config() {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                self.settings_ui.set_error(Some(err));
+                return;
+            }
+        };
+        if let Err(err) = save_config(&self.paths, &next_cfg) {
+            warn!(error = %err, "failed to save config.toml from Settings modal");
+            self.settings_ui.set_error(Some(err.to_string()));
+            return;
+        }
+        self.config = next_cfg;
+        self.settings_origin_config = None;
+        self.sync_terminal_options_to_sessions();
+        self.transfer_queue
+            .set_transfer_config(self.config.transfer.clone());
+        self.vault.apply_config(&self.config.vault);
+        self.last_error = None;
+        self.settings_ui.close();
+    }
+
+    fn apply_profile_save(&mut self) {
+        let existing = self
+            .profile_editor
+            .editing_id
+            .as_deref()
+            .and_then(|id| self.profiles.profiles.iter().find(|p| p.id == id))
+            .cloned();
+        let saved = match self.profile_editor.build_profile(existing.as_ref()) {
+            Ok(draft) => draft,
+            Err(err) => {
+                self.profile_editor.validation_error = Some(err);
+                return;
+            }
+        };
+
+        if let Some((secret_ref, secret)) = saved.secret_to_store {
+            if self.vault.requires_unlock() {
+                self.profile_editor.validation_error = Some(
+                    "Termewnal Vault is locked — unlock Vault first before saving secrets"
+                        .to_string(),
+                );
+                return;
+            }
+            if let Err(err) = self.vault.set_secret(&secret_ref, secret.as_str()) {
+                self.profile_editor.validation_error =
+                    Some(format!("Failed storing secret in Vault: {err}"));
+                return;
+            }
+        }
+
+        let mut next_profiles = self.profiles.clone();
+        if let Some(pos) = next_profiles
+            .profiles
+            .iter()
+            .position(|p| p.id == saved.profile.id)
+        {
+            next_profiles.profiles[pos] = saved.profile;
+        } else {
+            next_profiles.profiles.push(saved.profile);
+        }
+
+        if let Err(err) = save_profiles(&self.paths, &next_profiles) {
+            self.profile_editor.validation_error = Some(err.to_string());
+            return;
+        }
+
+        self.profiles = next_profiles;
+        self.last_error = None;
+        self.sync_tunnel_telemetry();
+        self.profile_editor.close();
+    }
+
+    fn apply_profile_delete(&mut self, profile_id: &str) {
+        let mut next_profiles = self.profiles.clone();
+        let before = next_profiles.profiles.len();
+        next_profiles.profiles.retain(|p| p.id != profile_id);
+        if next_profiles.profiles.len() == before {
+            self.profile_editor.close();
+            return;
+        }
+        if let Err(err) = save_profiles(&self.paths, &next_profiles) {
+            self.profile_editor.validation_error = Some(err.to_string());
+            return;
+        }
+        self.profiles = next_profiles;
+        self.last_error = None;
+        self.sync_tunnel_telemetry();
+        self.profile_editor.close();
     }
 
     fn run_tabby_import(&mut self, path: PathBuf) {
@@ -3641,42 +4055,44 @@ impl AppState {
     /// Renders the workspace tab strip, collapsible Left Sidebar, status/reload/Vault/SSH banners,
     /// active split panes, Status Bar, Search/Paste overlays, Command Palette, and Close Guard modal.
     pub fn view(&self, window_id: window::Id) -> Element<'_, Message, Theme, iced::Renderer> {
+        let palette = ThemePalette::for_name(&self.config.terminal.theme);
+        let chrome = ChromePalette::from_palette(&palette);
         let ws = self.window_workspaces.get(&window_id).map(|w| &w.workspace);
-        let mut main_pane_col = column![self.render_tab_strip(ws)]
+        let mut main_pane_col = column![self.render_tab_strip(ws, &palette)]
             .width(Length::Fill)
             .height(Length::Fill);
 
         if let Some(banner_text) = ws.and_then(Self::broadcast_banner_for_workspace) {
-            main_pane_col = main_pane_col.push(render_broadcast_banner(banner_text));
+            main_pane_col = main_pane_col.push(render_broadcast_banner(banner_text, chrome));
         }
 
-        if let Some(mitm) = self.ssh_ui.view_mitm_alerts() {
+        if let Some(mitm) = self.ssh_ui.view_mitm_alerts(&palette) {
             main_pane_col = main_pane_col.push(mitm);
         }
-        if let Some(tofu) = self.ssh_ui.view_tofu_modal() {
+        if let Some(tofu) = self.ssh_ui.view_tofu_modal(&palette) {
             main_pane_col = main_pane_col.push(tofu);
         }
-        if let Some(auth_prompt) = self.ssh_ui.view_auth_prompt() {
+        if let Some(auth_prompt) = self.ssh_ui.view_auth_prompt(&palette) {
             main_pane_col = main_pane_col.push(auth_prompt);
         }
 
-        if let Some(toasts) = self.reload_ui.view_reload_toasts() {
+        if let Some(toasts) = self.reload_ui.view_reload_toasts(&palette) {
             main_pane_col = main_pane_col.push(toasts);
         }
-        if let Some(vault_bar) = self.reload_ui.view_vault_banner(&self.vault) {
+        if let Some(vault_bar) = self.reload_ui.view_vault_banner(&self.vault, &palette) {
             main_pane_col = main_pane_col.push(vault_bar);
         }
 
         let body = match ws.and_then(|w| w.active_tab()) {
             Some(tab) => self.render_tab_body(tab),
-            None => self.render_empty_workspace(),
+            None => self.render_empty_workspace(&palette),
         };
         main_pane_col = main_pane_col.push(body);
 
         let main_or_sidebar: Element<'_, Message, Theme, iced::Renderer> = if self.sidebar.is_open()
         {
             row![
-                render_sidebar(&self.sidebar, &self.profiles.profiles),
+                render_sidebar(&self.sidebar, &self.profiles.profiles, &palette),
                 CapturedEventGate::new(main_pane_col.into()),
             ]
             .width(Length::Fill)
@@ -3697,7 +4113,7 @@ impl AppState {
             SftpDrawerDock::new(
                 self.sftp_drawer.width(),
                 main_or_sidebar,
-                render_sftp_drawer(&self.sftp_drawer, has_connected_ssh),
+                render_sftp_drawer(&self.sftp_drawer, has_connected_ssh, &palette),
             )
         } else {
             main_or_sidebar
@@ -3706,13 +4122,12 @@ impl AppState {
         let status_snapshot = self.status_bar_snapshot_for_workspace(ws);
         let base_layout: Element<'_, Message, Theme, iced::Renderer> = column![
             workspace_row,
-            render_status_bar(&status_snapshot),
+            render_status_bar(&status_snapshot, &palette),
         ]
         .width(Length::Fill)
         .height(Length::Fill)
         .into();
 
-        let palette = ThemePalette::for_name(&self.config.terminal.theme);
         let mut layers = stack![base_layout]
             .width(Length::Fill)
             .height(Length::Fill);
@@ -3750,12 +4165,19 @@ impl AppState {
         if let Some(bind_warning) = self.tunnel_ui.view_public_bind_warning(&palette) {
             layers = layers.push(bind_warning);
         }
+        if let Some(profile_modal) = self.profile_editor.view(&palette) {
+            layers = layers.push(profile_modal);
+        }
+        if let Some(settings_modal) = self.settings_ui.view(&palette, &self.vault) {
+            layers = layers.push(settings_modal);
+        }
         if self.command_palette.is_open() {
             let items = self.command_palette_items();
             layers = layers.push(render_command_palette(
                 &self.command_palette,
                 items,
                 self.last_error(),
+                &palette,
             ));
         }
 
@@ -3776,41 +4198,90 @@ impl AppState {
             Message::CloseGuardCancel,
             Message::CloseGuardKeepRunningInBackground,
             Message::CloseGuardStopAndQuit,
+            &palette,
         )
+    }
+
+    fn tab_status_color(&self, tab: &WorkspaceTab, chrome: ChromePalette) -> Color {
+        let Some(sid) = tab.focused_session_id() else {
+            return chrome.text_muted;
+        };
+        match self.sessions.get(&sid) {
+            Some(SessionEntry::Local(local)) => {
+                if local.exited.is_some() {
+                    chrome.text_muted
+                } else {
+                    chrome.success
+                }
+            }
+            Some(SessionEntry::Ssh(slot)) => match slot.transport_status {
+                TransportStatus::Connected { .. } => chrome.accent,
+                TransportStatus::Connecting
+                | TransportStatus::Reconnecting { .. }
+                | TransportStatus::Degraded { .. } => chrome.warning,
+                TransportStatus::Disconnected => {
+                    if slot.last_error.is_some() {
+                        chrome.danger
+                    } else {
+                        chrome.text_muted
+                    }
+                }
+            },
+            None => chrome.text_muted,
+        }
     }
 
     fn render_tab_strip(
         &self,
         ws: Option<&Workspace>,
+        palette: &ThemePalette,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
+        let chrome = ChromePalette::from_palette(palette);
         let active_tab_id = ws.and_then(|w| w.active_tab_id());
         let tab_count = ws.map_or(0, |w| w.tab_count());
 
-        let mut tabs_row = row![].spacing(4).align_y(Alignment::Center);
+        let mut tabs_row = row![].spacing(4).align_y(Alignment::End);
 
         if let Some(ws) = ws {
             for (idx, tab) in ws.tabs().iter().enumerate() {
                 let is_active = Some(tab.id) == active_tab_id;
                 let label = self.tab_display_title(tab);
+                let dot_color = self.tab_status_color(tab, chrome);
 
-                let mut tab_controls = row![].spacing(2).align_y(Alignment::Center);
-                tab_controls = tab_controls.push(
-                    button(text(label).size(13))
-                        .padding([4, 8])
-                        .style(if is_active {
-                            button::primary
+                let mut tab_controls = row![
+                    status_dot(dot_color),
+                    button(
+                        text(label).size(12).color(if is_active {
+                            chrome.text_primary
                         } else {
-                            button::secondary
-                        })
-                        .on_press(Message::SelectTab(tab.id)),
-                );
+                            chrome.text_secondary
+                        }),
+                    )
+                    .padding([5, 6])
+                    .style(move |_theme, status| {
+                        let hovered = matches!(status, button::Status::Hovered | button::Status::Pressed);
+                        button::Style {
+                            background: None,
+                            text_color: if is_active || hovered {
+                                chrome.text_primary
+                            } else {
+                                chrome.text_secondary
+                            },
+                            border: Border::default(),
+                            ..Default::default()
+                        }
+                    })
+                    .on_press(Message::SelectTab(tab.id)),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center);
 
-                if tab_count > 1 {
+                if is_active && tab_count > 1 {
                     if idx > 0 {
                         tab_controls = tab_controls.push(
                             button(text("<").size(11))
-                                .padding([4, 5])
-                                .style(button::subtle)
+                                .padding([2, 5])
+                                .style(pill_button_style(chrome, PillTone::Ghost))
                                 .on_press(Message::MoveTabBy {
                                     tab_id: tab.id,
                                     delta: -1,
@@ -3820,8 +4291,8 @@ impl AppState {
                     if idx + 1 < tab_count {
                         tab_controls = tab_controls.push(
                             button(text(">").size(11))
-                                .padding([4, 5])
-                                .style(button::subtle)
+                                .padding([2, 5])
+                                .style(pill_button_style(chrome, PillTone::Ghost))
                                 .on_press(Message::MoveTabBy {
                                     tab_id: tab.id,
                                     delta: 1,
@@ -3831,15 +4302,39 @@ impl AppState {
                 }
 
                 tab_controls = tab_controls.push(
-                    button(text("x").size(11))
-                        .padding([4, 6])
-                        .style(button::subtle)
+                    button(text("×").size(12))
+                        .padding([2, 6])
+                        .style(pill_button_style(chrome, PillTone::Ghost))
                         .on_press(Message::CloseTab(tab.id)),
                 );
 
-                tabs_row = tabs_row.push(tab_controls);
+                let tab_chip = container(tab_controls)
+                    .padding(Padding {
+                        top: 2.0,
+                        right: 6.0,
+                        bottom: if is_active { 4.0 } else { 2.0 },
+                        left: 10.0,
+                    })
+                    .style(move |_theme| tab_container_style(chrome, is_active));
+
+                tabs_row = tabs_row.push(tab_chip);
             }
         }
+
+        tabs_row = tabs_row.push(
+            container(
+                button(text("+").size(13))
+                    .padding([4, 9])
+                    .style(pill_button_style(chrome, PillTone::Ghost))
+                    .on_press(Message::NewTab),
+            )
+            .padding(Padding {
+                top: 0.0,
+                right: 2.0,
+                bottom: 4.0,
+                left: 2.0,
+            }),
+        );
 
         let active_zoomed = ws
             .and_then(|w| w.active_tab())
@@ -3848,58 +4343,90 @@ impl AppState {
             .and_then(|w| w.active_tab())
             .is_some_and(|t| t.broadcast_input);
 
-        let mut actions = row![
-            button(text("Palette").size(12))
-                .padding([4, 8])
-                .style(button::subtle)
-                .on_press(Message::ToggleCommandPalette),
-            button(text("+ Tab").size(12))
-                .padding([4, 8])
-                .style(button::secondary)
-                .on_press(Message::NewTab),
-            button(text("+ Win").size(12))
-                .padding([4, 8])
-                .style(button::subtle)
-                .on_press(Message::NewWindow),
-        ]
-        .spacing(4)
-        .align_y(Alignment::Center);
+        let mut actions = row![].spacing(4).align_y(Alignment::Center);
 
         if active_tab_id.is_some() {
             actions = actions
                 .push(
-                    button(text("Split V").size(12))
+                    button(text("Split V").size(11))
                         .padding([4, 8])
-                        .style(button::subtle)
+                        .style(pill_button_style(chrome, PillTone::Ghost))
                         .on_press(Message::SplitFocusedPane(SplitAxis::Vertical)),
                 )
                 .push(
-                    button(text("Split H").size(12))
+                    button(text("Split H").size(11))
                         .padding([4, 8])
-                        .style(button::subtle)
+                        .style(pill_button_style(chrome, PillTone::Ghost))
                         .on_press(Message::SplitFocusedPane(SplitAxis::Horizontal)),
                 )
                 .push(
-                    button(text(if active_zoomed { "Unzoom" } else { "Zoom" }).size(12))
+                    button(text(if active_zoomed { "Unzoom" } else { "Zoom" }).size(11))
                         .padding([4, 8])
-                        .style(if active_zoomed {
-                            button::primary
-                        } else {
-                            button::subtle
-                        })
+                        .style(pill_button_style(
+                            chrome,
+                            if active_zoomed {
+                                PillTone::ActiveAccent
+                            } else {
+                                PillTone::Ghost
+                            },
+                        ))
                         .on_press(Message::TogglePaneZoom),
                 )
                 .push(
-                    button(text("Broadcast").size(12))
+                    button(text("Broadcast").size(11))
                         .padding([4, 8])
-                        .style(if active_broadcast {
-                            button::danger
-                        } else {
-                            button::subtle
-                        })
+                        .style(pill_button_style(
+                            chrome,
+                            if active_broadcast {
+                                PillTone::Danger
+                            } else {
+                                PillTone::Ghost
+                            },
+                        ))
                         .on_press(Message::ToggleBroadcastInput),
-                );
+                )
+                .push(
+                    button(text("SFTP").size(11))
+                        .padding([4, 8])
+                        .style(pill_button_style(
+                            chrome,
+                            if self.sftp_drawer.is_open() {
+                                PillTone::ActiveAccent
+                            } else {
+                                PillTone::Ghost
+                            },
+                        ))
+                        .on_press(Message::ToggleSftpDrawer),
+                )
+                .push(container(rule::vertical(1)).height(16));
         }
+
+        actions = actions
+            .push(
+                button(text("+ Win").size(11))
+                    .padding([4, 8])
+                    .style(pill_button_style(chrome, PillTone::Ghost))
+                    .on_press(Message::NewWindow),
+            )
+            .push(
+                button(text("Palette").size(11))
+                    .padding([4, 9])
+                    .style(pill_button_style(chrome, PillTone::Subtle))
+                    .on_press(Message::ToggleCommandPalette),
+            )
+            .push(
+                button(text("Settings").size(11))
+                    .padding([4, 9])
+                    .style(pill_button_style(
+                        chrome,
+                        if self.settings_ui.is_open() {
+                            PillTone::ActiveAccent
+                        } else {
+                            PillTone::Subtle
+                        },
+                    ))
+                    .on_press(Message::OpenSettingsModal),
+            );
 
         let tabs_scroll = scrollable(tabs_row)
             .direction(scrollable::Direction::Horizontal(
@@ -3908,32 +4435,53 @@ impl AppState {
             .width(Length::Fill);
 
         let sidebar_btn = button(text("Profiles").size(12))
-            .padding([4, 8])
-            .style(if self.sidebar.is_open() {
-                button::primary
-            } else {
-                button::subtle
-            })
+            .padding([5, 10])
+            .style(pill_button_style(
+                chrome,
+                if self.sidebar.is_open() {
+                    PillTone::ActiveAccent
+                } else {
+                    PillTone::Ghost
+                },
+            ))
             .on_press(Message::ToggleSidebar);
 
-        let bar = row![sidebar_btn, tabs_scroll, actions]
-            .spacing(8)
-            .padding([6, 8])
-            .align_y(Alignment::Center);
+        let top_row = row![
+            container(sidebar_btn).padding(Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 4.0,
+                left: 0.0,
+            }),
+            tabs_scroll,
+            container(actions).padding(Padding {
+                top: 0.0,
+                right: 0.0,
+                bottom: 4.0,
+                left: 0.0,
+            }),
+        ]
+        .spacing(8)
+        .padding(Padding {
+            top: 6.0,
+            right: 8.0,
+            bottom: 0.0,
+            left: 8.0,
+        })
+        .align_y(Alignment::End);
 
-        container(bar)
+        let hairline = container(space::horizontal().height(1))
             .width(Length::Fill)
-            .style(|theme: &Theme| {
-                let ext = theme.extended_palette();
-                container::Style {
-                    background: Some(Background::Color(ext.background.weak.color)),
-                    border: Border {
-                        color: ext.background.strong.color,
-                        width: 1.0,
-                        radius: 0.0.into(),
-                    },
-                    ..Default::default()
-                }
+            .style(move |_theme| container::Style {
+                background: Some(Background::Color(chrome.border_subtle)),
+                ..Default::default()
+            });
+
+        container(column![top_row, hairline].width(Length::Fill))
+            .width(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(Background::Color(chrome.chrome_bg)),
+                ..Default::default()
             })
             .into()
     }
@@ -4002,12 +4550,9 @@ impl AppState {
         broadcast: bool,
         show_border: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
-        let terminal_focused =
-            focused && !self.command_palette.is_open() && !self.tabby_import.is_open();
-        let ime_enabled = !self.command_palette.is_open()
-            && !self.tabby_import.is_open()
-            && self.pending_paste.is_none()
-            && !(self.search.open && self.search.input_focused);
+        let modal_open = self.has_modal_open();
+        let terminal_focused = focused && !modal_open;
+        let ime_enabled = !modal_open && !(self.search.open && self.search.input_focused);
         let options = TerminalViewOptions::from_config(&self.config.terminal, ime_enabled);
         let is_active_session = Some(session_id) == self.active_session_id();
         let (matches, active_match): (Arc<[GridSearchMatch]>, Option<usize>) = if is_active_session
@@ -4039,12 +4584,14 @@ impl AppState {
                     terminal_focused,
                 );
                 if slot.transport_status == TransportStatus::Disconnected {
+                    let palette = ThemePalette::for_name(&self.config.terminal.theme);
                     let bar = SshUiState::view_disconnected_ssh_bar(
                         slot.id,
                         &slot.target.host,
                         slot.target.port,
                         self.ssh_ui.mitm_alert(slot.id).is_some(),
                         slot.last_error.as_deref(),
+                        &palette,
                     );
                     column![bar, viewport]
                         .width(Length::Fill)
@@ -4063,22 +4610,149 @@ impl AppState {
         PaneFrame::new(pane_id, terminal_focused, broadcast, show_border, content)
     }
 
-    fn render_empty_workspace(&self) -> Element<'_, Message, Theme, iced::Renderer> {
-        let prompt = column![
-            text("No open terminal tabs").size(16),
-            button(text("Open New Tab (Ctrl+Shift+T)").size(14))
-                .padding([8, 14])
-                .style(button::primary)
-                .on_press(Message::NewTab),
-        ]
-        .spacing(12)
-        .align_x(Alignment::Center);
+    fn render_empty_workspace(
+        &self,
+        palette: &ThemePalette,
+    ) -> Element<'_, Message, Theme, iced::Renderer> {
+        let chrome = ChromePalette::from_palette(palette);
 
-        container(prompt)
+        let hero = column![
+            text("Termewnal").size(26).color(chrome.text_primary),
+            text("Fast local & SSH workspace with persistent tunnels, SFTP, and Vault")
+                .size(13)
+                .color(chrome.text_muted),
+        ]
+        .spacing(4)
+        .align_x(Alignment::Start);
+
+        let quick_actions = row![
+            button(text("New Local Shell").size(13))
+                .padding([8, 16])
+                .style(pill_button_style(chrome, PillTone::Primary))
+                .on_press(Message::NewTab),
+            button(text("Quick SSH").size(12))
+                .padding([8, 14])
+                .style(pill_button_style(chrome, PillTone::Subtle))
+                .on_press(Message::OpenQuickConnectPalette),
+            button(text("+ New Profile").size(12))
+                .padding([8, 14])
+                .style(pill_button_style(chrome, PillTone::Subtle))
+                .on_press(Message::OpenNewProfileModal),
+            button(text("Settings").size(12))
+                .padding([8, 14])
+                .style(pill_button_style(chrome, PillTone::Subtle))
+                .on_press(Message::OpenSettingsModal),
+            button(text("Import Tabby").size(12))
+                .padding([8, 12])
+                .style(pill_button_style(chrome, PillTone::Ghost))
+                .on_press(Message::OpenTabbyImportModal),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let mut content = column![hero, quick_actions].spacing(18).width(Length::Fill);
+
+        if !self.profiles.profiles.is_empty() {
+            let mut profile_list = column![].spacing(6).width(Length::Fill);
+            for profile in self.profiles.profiles.iter().take(6) {
+                let is_ssh = matches!(profile.target, ProfileTarget::Ssh { .. });
+                let dot_color = if is_ssh {
+                    chrome.accent
+                } else {
+                    chrome.success
+                };
+                let target = profile_target_summary(profile);
+                let pid_connect = profile.id.clone();
+                let pid_edit = profile.id.clone();
+
+                let card = container(
+                    row![
+                        status_dot(dot_color),
+                        column![
+                            text(profile.name.as_str())
+                                .size(13)
+                                .color(chrome.text_primary),
+                            text(target).size(11).color(chrome.text_muted),
+                        ]
+                        .spacing(2),
+                        space::horizontal(),
+                        button(text("Edit").size(11))
+                            .padding([4, 9])
+                            .style(pill_button_style(chrome, PillTone::Ghost))
+                            .on_press(Message::OpenEditProfileModal(pid_edit)),
+                        button(text("Connect").size(11))
+                            .padding([4, 10])
+                            .style(pill_button_style(chrome, PillTone::Subtle))
+                            .on_press(Message::LaunchProfile {
+                                profile_id: pid_connect,
+                                disposition: LaunchDisposition::NewTab,
+                            }),
+                    ]
+                    .spacing(10)
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding([8, 12])
+                .style(move |_theme| card_container_style(chrome, false));
+
+                profile_list = profile_list.push(card);
+            }
+
+            content = content.push(
+                column![
+                    text("SAVED PROFILES").size(11).color(chrome.text_muted),
+                    profile_list,
+                ]
+                .spacing(8)
+                .width(Length::Fill),
+            );
+        }
+
+        let shortcuts = row![
+            row![
+                keycap_pill("Ctrl+Shift+T", chrome),
+                text("New Tab").size(11).color(chrome.text_muted),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            row![
+                keycap_pill("Ctrl+K", chrome),
+                text("Command Palette").size(11).color(chrome.text_muted),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            row![
+                keycap_pill("Ctrl+,", chrome),
+                text("Settings").size(11).color(chrome.text_muted),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+            row![
+                keycap_pill("Ctrl+B", chrome),
+                text("Profiles").size(11).color(chrome.text_muted),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
+        ]
+        .spacing(16)
+        .align_y(Alignment::Center);
+
+        content = content.push(rule::horizontal(1)).push(shortcuts);
+
+        let launcher_card = container(content.padding(24))
+            .width(Length::Fixed(640.0))
+            .style(move |_theme| card_container_style(chrome, false));
+
+        container(launcher_card)
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
+            .style(move |_theme| container::Style {
+                background: Some(Background::Color(chrome.term_bg)),
+                text_color: Some(chrome.text_primary),
+                ..Default::default()
+            })
             .into()
     }
 
@@ -4299,6 +4973,31 @@ impl AppState {
     /// Returns the Tabby `config.yaml` importer modal state.
     pub fn tabby_import(&self) -> &TabbyImportUiState {
         &self.tabby_import
+    }
+
+    /// Returns the Settings modal state (`Ctrl+,`).
+    pub fn settings_ui(&self) -> &SettingsUiState {
+        &self.settings_ui
+    }
+
+    /// Returns the Profile Manager create/edit modal state.
+    pub fn profile_editor(&self) -> &ProfileEditorState {
+        &self.profile_editor
+    }
+
+    /// Returns `true` when any overlay modal blocks background terminal focus or IME.
+    pub fn has_modal_open(&self) -> bool {
+        self.command_palette.is_open()
+            || self.tabby_import.is_open()
+            || self.settings_ui.is_open()
+            || self.profile_editor.is_open()
+            || self.tunnel_ui.create_form().open
+            || self.tunnel_ui.pending_public_bind_warning().is_some()
+            || self.sftp_drawer.active_conflict().is_some()
+            || self.pending_paste.is_some()
+            || self.ssh_ui.active_host_key_prompt().is_some()
+            || self.ssh_ui.active_auth_prompt().is_some()
+            || !matches!(self.close_guard, CloseGuardState::Idle)
     }
 
     /// Computes an inspectable [`StatusBarSnapshot`] from the active `Session`, `Tunnel`, and `Transfer` state.
@@ -5685,6 +6384,7 @@ pub fn shortcut_for_key_event(
             Key::Named(Named::Tab) => Some(Message::CycleTab(CycleDirection::Next)),
             Key::Character("b") | Key::Character("B") => Some(Message::ToggleSidebar),
             Key::Character("k") | Key::Character("K") => Some(Message::ToggleCommandPalette),
+            Key::Character(",") => Some(Message::OpenSettingsModal),
             _ => None,
         };
     }
@@ -5716,6 +6416,7 @@ pub fn shortcut_for_key_event_with_palette(
                 Message::ToggleCommandPalette
                     | Message::ToggleSidebar
                     | Message::ToggleSftpDrawer
+                    | Message::OpenSettingsModal
             )
         {
             return Some(msg);
@@ -5769,29 +6470,33 @@ fn ssh_target_from_profile(profile: &Profile) -> Option<SshSessionTarget> {
     })
 }
 
-fn render_broadcast_banner(banner_text: String) -> Element<'static, Message, Theme, iced::Renderer> {
+fn render_broadcast_banner(
+    banner_text: String,
+    chrome: ChromePalette,
+) -> Element<'static, Message, Theme, iced::Renderer> {
     let content = row![
-        text(banner_text).size(13).color(Color::WHITE),
+        status_dot(chrome.danger),
+        text(banner_text).size(12).color(chrome.text_primary),
         space::horizontal(),
-        button(text("Turn Off").size(12))
+        button(text("Turn Off").size(11))
             .padding([3, 10])
-            .style(button::secondary)
+            .style(pill_button_style(chrome, PillTone::Danger))
             .on_press(Message::SetBroadcastInput(false)),
     ]
-    .spacing(12)
+    .spacing(10)
     .padding([6, 12])
     .align_y(Alignment::Center);
 
     container(content)
         .width(Length::Fill)
-        .style(|_theme: &Theme| container::Style {
-            background: Some(Background::Color(Color::from_rgb8(185, 28, 28))),
+        .style(move |_theme: &Theme| container::Style {
+            background: Some(Background::Color(chrome.danger_soft)),
             border: Border {
-                color: Color::from_rgb8(248, 113, 113),
+                color: chrome.danger,
                 width: 1.0,
                 radius: 0.0.into(),
             },
-            text_color: Some(Color::WHITE),
+            text_color: Some(chrome.text_primary),
             ..Default::default()
         })
         .into()

@@ -1,7 +1,10 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use iced::widget::{button, column, container, opaque, row, space, stack, text};
-use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Theme, window};
+use iced::widget::{button, column, container, opaque, row, rule, space, stack, text};
+use iced::{Alignment, Background, Color, Element, Length, Theme, window};
+use termewnal_core::ThemePalette;
+
+use crate::ui_theme::{ChromePalette, PillTone, modal_card_style, pill_button_style, status_dot};
 
 /// Snapshot of active background operations that would be terminated on process exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -155,6 +158,7 @@ pub fn wrap_with_close_guard_modal<'a, Msg: Clone + 'a>(
     on_cancel: Msg,
     on_keep_running: Msg,
     on_stop_and_quit: Msg,
+    palette: &ThemePalette,
 ) -> Element<'a, Msg, Theme, iced::Renderer> {
     let CloseGuardState::Confirming {
         window_id: target_win,
@@ -169,53 +173,44 @@ pub fn wrap_with_close_guard_modal<'a, Msg: Clone + 'a>(
         return base;
     }
 
+    let chrome = ChromePalette::from_palette(palette);
     let summary = format_background_work_summary(active_standalone_tunnels, active_transfers);
 
     let dialog_card = container(
         column![
-            text("Background Work Active").size(18),
-            text(summary).size(14),
-            space::vertical().height(6),
             row![
-                button(text("Cancel").size(13))
+                status_dot(chrome.warning),
+                text("Background Work Active")
+                    .size(16)
+                    .color(chrome.text_primary),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            text(summary).size(13).color(chrome.text_secondary),
+            rule::horizontal(1),
+            row![
+                button(text("Cancel").size(12))
                     .padding([6, 12])
-                    .style(button::subtle)
+                    .style(pill_button_style(chrome, PillTone::Subtle))
                     .on_press(on_cancel),
                 space::horizontal(),
-                button(text("Keep Running in Background").size(13))
+                button(text("Keep Running in Background").size(12))
                     .padding([6, 12])
-                    .style(button::secondary)
+                    .style(pill_button_style(chrome, PillTone::Primary))
                     .on_press(on_keep_running),
-                button(text("Stop & Quit").size(13))
+                button(text("Stop & Quit").size(12))
                     .padding([6, 12])
-                    .style(button::danger)
+                    .style(pill_button_style(chrome, PillTone::Danger))
                     .on_press(on_stop_and_quit),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         ]
         .spacing(12)
-        .padding(20),
+        .padding(18),
     )
-    .max_width(520)
-    .style(|theme: &Theme| {
-        let ext = theme.extended_palette();
-        container::Style {
-            background: Some(Background::Color(ext.background.base.color)),
-            border: Border {
-                color: ext.background.strong.color,
-                width: 1.5,
-                radius: 8.0.into(),
-            },
-            shadow: Shadow {
-                color: Color::from_rgba(0.0, 0.0, 0.0, 0.45),
-                offset: iced::Vector::new(0.0, 4.0),
-                blur_radius: 16.0,
-            },
-            text_color: Some(ext.background.base.text),
-            ..Default::default()
-        }
-    });
+    .max_width(540)
+    .style(move |_theme: &Theme| modal_card_style(chrome, true));
 
     let backdrop = opaque(
         container(dialog_card)
@@ -224,7 +219,7 @@ pub fn wrap_with_close_guard_modal<'a, Msg: Clone + 'a>(
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .style(|_theme: &Theme| container::Style {
-                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))),
                 ..Default::default()
             }),
     );

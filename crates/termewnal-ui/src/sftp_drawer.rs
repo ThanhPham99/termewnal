@@ -6,12 +6,12 @@ use iced::advanced::renderer::{self, Quad, Renderer as _};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget};
 use iced::widget::{
-    button, checkbox, column, container, opaque, progress_bar, row, rule, scrollable, space, text,
+    button, checkbox, column, container, progress_bar, row, rule, scrollable, space, text,
     text_input,
 };
 use iced::{
-    Alignment, Background, Border, Color, Element, Event, Length, Point, Rectangle, Shadow, Size,
-    Theme, Vector, mouse, window,
+    Alignment, Background, Border, Color, Element, Event, Length, Point, Rectangle, Size, Theme,
+    Vector, mouse, window,
 };
 use termewnal_core::ThemePalette;
 use termewnal_ssh::{
@@ -21,7 +21,10 @@ use termewnal_ssh::{
 };
 
 use crate::app::{Message, SessionId};
-use crate::terminal_ergonomics::rgb_to_iced;
+use crate::ui_theme::{
+    ChromePalette, PillTone, badge_pill, card_container_style, modal_card_style, modal_overlay,
+    pill_button_style, status_dot, styled_input_style,
+};
 
 /// Default width in logical pixels of the right-docked SFTP Browser & `Transfer` Drawer.
 pub const DEFAULT_SFTP_DRAWER_WIDTH: f32 = 360.0;
@@ -682,21 +685,26 @@ impl Widget<Message, Theme, iced::Renderer> for SftpDrawerDock<'_> {
 pub fn render_sftp_drawer<'a>(
     state: &'a SftpDrawerState,
     has_connected_ssh: bool,
+    palette: &ThemePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
+    let chrome = ChromePalette::from_palette(palette);
+
     let header = row![
-        text("SFTP & Transfers").size(14),
+        text("SFTP & Transfers")
+            .size(13)
+            .color(chrome.text_primary),
         space::horizontal(),
         button(text("Up").size(11))
-            .padding([2, 6])
-            .style(button::subtle)
+            .padding([3, 8])
+            .style(pill_button_style(chrome, PillTone::Subtle))
             .on_press(Message::SftpNavigateUp),
         button(text("Refresh").size(11))
-            .padding([2, 6])
-            .style(button::subtle)
+            .padding([3, 8])
+            .style(pill_button_style(chrome, PillTone::Subtle))
             .on_press(Message::SftpRefresh),
-        button(text("x").size(12))
+        button(text("×").size(13))
             .padding([2, 7])
-            .style(button::subtle)
+            .style(pill_button_style(chrome, PillTone::Ghost))
             .on_press(Message::SetSftpDrawerOpen(false)),
     ]
     .spacing(4)
@@ -705,13 +713,15 @@ pub fn render_sftp_drawer<'a>(
     let mut content = column![header].spacing(8);
 
     if let Some(notice) = state.transport_notice() {
-        let (badge_color, copy) = match notice.mode {
+        let (dot_color, soft_bg, copy) = match notice.mode {
             SftpTransportMode::IsolatedTransferTransport => (
-                Color::from_rgb8(74, 222, 128),
+                chrome.success,
+                chrome.success_soft,
                 "Isolated Transfer Transport active".to_string(),
             ),
             SftpTransportMode::MuxFallback => (
-                Color::from_rgb8(251, 191, 36),
+                chrome.warning,
+                chrome.warning_soft,
                 notice
                     .message
                     .clone()
@@ -719,9 +729,22 @@ pub fn render_sftp_drawer<'a>(
             ),
         };
         content = content.push(
-            container(text(copy).size(11).color(badge_color))
-                .width(Length::Fill)
-                .padding([4, 8]),
+            container(
+                row![status_dot(dot_color), text(copy).size(11).color(dot_color)]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([6, 8])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(soft_bg)),
+                border: Border {
+                    color: dot_color,
+                    width: 1.0,
+                    radius: 6.0.into(),
+                },
+                ..Default::default()
+            }),
         );
     }
 
@@ -730,14 +753,15 @@ pub fn render_sftp_drawer<'a>(
             .on_input(Message::SftpPathInputChanged)
             .on_submit(Message::SftpNavigateTo(state.path_input().to_string()))
             .size(12)
-            .padding([4, 8])
+            .padding([5, 8])
+            .style(styled_input_style(chrome))
             .width(Length::Fill),
         button(text("Go").size(11))
-            .padding([4, 8])
-            .style(button::secondary)
+            .padding([5, 10])
+            .style(pill_button_style(chrome, PillTone::Subtle))
             .on_press(Message::SftpNavigateTo(state.path_input().to_string())),
     ]
-    .spacing(4)
+    .spacing(6)
     .align_y(Alignment::Center);
     content = content.push(path_row);
 
@@ -746,38 +770,40 @@ pub fn render_sftp_drawer<'a>(
             .on_input(Message::SftpNewFolderInputChanged)
             .on_submit(Message::SftpCreateFolder)
             .size(12)
-            .padding([4, 8])
+            .padding([5, 8])
+            .style(styled_input_style(chrome))
             .width(Length::Fill),
         button(text("+ Dir").size(11))
-            .padding([4, 8])
-            .style(button::subtle)
+            .padding([5, 9])
+            .style(pill_button_style(chrome, PillTone::Subtle))
             .on_press(Message::SftpCreateFolder),
     ]
-    .spacing(4)
+    .spacing(6)
     .align_y(Alignment::Center);
     content = content.push(mkdir_row);
 
     if let Some(notice) = state.last_transfer_notice() {
         content = content.push(
-            container(
-                text(notice.to_string())
-                    .size(11)
-                    .color(Color::from_rgb8(251, 191, 36)),
-            )
-            .width(Length::Fill)
-            .padding([3, 8]),
+            container(text(notice.to_string()).size(11).color(chrome.warning))
+                .width(Length::Fill)
+                .padding([5, 8])
+                .style(move |_| container::Style {
+                    background: Some(Background::Color(chrome.warning_soft)),
+                    border: Border {
+                        color: chrome.warning,
+                        width: 1.0,
+                        radius: 6.0.into(),
+                    },
+                    ..Default::default()
+                }),
         );
     }
 
     if let Some(err) = state.browser_error() {
-        content = content.push(
-            text(err.to_string())
-                .size(11)
-                .color(Color::from_rgb8(248, 113, 113)),
-        );
+        content = content.push(text(err.to_string()).size(11).color(chrome.danger));
     }
 
-    let browser_list = render_browser_entries(state, has_connected_ssh);
+    let browser_list = render_browser_entries(state, has_connected_ssh, chrome);
     content = content.push(
         scrollable(browser_list)
             .width(Length::Fill)
@@ -785,91 +811,112 @@ pub fn render_sftp_drawer<'a>(
     );
 
     content = content.push(rule::horizontal(1));
-    content = content.push(render_transfer_queue_section(state));
+    content = content.push(render_transfer_queue_section(state, chrome));
 
-    container(content.padding(10))
+    let body = container(content.padding(10))
         .width(Length::Fill)
         .height(Length::Fill)
-        .style(|theme: &Theme| {
-            let ext = theme.extended_palette();
-            container::Style {
-                background: Some(Background::Color(ext.background.weak.color)),
-                border: Border {
-                    color: ext.background.strong.color,
-                    width: 1.0,
-                    radius: 0.0.into(),
-                },
-                ..Default::default()
-            }
-        })
+        .style(move |_theme: &Theme| container::Style {
+            background: Some(Background::Color(chrome.chrome_bg)),
+            text_color: Some(chrome.text_primary),
+            ..Default::default()
+        });
+
+    let left_hairline = container(space::vertical().width(1))
+        .height(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(Background::Color(chrome.border_subtle)),
+            ..Default::default()
+        });
+
+    row![left_hairline, body]
+        .width(Length::Fill)
+        .height(Length::Fill)
         .into()
 }
 
 fn render_browser_entries<'a>(
     state: &'a SftpDrawerState,
     has_connected_ssh: bool,
+    chrome: ChromePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
-    let mut col = column![].spacing(4);
+    let mut col = column![].spacing(5);
 
     if state.is_loading() {
         col = col.push(
             text("Loading remote directory...")
                 .size(12)
-                .color(Color::from_rgb8(148, 163, 184)),
+                .color(chrome.text_muted),
         );
     } else if !has_connected_ssh && state.entries().is_empty() {
         col = col.push(
             text("Connect an SSH Session to browse remote files. Drop files here to upload.")
                 .size(12)
-                .color(Color::from_rgb8(148, 163, 184)),
+                .color(chrome.text_muted),
         );
         return col.into();
     } else if state.entries().is_empty() {
         col = col.push(
             text("Directory is empty (drop files here to upload)")
                 .size(12)
-                .color(Color::from_rgb8(148, 163, 184)),
+                .color(chrome.text_muted),
         );
         return col.into();
     }
 
     for entry in state.entries() {
-        let kind_badge = match entry.kind {
-            RemoteEntryKind::Dir => "[DIR]",
-            RemoteEntryKind::Symlink => "[LNK]",
-            RemoteEntryKind::File | RemoteEntryKind::Other => "[FILE]",
+        let (kind_badge, badge_fg, badge_bg) = match entry.kind {
+            RemoteEntryKind::Dir => ("DIR", chrome.accent, chrome.accent_soft),
+            RemoteEntryKind::Symlink => ("LNK", chrome.warning, chrome.warning_soft),
+            RemoteEntryKind::File | RemoteEntryKind::Other => {
+                ("FILE", chrome.text_secondary, chrome.card_hover)
+            }
         };
         let meta_label = if entry.is_dir() {
-            kind_badge.to_string()
+            "Directory".to_string()
         } else {
-            format!("{kind_badge} {}", format_bytes(entry.size))
+            format_bytes(entry.size)
         };
 
-        let mut row_el = row![
-            column![
-                text(entry.name.clone()).size(12),
-                text(meta_label)
-                    .size(10)
-                    .color(Color::from_rgb8(148, 163, 184)),
+        let name_col = column![
+            row![
+                badge_pill(kind_badge, badge_fg, badge_bg, Color::TRANSPARENT),
+                text(entry.name.clone())
+                    .size(12)
+                    .color(chrome.text_primary),
             ]
-            .spacing(1)
-            .width(Length::Fill),
+            .spacing(6)
+            .align_y(Alignment::Center),
+            text(meta_label).size(10).color(chrome.text_muted),
         ]
-        .spacing(4)
-        .align_y(Alignment::Center);
+        .spacing(2)
+        .width(Length::Fill);
+
+        let leading: Element<'a, Message, Theme, iced::Renderer> = if entry.is_dir() {
+            button(name_col)
+                .padding([3, 4])
+                .width(Length::Fill)
+                .style(pill_button_style(chrome, PillTone::Ghost))
+                .on_press(Message::SftpNavigateTo(entry.path.clone()))
+                .into()
+        } else {
+            container(name_col).padding([3, 4]).width(Length::Fill).into()
+        };
+
+        let mut row_el = row![leading].spacing(4).align_y(Alignment::Center);
 
         if entry.is_dir() {
             row_el = row_el
                 .push(
-                    button(text("Open").size(11))
-                        .padding([2, 6])
-                        .style(button::secondary)
+                    button(text("Open").size(10))
+                        .padding([3, 7])
+                        .style(pill_button_style(chrome, PillTone::Subtle))
                         .on_press(Message::SftpNavigateTo(entry.path.clone())),
                 )
                 .push(
-                    button(text("Get Dir").size(11))
-                        .padding([2, 6])
-                        .style(button::primary)
+                    button(text("Get Dir").size(10))
+                        .padding([3, 7])
+                        .style(pill_button_style(chrome, PillTone::Primary))
                         .on_press(Message::SftpDownloadDir {
                             remote_path: entry.path.clone(),
                             dir_name: entry.name.clone(),
@@ -877,9 +924,9 @@ fn render_browser_entries<'a>(
                 );
         } else {
             row_el = row_el.push(
-                button(text("Get").size(11))
-                    .padding([2, 6])
-                    .style(button::primary)
+                button(text("Get").size(10))
+                    .padding([3, 8])
+                    .style(pill_button_style(chrome, PillTone::Primary))
                     .on_press(Message::SftpDownloadFile {
                         remote_path: entry.path.clone(),
                         file_name: entry.name.clone(),
@@ -888,16 +935,21 @@ fn render_browser_entries<'a>(
         }
 
         row_el = row_el.push(
-            button(text("Del").size(11))
-                .padding([2, 6])
-                .style(button::subtle)
+            button(text("Del").size(10))
+                .padding([3, 7])
+                .style(pill_button_style(chrome, PillTone::Danger))
                 .on_press(Message::SftpDeleteEntry {
                     path: entry.path.clone(),
                     is_dir: entry.is_dir(),
                 }),
         );
 
-        col = col.push(row_el);
+        col = col.push(
+            container(row_el)
+                .padding([4, 6])
+                .width(Length::Fill)
+                .style(move |_| card_container_style(chrome, false)),
+        );
     }
 
     col.into()
@@ -905,6 +957,7 @@ fn render_browser_entries<'a>(
 
 fn render_transfer_queue_section<'a>(
     state: &'a SftpDrawerState,
+    chrome: ChromePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
     let snap = state.queue_snapshot();
     let header = row![
@@ -912,11 +965,12 @@ fn render_transfer_queue_section<'a>(
             "Transfers ({} active, {} queued)",
             snap.active_count, snap.queued_count
         ))
-        .size(12),
+        .size(12)
+        .color(chrome.text_primary),
         space::horizontal(),
-        button(text("Clear").size(11))
-            .padding([2, 6])
-            .style(button::subtle)
+        button(text("Clear").size(10))
+            .padding([3, 8])
+            .style(pill_button_style(chrome, PillTone::Ghost))
             .on_press(Message::ClearFinishedTransfers),
     ]
     .align_y(Alignment::Center);
@@ -926,7 +980,7 @@ fn render_transfer_queue_section<'a>(
         list = list.push(
             text("No transfers queued. Drop files onto drawer or Shift+Drop on SSH pane.")
                 .size(11)
-                .color(Color::from_rgb8(148, 163, 184)),
+                .color(chrome.text_muted),
         );
     } else {
         for item in &snap.transfers {
@@ -953,14 +1007,14 @@ fn render_transfer_queue_section<'a>(
                     controls = controls
                         .push(
                             button(text("Pause").size(10))
-                                .padding([2, 6])
-                                .style(button::secondary)
+                                .padding([2, 7])
+                                .style(pill_button_style(chrome, PillTone::Subtle))
                                 .on_press(Message::PauseTransfer(item.id)),
                         )
                         .push(
                             button(text("Cancel").size(10))
-                                .padding([2, 6])
-                                .style(button::danger)
+                                .padding([2, 7])
+                                .style(pill_button_style(chrome, PillTone::Danger))
                                 .on_press(Message::CancelTransfer(item.id)),
                         );
                 }
@@ -968,22 +1022,22 @@ fn render_transfer_queue_section<'a>(
                     controls = controls
                         .push(
                             button(text("Resume").size(10))
-                                .padding([2, 6])
-                                .style(button::primary)
+                                .padding([2, 7])
+                                .style(pill_button_style(chrome, PillTone::Primary))
                                 .on_press(Message::ResumeTransfer(item.id)),
                         )
                         .push(
                             button(text("Cancel").size(10))
-                                .padding([2, 6])
-                                .style(button::danger)
+                                .padding([2, 7])
+                                .style(pill_button_style(chrome, PillTone::Danger))
                                 .on_press(Message::CancelTransfer(item.id)),
                         );
                 }
                 TransferStatus::Failed { .. } | TransferStatus::Cancelled => {
                     controls = controls.push(
                         button(text("Retry").size(10))
-                            .padding([2, 6])
-                            .style(button::primary)
+                            .padding([2, 7])
+                            .style(pill_button_style(chrome, PillTone::Primary))
                             .on_press(Message::RetryTransfer(item.id)),
                     );
                 }
@@ -991,8 +1045,8 @@ fn render_transfer_queue_section<'a>(
                     controls = controls
                         .push(
                             button(text("Overwrite").size(10))
-                                .padding([2, 6])
-                                .style(button::primary)
+                                .padding([2, 7])
+                                .style(pill_button_style(chrome, PillTone::Primary))
                                 .on_press(Message::ResolveTransferConflict {
                                     transfer_id: item.id,
                                     resolution: ConflictResolution::Overwrite,
@@ -1001,8 +1055,8 @@ fn render_transfer_queue_section<'a>(
                         )
                         .push(
                             button(text("Skip").size(10))
-                                .padding([2, 6])
-                                .style(button::subtle)
+                                .padding([2, 7])
+                                .style(pill_button_style(chrome, PillTone::Subtle))
                                 .on_press(Message::ResolveTransferConflict {
                                     transfer_id: item.id,
                                     resolution: ConflictResolution::Skip,
@@ -1014,14 +1068,18 @@ fn render_transfer_queue_section<'a>(
             }
 
             let mut item_col = column![
-                row![text(item.file_name.clone()).size(12), space::horizontal(), controls]
-                    .align_y(Alignment::Center),
+                row![
+                    text(item.file_name.clone())
+                        .size(12)
+                        .color(chrome.text_primary),
+                    space::horizontal(),
+                    controls,
+                ]
+                .align_y(Alignment::Center),
                 progress_bar(0.0..=1.0, item.progress_fraction()),
-                text(subtitle)
-                    .size(10)
-                    .color(Color::from_rgb8(148, 163, 184)),
+                text(subtitle).size(10).color(chrome.text_muted),
             ]
-            .spacing(3);
+            .spacing(4);
 
             if let Some(notice) = item
                 .notice
@@ -1029,22 +1087,19 @@ fn render_transfer_queue_section<'a>(
                 .map(TransferNotice::summary)
                 .or_else(|| item.status_notice.clone())
             {
-                item_col = item_col.push(
-                    text(notice)
-                        .size(10)
-                        .color(Color::from_rgb8(251, 191, 36)),
-                );
+                item_col = item_col.push(text(notice).size(10).color(chrome.warning));
             }
 
             if let TransferStatus::Failed { error } = &item.status {
-                item_col = item_col.push(
-                    text(error.clone())
-                        .size(10)
-                        .color(Color::from_rgb8(248, 113, 113)),
-                );
+                item_col = item_col.push(text(error.clone()).size(10).color(chrome.danger));
             }
 
-            list = list.push(item_col);
+            list = list.push(
+                container(item_col)
+                    .padding([6, 8])
+                    .width(Length::Fill)
+                    .style(move |_| card_container_style(chrome, false)),
+            );
         }
     }
 
@@ -1083,19 +1138,20 @@ pub fn render_conflict_resolution_modal<'a>(
     palette: &ThemePalette,
 ) -> Option<Element<'a, Message, Theme, iced::Renderer>> {
     let conflict = state.active_conflict()?;
-    let surface = rgb_to_iced(palette.ui_surface);
-    let bg = rgb_to_iced(palette.background);
-    let border_color = rgb_to_iced(palette.ui_border);
-    let fg = rgb_to_iced(palette.foreground);
-    let accent = rgb_to_iced(palette.ui_accent);
+    let chrome = ChromePalette::from_palette(palette);
     let transfer_id = conflict.transfer_id;
     let apply_to_all = state.conflict_apply_to_all();
     let rename_value = state.conflict_rename_input();
     let trimmed_rename = rename_value.trim().to_string();
 
-    let heading = text(format!("File conflict: {}", conflict.file_name))
-        .size(15)
-        .color(fg);
+    let heading = row![
+        status_dot(chrome.warning),
+        text(format!("File conflict: {}", conflict.file_name))
+            .size(15)
+            .color(chrome.text_primary),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
 
     let mut details = format!(
         "Target already exists ({} vs source {}).",
@@ -1109,24 +1165,14 @@ pub fn render_conflict_resolution_modal<'a>(
         ));
     }
 
-    let detail_box = container(text(details).size(12).color(fg))
+    let detail_box = container(text(details).size(12).color(chrome.text_secondary))
         .width(Length::Fill)
-        .padding(8)
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(bg)),
-            text_color: Some(fg),
-            border: Border {
-                color: border_color,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        });
+        .padding([8, 10])
+        .style(move |_theme| card_container_style(chrome, false));
 
     let rename_btn = button(text("Rename").size(12))
-        .padding([4, 10])
-        .style(button::secondary)
+        .padding([5, 10])
+        .style(pill_button_style(chrome, PillTone::Subtle))
         .on_press_maybe((!trimmed_rename.is_empty()).then(|| {
             Message::ResolveTransferConflict {
                 transfer_id,
@@ -1141,7 +1187,8 @@ pub fn render_conflict_resolution_modal<'a>(
         text_input("New filename...", rename_value)
             .on_input(Message::TransferConflictRenameInputChanged)
             .size(12)
-            .padding([5, 8])
+            .padding([6, 8])
+            .style(styled_input_style(chrome))
             .width(Length::Fill),
         rename_btn,
     ]
@@ -1156,7 +1203,7 @@ pub fn render_conflict_resolution_modal<'a>(
     let actions = row![
         button(text("Skip").size(12))
             .padding([5, 12])
-            .style(button::subtle)
+            .style(pill_button_style(chrome, PillTone::Ghost))
             .on_press(Message::ResolveTransferConflict {
                 transfer_id,
                 resolution: ConflictResolution::Skip,
@@ -1164,15 +1211,15 @@ pub fn render_conflict_resolution_modal<'a>(
             }),
         button(text("Resume").size(12))
             .padding([5, 12])
-            .style(button::secondary)
+            .style(pill_button_style(chrome, PillTone::Subtle))
             .on_press(Message::ResolveTransferConflict {
                 transfer_id,
                 resolution: ConflictResolution::Resume,
                 apply_to_all,
             }),
         button(text("Overwrite").size(12))
-            .padding([5, 12])
-            .style(button::primary)
+            .padding([5, 14])
+            .style(pill_button_style(chrome, PillTone::Primary))
             .on_press(Message::ResolveTransferConflict {
                 transfer_id,
                 resolution: ConflictResolution::Overwrite,
@@ -1186,49 +1233,23 @@ pub fn render_conflict_resolution_modal<'a>(
         TransferDirection::Upload => conflict.remote_path.clone(),
         TransferDirection::Download => conflict.local_path.display().to_string(),
     };
-    let card = opaque(
-        container(
-            column![
-                heading,
-                text(format!("Destination: {dest_label}"))
-                    .size(11)
-                    .color(Color { a: 0.78, ..fg }),
-                detail_box,
-                rename_row,
-                apply_toggle,
-                row![space::horizontal(), actions],
-            ]
-            .spacing(10),
-        )
-        .width(Length::Fixed(480.0))
-        .padding(16)
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(surface)),
-            text_color: Some(fg),
-            border: Border {
-                color: accent,
-                width: 1.0,
-                radius: 8.0.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        }),
-    );
+    let card = container(
+        column![
+            heading,
+            text(format!("Destination: {dest_label}"))
+                .size(11)
+                .color(chrome.text_muted),
+            detail_box,
+            rename_row,
+            apply_toggle,
+            rule::horizontal(1),
+            row![space::horizontal(), actions],
+        ]
+        .spacing(10),
+    )
+    .width(Length::Fixed(480.0))
+    .padding(16)
+    .style(move |_theme| modal_card_style(chrome, true));
 
-    let backdrop = container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .style(|_theme| container::Style {
-            background: Some(Background::Color(Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.45,
-            })),
-            ..container::Style::default()
-        });
-
-    Some(opaque(backdrop))
+    Some(modal_overlay(card.into(), None, 24.0))
 }

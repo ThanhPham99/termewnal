@@ -3,12 +3,16 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{Id, button, column, container, opaque, row, text, text_input};
-use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Theme};
+use iced::widget::{Id, button, column, container, opaque, row, rule, space, text, text_input};
+use iced::{Alignment, Color, Element, Length, Padding, Theme};
 use termewnal_core::{CursorStyle, RgbColor, ThemePalette};
 use termewnal_pty::{CursorShape, GridSearchMatch, PtySession, TerminalBuffer, shell_escape_path};
 
 use crate::app::{Message, SessionId};
+use crate::ui_theme::{
+    ChromePalette, PillTone, card_container_style, modal_card_style, modal_overlay,
+    pill_button_style, status_dot, styled_input_style,
+};
 
 /// Returns the widget `Id` for the `Ctrl+F` scrollback search input.
 pub fn search_input_id() -> Id {
@@ -296,52 +300,47 @@ pub fn search_bar_view<'a>(
     state: &SearchBarState,
     palette: &ThemePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
-    let surface = rgb_to_iced(palette.ui_surface);
-    let border_color = rgb_to_iced(palette.ui_border);
-    let fg = rgb_to_iced(palette.foreground);
-    let accent = rgb_to_iced(palette.ui_accent);
+    let chrome = ChromePalette::from_palette(palette);
 
     let input = text_input("Find in scrollback...", &state.query)
         .id(search_input_id())
         .on_input(Message::SearchQueryChanged)
         .on_submit(Message::SearchNext)
-        .size(13)
-        .padding([4, 8])
+        .size(12)
+        .padding([5, 9])
+        .style(styled_input_style(chrome))
         .width(Length::Fixed(220.0));
 
-    let counter = text(state.status_label()).size(12).color(fg);
-
-    let nav_button = |label: &'static str, msg: Message| {
-        styled_action_button(label, msg, fg, border_color, accent, Color::TRANSPARENT)
-    };
+    let counter = text(state.status_label())
+        .size(11)
+        .color(chrome.text_secondary);
 
     let bar_row = row![
         input,
         counter,
-        nav_button("Prev", Message::SearchPrev),
-        nav_button("Next", Message::SearchNext),
-        nav_button("Close", Message::CloseSearch),
+        button(text("Prev").size(11))
+            .padding([4, 9])
+            .style(pill_button_style(chrome, PillTone::Subtle))
+            .on_press(Message::SearchPrev),
+        button(text("Next").size(11))
+            .padding([4, 9])
+            .style(pill_button_style(chrome, PillTone::Subtle))
+            .on_press(Message::SearchNext),
+        button(text("Close").size(11))
+            .padding([4, 9])
+            .style(pill_button_style(chrome, PillTone::Ghost))
+            .on_press(Message::CloseSearch),
     ]
     .spacing(6)
     .align_y(Alignment::Center);
 
     let card = container(bar_row)
-        .padding(Padding::from([6, 10]))
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(surface)),
-            text_color: Some(fg),
-            border: Border {
-                color: border_color,
-                width: 1.0,
-                radius: 6.0.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        });
+        .padding(Padding::from([7, 10]))
+        .style(move |_theme| modal_card_style(chrome, true));
 
     container(opaque(card))
         .width(Length::Fill)
-        .padding(Padding::from([10, 14]))
+        .padding(Padding::from([12, 16]))
         .align_x(iced::alignment::Horizontal::Right)
         .align_y(iced::alignment::Vertical::Top)
         .into()
@@ -352,121 +351,49 @@ pub fn paste_confirm_modal_view<'a>(
     pending: &PendingPaste,
     palette: &ThemePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
-    let surface = rgb_to_iced(palette.ui_surface);
-    let bg = rgb_to_iced(palette.background);
-    let border_color = rgb_to_iced(palette.ui_border);
-    let fg = rgb_to_iced(palette.foreground);
-    let accent = rgb_to_iced(palette.ui_accent);
+    let chrome = ChromePalette::from_palette(palette);
 
-    let heading = text(format!(
-        "Paste {} lines into terminal?",
-        pending.line_count
-    ))
-    .size(15)
-    .color(fg);
+    let heading = row![
+        status_dot(chrome.warning),
+        text(format!(
+            "Paste {} lines into terminal?",
+            pending.line_count
+        ))
+        .size(15)
+        .color(chrome.text_primary),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
 
     let hint = text("Multi-line text may execute commands immediately.")
         .size(12)
-        .color(Color { a: 0.8, ..fg });
+        .color(chrome.text_muted);
 
-    let preview_box = container(text(pending.preview()).size(12).color(fg))
+    let preview_box = container(text(pending.preview()).size(12).color(chrome.text_secondary))
         .width(Length::Fill)
-        .padding(8)
-        .style(move |_theme| container::Style {
-            background: Some(Background::Color(bg)),
-            text_color: Some(fg),
-            border: Border {
-                color: border_color,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            shadow: Shadow::default(),
-            snap: true,
-        });
+        .padding([8, 10])
+        .style(move |_theme| card_container_style(chrome, false));
 
     let actions = row![
-        styled_action_button(
-            "Cancel",
-            Message::CancelPendingPaste,
-            fg,
-            border_color,
-            accent,
-            Color::TRANSPARENT,
-        ),
-        styled_action_button(
-            "Paste",
-            Message::ConfirmPendingPaste,
-            fg,
-            accent,
-            accent,
-            Color { a: 0.25, ..accent },
-        ),
+        space::horizontal(),
+        button(text("Cancel").size(12))
+            .padding([6, 12])
+            .style(pill_button_style(chrome, PillTone::Subtle))
+            .on_press(Message::CancelPendingPaste),
+        button(text("Paste").size(12))
+            .padding([6, 14])
+            .style(pill_button_style(chrome, PillTone::Primary))
+            .on_press(Message::ConfirmPendingPaste),
     ]
-    .spacing(8);
+    .spacing(8)
+    .align_y(Alignment::Center);
 
-    let dialog = container(opaque(
-        container(column![heading, hint, preview_box, actions].spacing(10))
-            .width(Length::Fixed(460.0))
-            .padding(16)
-            .style(move |_theme| container::Style {
-                background: Some(Background::Color(surface)),
-                text_color: Some(fg),
-                border: Border {
-                    color: border_color,
-                    width: 1.0,
-                    radius: 8.0.into(),
-                },
-                shadow: Shadow::default(),
-                snap: true,
-            }),
-    ))
-    .width(Length::Fill)
-    .height(Length::Fill)
-    .center_x(Length::Fill)
-    .center_y(Length::Fill)
-    .style(|_theme| container::Style {
-        background: Some(Background::Color(Color {
-            r: 0.0,
-            g: 0.0,
-            b: 0.0,
-            a: 0.45,
-        })),
-        ..container::Style::default()
-    });
+    let card = container(
+        column![heading, hint, preview_box, rule::horizontal(1), actions].spacing(10),
+    )
+    .width(Length::Fixed(460.0))
+    .padding(16)
+    .style(move |_theme| modal_card_style(chrome, true));
 
-    opaque(dialog)
-}
-
-fn styled_action_button<'a>(
-    label: &'static str,
-    msg: Message,
-    fg: Color,
-    border_color: Color,
-    accent: Color,
-    base_bg: Color,
-) -> Element<'a, Message, Theme, iced::Renderer> {
-    button(text(label).size(12).color(fg))
-        .padding([4, 10])
-        .style(move |_theme, status| {
-            let bg = match status {
-                button::Status::Hovered | button::Status::Pressed => Color {
-                    a: 0.35,
-                    ..accent
-                },
-                _ => base_bg,
-            };
-            button::Style {
-                background: Some(Background::Color(bg)),
-                text_color: fg,
-                border: Border {
-                    color: border_color,
-                    width: 1.0,
-                    radius: 4.0.into(),
-                },
-                shadow: Shadow::default(),
-                snap: true,
-            }
-        })
-        .on_press(msg)
-        .into()
+    modal_overlay(card.into(), Some(Message::CancelPendingPaste), 24.0)
 }

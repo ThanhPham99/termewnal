@@ -2,8 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use iced::widget::{
-    Id, button, column, container, mouse_area, opaque, row, rule, scrollable, space, text,
-    text_input,
+    Id, button, column, container, opaque, row, rule, scrollable, space, text, text_input,
 };
 use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Theme, Vector};
 use termewnal_core::{
@@ -14,6 +13,10 @@ use termewnal_ssh::{TunnelManagerSnapshot, TunnelState};
 
 use crate::app::{Message, SessionId};
 use crate::sidebar::{ActiveTunnelEntry, TunnelRuntimeState};
+use crate::ui_theme::{
+    ChromePalette, PillTone, modal_card_style, modal_overlay, pill_button_style, status_dot,
+    styled_input_style,
+};
 
 const MODAL_WIDTH: f32 = 540.0;
 
@@ -346,37 +349,46 @@ impl TunnelUiState {
         if !self.create_form.open {
             return None;
         }
-
+        let chrome = ChromePalette::from_palette(palette);
         let form = &self.create_form;
         let is_local = form.direction == TunnelDirection::Local;
         let is_remote = form.direction == TunnelDirection::Remote;
         let is_dynamic = form.direction == TunnelDirection::Dynamic;
 
         let dir_row = row![
-            text("Direction:").size(12),
+            text("Direction:").size(12).color(chrome.text_secondary),
             button(text("Local (-L)").size(12))
-                .padding([4, 10])
-                .style(if is_local {
-                    button::primary
-                } else {
-                    button::secondary
-                })
+                .padding([5, 10])
+                .style(pill_button_style(
+                    chrome,
+                    if is_local {
+                        PillTone::ActiveAccent
+                    } else {
+                        PillTone::Subtle
+                    },
+                ))
                 .on_press(Message::TunnelFormDirectionChanged(TunnelDirection::Local)),
             button(text("Remote (-R)").size(12))
-                .padding([4, 10])
-                .style(if is_remote {
-                    button::primary
-                } else {
-                    button::secondary
-                })
+                .padding([5, 10])
+                .style(pill_button_style(
+                    chrome,
+                    if is_remote {
+                        PillTone::ActiveAccent
+                    } else {
+                        PillTone::Subtle
+                    },
+                ))
                 .on_press(Message::TunnelFormDirectionChanged(TunnelDirection::Remote)),
             button(text("Dynamic SOCKS5 (-D)").size(12))
-                .padding([4, 10])
-                .style(if is_dynamic {
-                    button::primary
-                } else {
-                    button::secondary
-                })
+                .padding([5, 10])
+                .style(pill_button_style(
+                    chrome,
+                    if is_dynamic {
+                        PillTone::ActiveAccent
+                    } else {
+                        PillTone::Subtle
+                    },
+                ))
                 .on_press(Message::TunnelFormDirectionChanged(
                     TunnelDirection::Dynamic
                 )),
@@ -394,12 +406,15 @@ impl TunnelUiState {
             let selected = form.profile_id.as_deref() == Some(prof.id.as_str());
             target_buttons.push(
                 button(text(&prof.name).size(11))
-                    .padding([3, 8])
-                    .style(if selected {
-                        button::primary
-                    } else {
-                        button::subtle
-                    })
+                    .padding([4, 9])
+                    .style(pill_button_style(
+                        chrome,
+                        if selected {
+                            PillTone::ActiveAccent
+                        } else {
+                            PillTone::Subtle
+                        },
+                    ))
                     .on_press(Message::TunnelFormProfileSelected(Some(prof.id.clone())))
                     .into(),
             );
@@ -408,12 +423,15 @@ impl TunnelUiState {
             let selected = form.profile_id.is_none() && form.session_id == Some(*sid);
             target_buttons.push(
                 button(text(format!("Session: {label}")).size(11))
-                    .padding([3, 8])
-                    .style(if selected {
-                        button::primary
-                    } else {
-                        button::subtle
-                    })
+                    .padding([4, 9])
+                    .style(pill_button_style(
+                        chrome,
+                        if selected {
+                            PillTone::ActiveAccent
+                        } else {
+                            PillTone::Subtle
+                        },
+                    ))
                     .on_press(Message::TunnelFormSessionSelected(*sid))
                     .into(),
             );
@@ -423,7 +441,7 @@ impl TunnelUiState {
             if target_buttons.is_empty() {
                 text("No SSH Profile or active SSH Session")
                     .size(12)
-                    .color(Color::from_rgb8(148, 163, 184))
+                    .color(chrome.text_muted)
                     .into()
             } else {
                 let mut rows_col = column![].spacing(4);
@@ -449,29 +467,41 @@ impl TunnelUiState {
             };
 
         let profile_row = row![
-            text("SSH Target:").size(12).width(Length::Fixed(95.0)),
+            text("SSH Target:")
+                .size(12)
+                .width(Length::Fixed(95.0))
+                .color(chrome.text_secondary),
             target_picker,
         ]
         .spacing(8)
         .align_y(Alignment::Start);
 
         let scope_row = row![
-            text("Lifecycle:").size(12),
+            text("Lifecycle:")
+                .size(12)
+                .width(Length::Fixed(95.0))
+                .color(chrome.text_secondary),
             button(text("Session-bound").size(12))
-                .padding([4, 10])
-                .style(if !form.standalone {
-                    button::primary
-                } else {
-                    button::secondary
-                })
+                .padding([5, 10])
+                .style(pill_button_style(
+                    chrome,
+                    if !form.standalone {
+                        PillTone::ActiveAccent
+                    } else {
+                        PillTone::Subtle
+                    },
+                ))
                 .on_press(Message::TunnelFormStandaloneToggled(false)),
             button(text("Standalone (Background)").size(12))
-                .padding([4, 10])
-                .style(if form.standalone {
-                    button::primary
-                } else {
-                    button::secondary
-                })
+                .padding([5, 10])
+                .style(pill_button_style(
+                    chrome,
+                    if form.standalone {
+                        PillTone::ActiveAccent
+                    } else {
+                        PillTone::Subtle
+                    },
+                ))
                 .on_press(Message::TunnelFormStandaloneToggled(true)),
         ]
         .spacing(8)
@@ -483,39 +513,61 @@ impl TunnelUiState {
             "Bind Host:"
         };
         let mut fields = column![
-            text("New SSH Tunnel").size(16),
+            row![
+                status_dot(chrome.accent),
+                text("New SSH Tunnel")
+                    .size(16)
+                    .color(chrome.text_primary),
+                space::horizontal(),
+                button(text("Close").size(11))
+                    .padding([4, 9])
+                    .style(pill_button_style(chrome, PillTone::Ghost))
+                    .on_press(Message::CloseTunnelCreateModal),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
+            rule::horizontal(1),
             dir_row,
             profile_row,
             scope_row,
             row![
-                text("Name:").size(12).width(Length::Fixed(95.0)),
+                text("Name:")
+                    .size(12)
+                    .width(Length::Fixed(95.0))
+                    .color(chrome.text_secondary),
                 text_input("Optional display name", &form.name)
                     .id(tunnel_name_input_id())
                     .on_input(Message::TunnelFormNameChanged)
                     .size(12)
-                    .padding([5, 8]),
+                    .padding([6, 8])
+                    .style(styled_input_style(chrome)),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
             row![
-                text(bind_label).size(12).width(Length::Fixed(95.0)),
+                text(bind_label)
+                    .size(12)
+                    .width(Length::Fixed(95.0))
+                    .color(chrome.text_secondary),
                 text_input("127.0.0.1", &form.bind_host)
                     .id(tunnel_bind_host_input_id())
                     .on_input(Message::TunnelFormBindHostChanged)
                     .size(12)
-                    .padding([5, 8]),
-                text("Port:").size(12),
+                    .padding([6, 8])
+                    .style(styled_input_style(chrome)),
+                text("Port:").size(12).color(chrome.text_secondary),
                 text_input("5432", &form.bind_port)
                     .id(tunnel_bind_port_input_id())
                     .on_input(Message::TunnelFormBindPortChanged)
                     .width(Length::Fixed(90.0))
                     .size(12)
-                    .padding([5, 8]),
+                    .padding([6, 8])
+                    .style(styled_input_style(chrome)),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         ]
-        .spacing(8);
+        .spacing(10);
 
         if is_local || is_remote {
             let target_label = if is_remote {
@@ -525,19 +577,24 @@ impl TunnelUiState {
             };
             fields = fields.push(
                 row![
-                    text(target_label).size(12).width(Length::Fixed(95.0)),
+                    text(target_label)
+                        .size(12)
+                        .width(Length::Fixed(95.0))
+                        .color(chrome.text_secondary),
                     text_input("127.0.0.1", &form.target_host)
                         .id(tunnel_target_host_input_id())
                         .on_input(Message::TunnelFormTargetHostChanged)
                         .size(12)
-                        .padding([5, 8]),
-                    text("Port:").size(12),
+                        .padding([6, 8])
+                        .style(styled_input_style(chrome)),
+                    text("Port:").size(12).color(chrome.text_secondary),
                     text_input("5432", &form.target_port)
                         .id(tunnel_target_port_input_id())
                         .on_input(Message::TunnelFormTargetPortChanged)
                         .width(Length::Fixed(90.0))
                         .size(12)
-                        .padding([5, 8]),
+                        .padding([6, 8])
+                        .style(styled_input_style(chrome)),
                 ]
                 .spacing(8)
                 .align_y(Alignment::Center),
@@ -546,26 +603,26 @@ impl TunnelUiState {
 
         fields = fields.push(
             row![
-                text("Hold Grace (s):").size(12).width(Length::Fixed(95.0)),
+                text("Hold Grace (s):")
+                    .size(12)
+                    .width(Length::Fixed(95.0))
+                    .color(chrome.text_secondary),
                 text_input("10", &form.hold_grace_secs)
                     .on_input(Message::TunnelFormHoldGraceChanged)
                     .width(Length::Fixed(90.0))
                     .size(12)
-                    .padding([5, 8]),
+                    .padding([6, 8])
+                    .style(styled_input_style(chrome)),
                 text("Held sockets wait for reconnect before resetting")
                     .size(11)
-                    .color(Color::from_rgb8(148, 163, 184)),
+                    .color(chrome.text_muted),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         );
 
         if let Some(err) = &form.validation_error {
-            fields = fields.push(
-                text(err.as_str())
-                    .size(12)
-                    .color(Color::from_rgb8(248, 113, 113)),
-            );
+            fields = fields.push(text(err.as_str()).size(12).color(chrome.danger));
         }
 
         fields = fields.push(rule::horizontal(1));
@@ -573,56 +630,23 @@ impl TunnelUiState {
             row![
                 space::horizontal(),
                 button(text("Cancel").size(12))
-                    .padding([5, 12])
-                    .style(button::subtle)
+                    .padding([6, 12])
+                    .style(pill_button_style(chrome, PillTone::Subtle))
                     .on_press(Message::CloseTunnelCreateModal),
                 button(text("Create & Start").size(12))
-                    .padding([5, 14])
-                    .style(button::primary)
+                    .padding([6, 14])
+                    .style(pill_button_style(chrome, PillTone::Primary))
                     .on_press(Message::SubmitTunnelCreate),
             ]
             .spacing(8)
             .align_y(Alignment::Center),
         );
 
-        let bg = Color::from_rgb8(palette.background.r, palette.background.g, palette.background.b);
-        let fg = Color::from_rgb8(palette.foreground.r, palette.foreground.g, palette.foreground.b);
+        let card = container(scrollable(fields.padding(16)))
+            .width(Length::Fixed(MODAL_WIDTH))
+            .style(move |_| modal_card_style(chrome, true));
 
-        let card = opaque(
-            container(scrollable(fields.padding(16)))
-                .width(Length::Fixed(MODAL_WIDTH))
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(bg)),
-                    border: Border {
-                        color: Color::from_rgb8(96, 165, 250),
-                        width: 1.0,
-                        radius: 8.0.into(),
-                    },
-                    shadow: Shadow {
-                        color: Color::from_rgba(0.0, 0.0, 0.0, 0.5),
-                        offset: Vector::new(0.0, 6.0),
-                        blur_radius: 18.0,
-                    },
-                    text_color: Some(fg),
-                    ..Default::default()
-                }),
-        );
-
-        Some(
-            mouse_area(
-                container(card)
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .center_x(Length::Fill)
-                    .center_y(Length::Fill)
-                    .style(|_| container::Style {
-                        background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
-                        ..Default::default()
-                    }),
-            )
-            .on_press(Message::CloseTunnelCreateModal)
-            .into(),
-        )
+        Some(modal_overlay(card.into(), Some(Message::CloseTunnelCreateModal), 24.0))
     }
 
     /// Renders the `0.0.0.0` public-bind security warning confirmation modal when active.
@@ -631,26 +655,32 @@ impl TunnelUiState {
         palette: &ThemePalette,
     ) -> Option<Element<'a, Message, Theme, iced::Renderer>> {
         let pending = self.pending_public_bind.as_ref()?;
-        let bg = Color::from_rgb8(palette.background.r, palette.background.g, palette.background.b);
-        let fg = Color::from_rgb8(palette.foreground.r, palette.foreground.g, palette.foreground.b);
+        let chrome = ChromePalette::from_palette(palette);
 
         let card = opaque(
             container(
                 column![
-                    text("Public Network Bind Warning")
-                        .size(17)
-                        .color(Color::from_rgb8(251, 191, 36)),
-                    text(pending.warning_text()).size(13),
+                    row![
+                        status_dot(chrome.warning),
+                        text("Public Network Bind Warning")
+                            .size(16)
+                            .color(chrome.warning),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    text(pending.warning_text())
+                        .size(13)
+                        .color(chrome.text_primary),
                     rule::horizontal(1),
                     row![
                         button(text("Cancel (Keep Safe)").size(12))
                             .padding([6, 12])
-                            .style(button::subtle)
+                            .style(pill_button_style(chrome, PillTone::Subtle))
                             .on_press(Message::TunnelPublicBindCancel),
                         space::horizontal(),
                         button(text("Allow Public Bind & Start").size(12))
                             .padding([6, 14])
-                            .style(button::danger)
+                            .style(pill_button_style(chrome, PillTone::Danger))
                             .on_press(Message::TunnelPublicBindConfirm),
                     ]
                     .spacing(8)
@@ -661,18 +691,18 @@ impl TunnelUiState {
             )
             .width(Length::Fixed(MODAL_WIDTH))
             .style(move |_| container::Style {
-                background: Some(Background::Color(bg)),
+                background: Some(Background::Color(chrome.panel_bg)),
                 border: Border {
-                    color: Color::from_rgb8(251, 191, 36),
+                    color: chrome.warning,
                     width: 1.5,
-                    radius: 8.0.into(),
+                    radius: 10.0.into(),
                 },
                 shadow: Shadow {
                     color: Color::from_rgba(0.0, 0.0, 0.0, 0.55),
                     offset: Vector::new(0.0, 8.0),
-                    blur_radius: 20.0,
+                    blur_radius: 22.0,
                 },
-                text_color: Some(fg),
+                text_color: Some(chrome.text_primary),
                 ..Default::default()
             }),
         );

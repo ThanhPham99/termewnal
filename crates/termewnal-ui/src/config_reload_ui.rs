@@ -1,14 +1,16 @@
 use std::collections::BTreeMap;
 
 use iced::widget::{button, column, container, row, space, text, text_input};
-use iced::{Alignment, Border, Color, Element, Length, Theme};
+use iced::{Alignment, Border, Element, Length, Theme};
 use termewnal_core::{
-    AppConfig, ConfigFileKind, ConfigPaths, ProfilesConfig, RestoredSnapshot, TomlReloadError,
-    VaultSession, reload_config_snapshot, reload_profiles_snapshot, restore_from_backup,
+    AppConfig, ConfigFileKind, ConfigPaths, ProfilesConfig, RestoredSnapshot, ThemePalette,
+    TomlReloadError, VaultSession, reload_config_snapshot, reload_profiles_snapshot,
+    restore_from_backup,
 };
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::Message;
+use crate::ui_theme::{ChromePalette, PillTone, pill_button_style, status_dot, styled_input_style};
 
 /// Tracks safe TOML hot-reload parse error toasts and local `Vault` unlock bar state for the UI.
 #[derive(Debug, Default)]
@@ -116,37 +118,55 @@ impl ConfigReloadUiState {
     }
 
     /// Renders any active TOML reload parse-error toasts (with 1-click `.bak.1` restore).
-    pub fn view_reload_toasts(&self) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
+    pub fn view_reload_toasts(
+        &self,
+        palette: &ThemePalette,
+    ) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
         if self.errors.is_empty() {
             return None;
         }
+        let chrome = ChromePalette::from_palette(palette);
 
         let mut list = column![].spacing(6).width(Length::Fill);
         for err in self.errors.values() {
             let mut controls = row![].spacing(8).align_y(Alignment::Center);
             if err.backup_available {
                 controls = controls.push(
-                    button(text("Restore .bak.1").size(13))
+                    button(text("Restore .bak.1").size(12))
+                        .padding([4, 10])
+                        .style(pill_button_style(chrome, PillTone::Primary))
                         .on_press(Message::RestoreConfigBackup(err.kind)),
                 );
             }
             controls = controls.push(
-                button(text("Dismiss").size(13))
+                button(text("Dismiss").size(12))
+                    .padding([4, 10])
+                    .style(pill_button_style(chrome, PillTone::Subtle))
                     .on_press(Message::DismissReloadToast(err.kind)),
             );
 
             let banner = container(
                 row![
-                    text(err.to_string()).size(13),
+                    status_dot(chrome.danger),
+                    text(err.to_string()).size(12).color(chrome.text_primary),
                     space::horizontal(),
                     controls,
                 ]
-                .spacing(12)
+                .spacing(10)
                 .align_y(Alignment::Center),
             )
             .width(Length::Fill)
             .padding([8, 12])
-            .style(error_toast_style);
+            .style(move |_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(chrome.danger_soft)),
+                border: Border {
+                    color: chrome.danger,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                text_color: Some(chrome.text_primary),
+                ..Default::default()
+            });
 
             list = list.push(banner);
         }
@@ -159,10 +179,12 @@ impl ConfigReloadUiState {
     pub fn view_vault_banner(
         &self,
         vault: &VaultSession,
+        palette: &ThemePalette,
     ) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
         if !vault.requires_unlock() {
             return None;
         }
+        let chrome = ChromePalette::from_palette(palette);
 
         let exists = vault.has_encrypted_vault();
         let action_label = if exists {
@@ -177,54 +199,49 @@ impl ConfigReloadUiState {
         };
 
         let mut items = row![
+            status_dot(chrome.warning),
             text(if exists {
                 "Local Vault locked:"
             } else {
                 "Create Master Password for local Vault:"
             })
-            .size(13),
+            .size(12)
+            .color(chrome.text_primary),
             text_input("Master password...", self.vault_password_draft.as_str())
                 .secure(true)
                 .width(Length::Fixed(220.0))
+                .size(12)
+                .padding([5, 8])
+                .style(styled_input_style(chrome))
                 .on_input(Message::VaultUnlockInputChanged)
                 .on_submit(submit_msg.clone()),
-            button(text(action_label).size(13)).on_press(submit_msg),
+            button(text(action_label).size(12))
+                .padding([5, 12])
+                .style(pill_button_style(chrome, PillTone::Primary))
+                .on_press(submit_msg),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
 
         if let Some(err) = &self.vault_error {
-            items = items.push(text(err.as_str()).size(12));
+            items = items.push(text(err.as_str()).size(12).color(chrome.danger));
         }
 
         Some(
             container(items)
                 .width(Length::Fill)
-                .padding([6, 12])
-                .style(vault_banner_style)
+                .padding([7, 12])
+                .style(move |_theme: &Theme| container::Style {
+                    background: Some(iced::Background::Color(chrome.panel_bg)),
+                    border: Border {
+                        color: chrome.border_subtle,
+                        width: 1.0,
+                        radius: 0.0.into(),
+                    },
+                    text_color: Some(chrome.text_primary),
+                    ..Default::default()
+                })
                 .into(),
         )
     }
-}
-
-fn error_toast_style(_theme: &Theme) -> container::Style {
-    container::Style::default()
-        .background(Color::from_rgb8(0x5b, 0x1e, 0x24))
-        .color(Color::from_rgb8(0xfd, 0xed, 0xee))
-        .border(Border {
-            color: Color::from_rgb8(0xd9, 0x53, 0x4f),
-            width: 1.0,
-            radius: 4.0.into(),
-        })
-}
-
-fn vault_banner_style(_theme: &Theme) -> container::Style {
-    container::Style::default()
-        .background(Color::from_rgb8(0x28, 0x30, 0x3d))
-        .color(Color::from_rgb8(0xe5, 0xe9, 0xf0))
-        .border(Border {
-            color: Color::from_rgb8(0x4c, 0x56, 0x6a),
-            width: 1.0,
-            radius: 0.0.into(),
-        })
 }

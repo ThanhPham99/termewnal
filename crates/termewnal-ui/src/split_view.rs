@@ -11,9 +11,9 @@ use iced::{
 use crate::app::{Message, shortcut_for_key_event_with_palette};
 use crate::workspace::{MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, PaneId, SplitAxis, SplitId, TabId};
 
-const DIVIDER_THICKNESS: f32 = 4.0;
-const DIVIDER_HIT_PADDING: f32 = 3.0;
-const PANE_BORDER_WIDTH: f32 = 2.0;
+const DIVIDER_THICKNESS: f32 = 2.0;
+const DIVIDER_HIT_PADDING: f32 = 4.0;
+const PANE_BORDER_WIDTH: f32 = 1.5;
 
 #[derive(Debug, Default)]
 struct SplitDragState {

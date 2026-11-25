@@ -1,12 +1,15 @@
 use iced::widget::{
-    Id, button, column, container, mouse_area, opaque, row, rule, scrollable, space, text,
-    text_input,
+    Id, button, column, container, row, rule, scrollable, space, text, text_input,
 };
-use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Theme, Vector};
-use termewnal_core::{Profile, ProfileTarget};
+use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
+use termewnal_core::{Profile, ProfileTarget, ThemePalette};
 
 use crate::app::{LaunchDisposition, Message, SessionId, default_os_username};
 use crate::sidebar::{ActiveTunnelEntry, SystemSshProfile, profile_target_summary};
+use crate::ui_theme::{
+    ChromePalette, PillTone, badge_pill, keycap_pill, modal_card_style, modal_overlay,
+    pill_button_style, styled_input_style,
+};
 use crate::workspace::SplitAxis;
 
 const PALETTE_MAX_WIDTH: f32 = 620.0;
@@ -139,6 +142,8 @@ pub enum PaletteAction {
     ToggleSidebar,
     ToggleSftpDrawer,
     CloseFocusedPane,
+    OpenSettings,
+    OpenNewProfile,
     OpenQuickConnectPrompt,
     OpenTabbyImporter,
     OpenTunnelCreator,
@@ -558,6 +563,38 @@ fn workspace_command_items() -> Vec<PaletteItem> {
             action: PaletteAction::OpenQuickConnectPrompt,
         },
         PaletteItem {
+            id: "cmd:open-settings".to_string(),
+            category: PaletteCategory::Command,
+            title: "Open Settings...".to_string(),
+            subtitle: "Customize Theme, fonts, cursor, SSH keepalive, SFTP, and Vault"
+                .to_string(),
+            keywords: vec![
+                "settings".to_string(),
+                "preferences".to_string(),
+                "theme".to_string(),
+                "font".to_string(),
+                "appearance".to_string(),
+                "config".to_string(),
+            ],
+            shortcut: Some("Ctrl+,".to_string()),
+            action: PaletteAction::OpenSettings,
+        },
+        PaletteItem {
+            id: "cmd:new-profile".to_string(),
+            category: PaletteCategory::Command,
+            title: "New Profile...".to_string(),
+            subtitle: "Create and save a Local shell or SSH Profile in profiles.toml".to_string(),
+            keywords: vec![
+                "profile".to_string(),
+                "new".to_string(),
+                "create".to_string(),
+                "ssh".to_string(),
+                "host".to_string(),
+            ],
+            shortcut: None,
+            action: PaletteAction::OpenNewProfile,
+        },
+        PaletteItem {
             id: "cmd:probe-reconnect-all".to_string(),
             category: PaletteCategory::Command,
             title: "Probe / Reconnect All SSH Sessions".to_string(),
@@ -712,61 +749,49 @@ pub fn render_command_palette<'a>(
     palette: &'a CommandPaletteState,
     items: Vec<PaletteItem>,
     last_error: Option<&'a str>,
+    terminal_palette: &ThemePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
+    let chrome = ChromePalette::from_palette(terminal_palette);
     let card_content: Element<'a, Message, Theme, iced::Renderer> = match palette.mode() {
-        CommandPaletteMode::Search => render_search_mode(palette, items),
-        CommandPaletteMode::QuickConnect => render_quick_connect_mode(palette, last_error),
+        CommandPaletteMode::Search => render_search_mode(palette, items, chrome),
+        CommandPaletteMode::QuickConnect => render_quick_connect_mode(palette, last_error, chrome),
     };
 
-    let card = opaque(
-        container(card_content)
-            .width(Length::Fixed(PALETTE_MAX_WIDTH))
-            .padding(12)
-            .style(|theme: &Theme| {
-                let ext = theme.extended_palette();
-                container::Style {
-                    background: Some(Background::Color(ext.background.base.color)),
-                    border: Border {
-                        color: ext.primary.strong.color,
-                        width: 1.0,
-                        radius: 6.0.into(),
-                    },
-                    shadow: Shadow {
-                        color: Color::from_rgba(0.0, 0.0, 0.0, 0.45),
-                        offset: Vector::new(0.0, 8.0),
-                        blur_radius: 20.0,
-                    },
-                    ..Default::default()
-                }
-            }),
-    );
+    let card = container(card_content)
+        .width(Length::Fixed(PALETTE_MAX_WIDTH))
+        .padding(14)
+        .style(move |_theme: &Theme| modal_card_style(chrome, true));
 
-    let backdrop = container(card)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .center_x(Length::Fill)
-        .padding([56, 24])
-        .style(|_theme: &Theme| container::Style {
-            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.55))),
-            ..Default::default()
-        });
+    modal_overlay(card.into(), Some(Message::CloseCommandPalette), 64.0)
+}
 
-    mouse_area(backdrop)
-        .on_press(Message::CloseCommandPalette)
-        .into()
+fn category_pill_colors(category: PaletteCategory, chrome: ChromePalette) -> (Color, Color) {
+    match category {
+        PaletteCategory::QuickConnect | PaletteCategory::Profile => {
+            (chrome.accent, chrome.accent_soft)
+        }
+        PaletteCategory::Session => (chrome.success, chrome.success_soft),
+        PaletteCategory::Tunnel => (chrome.warning, chrome.warning_soft),
+        PaletteCategory::Command | PaletteCategory::SystemSsh => {
+            (chrome.text_secondary, chrome.card_hover)
+        }
+    }
 }
 
 fn render_search_mode<'a>(
     palette: &'a CommandPaletteState,
     items: Vec<PaletteItem>,
+    chrome: ChromePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
     let header = row![
-        text("Command Palette").size(13),
+        text("Command Palette")
+            .size(14)
+            .color(chrome.text_primary),
         space::horizontal(),
-        text("Ctrl+K / Esc")
-            .size(11)
-            .color(Color::from_rgb8(148, 163, 184)),
+        keycap_pill("Ctrl+K", chrome),
+        keycap_pill("Esc", chrome),
     ]
+    .spacing(6)
     .align_y(Alignment::Center);
 
     let input = text_input(
@@ -777,7 +802,8 @@ fn render_search_mode<'a>(
     .on_input(Message::CommandPaletteQueryChanged)
     .on_submit(Message::CommandPaletteConfirm)
     .size(13)
-    .padding([8, 10]);
+    .padding([9, 12])
+    .style(styled_input_style(chrome));
 
     let selected = if items.is_empty() {
         0
@@ -791,59 +817,87 @@ fn render_search_mode<'a>(
             container(
                 text("No matching commands, profiles, or sessions")
                     .size(12)
-                    .color(Color::from_rgb8(148, 163, 184)),
+                    .color(chrome.text_muted),
             )
-            .padding([12, 8]),
+            .padding([16, 10]),
         );
     } else {
         for (idx, item) in items.into_iter().enumerate() {
             let is_selected = idx == selected;
-            let badge = item.category.badge();
+            let badge_label = item.category.badge();
+            let (badge_fg, badge_bg) = category_pill_colors(item.category, chrome);
             let shortcut_text = item.shortcut.clone().unwrap_or_default();
             let split_profile_id = match &item.action {
                 PaletteAction::LaunchProfile { profile_id, .. } => Some(profile_id.clone()),
                 _ => None,
             };
 
-            let text_col = column![
-                text(format!("[{badge}] {}", item.title)).size(13),
-                text(item.subtitle)
-                    .size(11)
-                    .color(Color::from_rgb8(148, 163, 184)),
+            let accent_bar = container(space::horizontal().width(3).height(26)).style(move |_| {
+                container::Style {
+                    background: Some(Background::Color(if is_selected {
+                        chrome.accent
+                    } else {
+                        Color::TRANSPARENT
+                    })),
+                    border: Border {
+                        radius: 2.0.into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }
+            });
+
+            let title_row = row![
+                badge_pill(badge_label, badge_fg, badge_bg, Color::TRANSPARENT),
+                text(item.title)
+                    .size(13)
+                    .color(if is_selected {
+                        chrome.text_primary
+                    } else {
+                        chrome.text_secondary
+                    }),
             ]
-            .spacing(2)
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            let text_col = column![
+                title_row,
+                text(item.subtitle).size(11).color(chrome.text_muted),
+            ]
+            .spacing(3)
             .width(Length::Fill);
 
-            let mut row_items = row![text_col].spacing(8).align_y(Alignment::Center);
+            let mut row_items = row![accent_bar, text_col]
+                .spacing(8)
+                .align_y(Alignment::Center);
             if !shortcut_text.is_empty() {
-                row_items = row_items.push(
-                    text(shortcut_text)
-                        .size(11)
-                        .color(Color::from_rgb8(148, 163, 184)),
-                );
+                row_items = row_items.push(keycap_pill(shortcut_text, chrome));
             }
 
             let main_btn = button(row_items)
-                .padding([6, 10])
+                .padding([7, 10])
                 .width(Length::Fill)
-                .style(if is_selected {
-                    button::primary
-                } else {
-                    button::subtle
-                })
+                .style(pill_button_style(
+                    chrome,
+                    if is_selected {
+                        PillTone::ActiveAccent
+                    } else {
+                        PillTone::Ghost
+                    },
+                ))
                 .on_press(Message::CommandPaletteExecuteItem(item.action));
 
             if let Some(pid) = split_profile_id {
                 let split_btn = button(text("Split V").size(11))
-                    .padding([6, 8])
-                    .style(button::secondary)
+                    .padding([7, 10])
+                    .style(pill_button_style(chrome, PillTone::Subtle))
                     .on_press(Message::LaunchProfile {
                         profile_id: pid,
                         disposition: LaunchDisposition::Split(SplitAxis::Vertical),
                     });
                 list_col = list_col.push(
                     row![main_btn, split_btn]
-                        .spacing(4)
+                        .spacing(6)
                         .align_y(Alignment::Center),
                 );
             } else {
@@ -860,43 +914,47 @@ fn render_search_mode<'a>(
             .width(Length::Fill)
             .height(Length::Fixed(PALETTE_LIST_MAX_HEIGHT)),
     ]
-    .spacing(8)
+    .spacing(10)
     .into()
 }
 
 fn render_quick_connect_mode<'a>(
     palette: &'a CommandPaletteState,
     last_error: Option<&'a str>,
+    chrome: ChromePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
     let parsed = QuickConnectTarget::parse(palette.quick_connect_input());
-    let preview = match &parsed {
-        Some(target) => format!("Ready: ssh {}", target.display_addr()),
-        None => "Enter destination as user@host[:port] or host".to_string(),
+    let (preview, preview_color) = match &parsed {
+        Some(target) => (format!("Ready: ssh {}", target.display_addr()), chrome.success),
+        None => (
+            "Enter destination as user@host[:port] or host".to_string(),
+            chrome.text_muted,
+        ),
     };
 
     let header = row![
-        text("Quick Connect (SSH)").size(14),
+        text("Quick Connect (SSH)")
+            .size(14)
+            .color(chrome.text_primary),
         space::horizontal(),
         button(text("Back").size(11))
-            .padding([3, 8])
-            .style(button::subtle)
+            .padding([4, 10])
+            .style(pill_button_style(chrome, PillTone::Subtle))
             .on_press(Message::CommandPaletteExitQuickConnect),
     ]
     .align_y(Alignment::Center);
 
-    let input = text_input(
-        "alice@10.0.0.5:2222",
-        palette.quick_connect_input(),
-    )
-    .id(quick_connect_input_id())
-    .on_input(Message::CommandPaletteQuickConnectInputChanged)
-    .on_submit(Message::CommandPaletteConfirm)
-    .size(13)
-    .padding([8, 10]);
+    let input = text_input("alice@10.0.0.5:2222", palette.quick_connect_input())
+        .id(quick_connect_input_id())
+        .on_input(Message::CommandPaletteQuickConnectInputChanged)
+        .on_submit(Message::CommandPaletteConfirm)
+        .size(13)
+        .padding([9, 12])
+        .style(styled_input_style(chrome));
 
     let mut connect_btn = button(text("Connect").size(12))
         .padding([6, 14])
-        .style(button::primary);
+        .style(pill_button_style(chrome, PillTone::Primary));
     if let Some(target) = parsed {
         connect_btn = connect_btn.on_press(Message::QuickConnect(target));
     }
@@ -905,9 +963,7 @@ fn render_quick_connect_mode<'a>(
         header,
         input,
         row![
-            text(preview)
-                .size(12)
-                .color(Color::from_rgb8(148, 163, 184)),
+            text(preview).size(12).color(preview_color),
             space::horizontal(),
             connect_btn,
         ]
@@ -916,7 +972,7 @@ fn render_quick_connect_mode<'a>(
     .spacing(10);
 
     if let Some(err) = last_error {
-        col = col.push(text(err).size(11).color(Color::from_rgb8(248, 113, 113)));
+        col = col.push(text(err).size(11).color(chrome.danger));
     }
 
     col.into()
