@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::Path;
 use std::time::Duration;
 
+use tempfile::TempDir;
 use termewnal_pty::{
     PtyEvent, PtySession, PtySpawnConfig, ShellKind, detect_default_shell, resolve_unix_shell,
     resolve_windows_shells,
@@ -146,4 +147,108 @@ fn exiting_shell_delivers_eof_and_exited_event_without_hanging() {
     });
 
     assert_eq!(exited.expect("timed out waiting for PtyEvent::Exited"), Some(Some(0)));
+}
+
+#[test]
+fn pty_captures_working_dir_after_cd_and_respawns_in_captured_directory() {
+    let temp = TempDir::new().expect("create temp workspace dir");
+    let dir_a = temp.path().join("alpha").canonicalize().unwrap_or_else(|_| {
+        std::fs::create_dir_all(temp.path().join("alpha")).unwrap();
+        temp.path().join("alpha").canonicalize().unwrap()
+    });
+    let dir_b = temp.path().join("beta dir").canonicalize().unwrap_or_else(|_| {
+        std::fs::create_dir_all(temp.path().join("beta dir")).unwrap();
+        temp.path().join("beta dir").canonicalize().unwrap()
+    });
+
+    let session = PtySession::spawn(PtySpawnConfig {
+        working_dir: Some(dir_a.clone()),
+        ..PtySpawnConfig::default()
+    })
+    .expect("spawn PTY at dir_a");
+
+    assert_eq!(
+        session.current_working_dir().and_then(|p| p.canonicalize().ok()),
+        Some(dir_a)
+    );
+
+    let cd_cmd = format!("cd '{}' && printf \"CD_DONE_%s\\n\" OK\r", dir_b.display());
+    session
+        .write_bytes(cd_cmd.as_bytes())
+        .expect("send cd command");
+    assert!(
+        session.wait_for_output(Duration::from_secs(5), |s| {
+            s.visible_text().contains("CD_DONE_OK")
+        }),
+        "expected CD_DONE_OK, got:\n{}",
+        session.snapshot().visible_text()
+    );
+
+    let captured = session
+        .current_working_dir()
+        .expect("current_working_dir should return dir_b");
+    assert_eq!(captured.canonicalize().unwrap(), dir_b);
+
+    // Respawn a fresh session at the captured working directory and verify `pwd`.
+    let respawned = PtySession::spawn(PtySpawnConfig {
+        working_dir: Some(captured),
+        ..PtySpawnConfig::default()
+    })
+    .expect("respawn PTY at captured working dir");
+    respawned
+        .write_bytes(b"pwd && printf \"RESPAWN_PWD_%s\\n\" OK\r")
+        .expect("send pwd command");
+    assert!(
+        respawned.wait_for_output(Duration::from_secs(5), |s| {
+            s.visible_text().contains("RESPAWN_PWD_OK")
+        }),
+        "expected RESPAWN_PWD_OK, got:\n{}",
+        respawned.snapshot().visible_text()
+    );
+    assert!(
+        respawned
+            .snapshot()
+            .visible_text()
+            .contains(&dir_b.to_string_lossy().to_string()),
+        "respawned shell pwd did not include {}; got:\n{}",
+        dir_b.display(),
+        respawned.snapshot().visible_text()
+    );
+}
+
+#[test]
+fn pty_retains_osc7_working_dir_after_shell_exits() {
+    let temp = TempDir::new().expect("create temp dir");
+    let target = temp.path().join("osc7 space");
+    std::fs::create_dir_all(&target).expect("create osc7 target");
+    let target = target.canonicalize().expect("canonicalize osc7 target");
+    let encoded = target.to_string_lossy().replace(' ', "%20");
+
+    let session = PtySession::spawn(PtySpawnConfig::default()).expect("spawn PTY");
+    let mut rx = session.take_event_receiver().expect("event receiver");
+
+    let cmd = format!("printf '\\033]7;file://localhost%s\\007' '{encoded}'; exit 0\r");
+    session.write_bytes(cmd.as_bytes()).expect("send osc7 + exit");
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .expect("build tokio runtime");
+    let exited = rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(ev) = rx.recv().await {
+                if let PtyEvent::Exited(code) = ev {
+                    return Some(code);
+                }
+            }
+            None
+        })
+        .await
+    });
+    assert_eq!(exited.expect("wait exit"), Some(Some(0)));
+
+    assert_eq!(
+        session.current_working_dir().and_then(|p| p.canonicalize().ok()),
+        Some(target)
+    );
 }

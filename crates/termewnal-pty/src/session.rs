@@ -11,6 +11,7 @@ use alacritty_terminal::term::{Config as TermConfig, Term};
 use alacritty_terminal::vte::ansi::{
     Color as TermColor, CursorShape, Processor, StdSyncHandler,
 };
+use alacritty_terminal::vte::{Parser as VteParser, Perform};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -185,11 +186,14 @@ impl EventListener for TermEventProxy {
 /// Active local shell PTY backed by `portable-pty` and an `alacritty_terminal::Term` state machine.
 pub struct PtySession {
     shell: ShellSpec,
+    child_pid: Option<u32>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     term: Arc<Mutex<Term<TermEventProxy>>>,
     dimensions: Mutex<TermDimensions>,
+    last_working_dir: Arc<Mutex<Option<PathBuf>>>,
+    osc7_working_dir: Arc<Mutex<Option<PathBuf>>>,
     update_signal: Arc<(Mutex<(u64, bool, Option<i32>)>, Condvar)>,
     events_tx: mpsc::UnboundedSender<PtyEvent>,
     events_rx: Mutex<Option<mpsc::UnboundedReceiver<PtyEvent>>>,
@@ -224,6 +228,7 @@ impl PtySession {
                 program: config.shell.program.clone(),
                 reason: err.to_string(),
             })?;
+        let child_pid = child.process_id();
 
         // CRITICAL ON UNIX: Drop slave in parent immediately so reader receives EOF when child exits.
         drop(pair.slave);
@@ -252,22 +257,30 @@ impl PtySession {
         };
         let term = Arc::new(Mutex::new(Term::new(term_config, &dims, proxy)));
         let update_signal = Arc::new((Mutex::new((0_u64, false, None)), Condvar::new()));
+        let last_working_dir = Arc::new(Mutex::new(config.working_dir.clone()));
+        let osc7_working_dir = Arc::new(Mutex::new(None));
 
         spawn_reader_thread(
             reader,
             child,
+            child_pid,
             Arc::clone(&term),
+            Arc::clone(&last_working_dir),
+            Arc::clone(&osc7_working_dir),
             Arc::clone(&update_signal),
             events_tx.clone(),
         );
 
         Ok(Self {
             shell: config.shell,
+            child_pid,
             master: Mutex::new(pair.master),
             writer,
             killer: Mutex::new(killer),
             term,
             dimensions: Mutex::new(dims),
+            last_working_dir,
+            osc7_working_dir,
             update_signal,
             events_tx,
             events_rx: Mutex::new(Some(events_rx)),
@@ -277,6 +290,47 @@ impl PtySession {
     /// Returns the shell specification used to launch this session.
     pub fn shell(&self) -> &ShellSpec {
         &self.shell
+    }
+
+    /// Captures the current working directory of this local shell `Session`.
+    ///
+    /// On Linux, queries `/proc/<pid>/cwd` for the live shell (or foreground process group leader)
+    /// and caches the result, falling back to OSC 7 reports or the last retained directory once
+    /// the child exits.
+    pub fn current_working_dir(&self) -> Option<PathBuf> {
+        let exited = self
+            .update_signal
+            .0
+            .lock()
+            .map(|state| state.1)
+            .unwrap_or(false);
+
+        if !exited {
+            let fg_pid = self
+                .master
+                .lock()
+                .ok()
+                .and_then(|master| master.process_group_leader())
+                .and_then(|pid| u32::try_from(pid).ok());
+
+            if let Some(cwd) = read_proc_cwd(self.child_pid).or_else(|| read_proc_cwd(fg_pid)) {
+                if let Ok(mut guard) = self.last_working_dir.lock() {
+                    *guard = Some(cwd.clone());
+                }
+                return Some(cwd);
+            }
+        }
+
+        if let Ok(guard) = self.osc7_working_dir.lock()
+            && let Some(cwd) = guard.clone()
+        {
+            return Some(cwd);
+        }
+
+        self.last_working_dir
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Takes the async event receiver once for driving an external event loop or UI subscription.
@@ -390,10 +444,14 @@ impl Drop for PtySession {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_reader_thread(
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    child_pid: Option<u32>,
     term: Arc<Mutex<Term<TermEventProxy>>>,
+    last_working_dir: Arc<Mutex<Option<PathBuf>>>,
+    osc7_working_dir: Arc<Mutex<Option<PathBuf>>>,
     update_signal: Arc<(Mutex<(u64, bool, Option<i32>)>, Condvar)>,
     events_tx: mpsc::UnboundedSender<PtyEvent>,
 ) {
@@ -401,6 +459,10 @@ fn spawn_reader_thread(
         .name("termewnal-pty-reader".to_string())
         .spawn(move || {
             let mut processor: Processor<StdSyncHandler> = Processor::new();
+            let mut osc7_parser = VteParser::new();
+            let mut osc7_tracker = Osc7Tracker {
+                osc7_working_dir: Arc::clone(&osc7_working_dir),
+            };
             let mut buf = [0_u8; 8192];
 
             loop {
@@ -410,9 +472,15 @@ fn spawn_reader_thread(
                         break;
                     }
                     Ok(n) => {
+                        osc7_parser.advance(&mut osc7_tracker, &buf[..n]);
                         {
                             let mut guard = term.lock().expect("term mutex poisoned");
                             processor.advance(&mut *guard, &buf[..n]);
+                        }
+                        if let Some(cwd) = read_proc_cwd(child_pid)
+                            && let Ok(mut guard) = last_working_dir.lock()
+                        {
+                            *guard = Some(cwd);
                         }
                         {
                             let (lock, cvar) = &*update_signal;
@@ -448,6 +516,81 @@ fn spawn_reader_thread(
             let _ = events_tx.send(PtyEvent::Exited(exit_code));
         })
         .expect("spawn PTY reader thread");
+}
+
+struct Osc7Tracker {
+    osc7_working_dir: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl Perform for Osc7Tracker {
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.len() >= 2
+            && params[0] == b"7"
+            && let Ok(uri) = std::str::from_utf8(params[1])
+            && let Some(path) = parse_osc7_path(uri)
+            && let Ok(mut guard) = self.osc7_working_dir.lock()
+        {
+            *guard = Some(path);
+        }
+    }
+}
+
+fn parse_osc7_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    let encoded_path = if let Some(rest) = trimmed.strip_prefix("file://") {
+        if rest.starts_with('/') {
+            rest
+        } else {
+            let idx = rest.find('/')?;
+            &rest[idx..]
+        }
+    } else if trimmed.starts_with('/') {
+        trimmed
+    } else {
+        return None;
+    };
+
+    let decoded = percent_decode(encoded_path);
+    (!decoded.is_empty()).then(|| PathBuf::from(decoded))
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_cwd(pid: Option<u32>) -> Option<PathBuf> {
+    let pid = pid?;
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_proc_cwd(_pid: Option<u32>) -> Option<PathBuf> {
+    None
 }
 
 fn snapshot_from_term(term: &Term<TermEventProxy>, dims: TermDimensions) -> TerminalSnapshot {

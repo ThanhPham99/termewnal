@@ -2,6 +2,7 @@
 
 pub mod config;
 pub mod error;
+pub mod layout;
 pub mod profile;
 mod storage;
 
@@ -10,6 +11,10 @@ pub use config::{
     ensure_config_files, load_config, save_config,
 };
 pub use error::CoreError;
+pub use layout::{
+    LayoutSplitAxis, LayoutSplitNode, SessionDescriptor, TabLayout, WindowLayout, WorkspaceLayout,
+    load_layout, save_layout,
+};
 pub use profile::{
     Profile, ProfileTarget, ProfilesConfig, SshAuthMethod, TunnelDirection, TunnelRule,
     load_profiles, save_profiles,
