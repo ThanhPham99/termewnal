@@ -1,12 +1,17 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use russh::client;
 use russh::keys::PublicKeyOrCertificate;
 use russh::{Channel, Disconnect};
-use termewnal_core::{Profile, ProfileTarget, SshAuthMethod, vault::SecretStore};
+use socket2::{SockRef, TcpKeepalive};
+use termewnal_core::{
+    DEFAULT_KEEPALIVE_INTERVAL_SECS, Profile, ProfileTarget, SshAuthMethod, vault::SecretStore,
+};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tracing::debug;
 
 use crate::auth::{AgentConnector, SshInteractionHandler, authenticate_session};
 use crate::error::SshError;
@@ -155,6 +160,21 @@ impl client::Handler for SshClientHandler {
     }
 }
 
+/// TCP keepalive settings applied to the underlying `TcpStream` via `socket2` before SSH handshake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TcpKeepaliveSettings {
+    /// Idle duration before the OS starts sending TCP keepalive probes.
+    pub interval: Duration,
+}
+
+impl Default for TcpKeepaliveSettings {
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL_SECS),
+        }
+    }
+}
+
 /// Authenticated SSH `Primary Transport` wrapping `russh::client::Handle`.
 pub struct SshTransport {
     host: String,
@@ -164,9 +184,29 @@ pub struct SshTransport {
 }
 
 impl SshTransport {
-    /// Opens a TCP connection to `config.host:config.port`, verifies host key, and authenticates.
+    /// Opens a TCP connection to `config.host:config.port`, applies TCP keepalives,
+    /// verifies the host key, and authenticates.
     pub async fn connect(
         config: &SshConnectConfig,
+        vault: Option<&dyn SecretStore>,
+        interaction: Arc<dyn SshInteractionHandler>,
+        agent_connector: Arc<dyn AgentConnector>,
+    ) -> Result<Self, SshError> {
+        Self::connect_with_keepalive(
+            config,
+            Some(TcpKeepaliveSettings::default()),
+            vault,
+            interaction,
+            agent_connector,
+        )
+        .await
+    }
+
+    /// Opens a TCP connection to `config.host:config.port` with explicit TCP keepalive settings,
+    /// verifies the host key, and authenticates.
+    pub async fn connect_with_keepalive(
+        config: &SshConnectConfig,
+        keepalive: Option<TcpKeepaliveSettings>,
         vault: Option<&dyn SecretStore>,
         interaction: Arc<dyn SshInteractionHandler>,
         agent_connector: Arc<dyn AgentConnector>,
@@ -179,6 +219,11 @@ impl SshTransport {
                 reason: err.to_string(),
             })?;
         let _ = tcp.set_nodelay(config.nodelay);
+        if let Some(ka) = keepalive
+            && !ka.interval.is_zero()
+        {
+            apply_tcp_keepalive(&tcp, ka);
+        }
 
         Self::connect_over_stream(tcp, config, vault, interaction, agent_connector).await
     }
@@ -272,7 +317,7 @@ impl SshTransport {
         Ok(self.handle.channel_open_session().await?)
     }
 
-    /// Sends an SSH `SSH_MSG_DISCONNECT` cleanly and shuts down the transport.
+    /// Sends an SSH `SSH_MSG_DISCONNECT` cleanly without consuming the shared transport handle.
     pub async fn disconnect_shared(&self) -> Result<(), SshError> {
         self.handle
             .disconnect(Disconnect::ByApplication, "closed by user", "en")
@@ -280,8 +325,34 @@ impl SshTransport {
         Ok(())
     }
 
+    /// Alias for [`Self::disconnect_shared`] used by supervisor teardown paths.
+    pub async fn close(&self) -> Result<(), SshError> {
+        self.disconnect_shared().await
+    }
+
     /// Sends an SSH `SSH_MSG_DISCONNECT` cleanly and shuts down the transport.
     pub async fn disconnect(self) -> Result<(), SshError> {
         self.disconnect_shared().await
+    }
+}
+
+fn apply_tcp_keepalive(tcp: &TcpStream, settings: TcpKeepaliveSettings) {
+    let mut keepalive = TcpKeepalive::new().with_time(settings.interval);
+    #[cfg(not(any(
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "solaris",
+        target_os = "nto",
+        target_os = "espidf",
+        target_os = "vita",
+        target_os = "haiku",
+        target_os = "horizon"
+    )))]
+    {
+        keepalive = keepalive.with_interval(settings.interval);
+    }
+
+    if let Err(err) = SockRef::from(tcp).set_tcp_keepalive(&keepalive) {
+        debug!(error = %err, "failed to apply SO_KEEPALIVE/TCP_KEEPALIVE parameters");
     }
 }

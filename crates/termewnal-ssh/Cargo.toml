@@ -5,12 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+chrono.workspace = true
 data-encoding.workspace = true
 directories.workspace = true
 hmac.workspace = true
+rand.workspace = true
 russh.workspace = true
 russh-sftp.workspace = true
 sha1.workspace = true
+socket2.workspace = true
 termewnal-core = { path = "../termewnal-core" }
 termewnal-pty = { path = "../termewnal-pty" }
 thiserror.workspace = true
@@ -20,5 +23,4 @@ zeroize.workspace = true
 
 [dev-dependencies]
 futures = "0.3"
-rand.workspace = true
 tempfile.workspace = true

@@ -5512,6 +5512,7 @@ dependencies = [
 name = "termewnal-ssh"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "data-encoding",
  "directories",
  "futures",
@@ -5520,6 +5521,7 @@ dependencies = [
  "russh",
  "russh-sftp",
  "sha1",
+ "socket2",
  "tempfile",
  "termewnal-core",
  "termewnal-pty",

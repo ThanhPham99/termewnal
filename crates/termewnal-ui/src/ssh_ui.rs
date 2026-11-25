@@ -6,12 +6,12 @@ use std::sync::{Arc, Mutex};
 use iced::futures::SinkExt;
 use iced::widget::{button, column, container, row, space, text, text_input};
 use iced::{Alignment, Background, Border, Color, Element, Length, Task, Theme};
-use termewnal_core::{Profile, VaultSession};
+use termewnal_core::{AppConfig, Profile, VaultSession, vault::SecretStore};
 use termewnal_pty::TerminalBuffer;
 use termewnal_ssh::{
-    AgentConnector, BoxFuture, HostKeyDecision, HostKeyPrompt, InteractivePromptItem,
-    KeyboardInteractiveChallenge, OsAgentConnector, SshConnectConfig, SshError,
-    SshInteractionHandler, SshSession, SshTransport,
+    AgentConnector, BoxFuture, ConnectionSupervisor, HostKeyDecision, HostKeyPrompt,
+    InteractivePromptItem, KeyboardInteractiveChallenge, OsAgentConnector, SshConnectConfig,
+    SshInteractionHandler, SshSession, SupervisorConfig, SupervisorEvent, TransportStatus,
 };
 use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize, Zeroizing};
@@ -30,6 +30,7 @@ pub struct SshTargetSpec {
     pub profile_id: Option<String>,
     pub title: String,
     pub connect_config: SshConnectConfig,
+    pub supervisor_config: SupervisorConfig,
     pub agent_connector: Arc<dyn AgentConnector>,
     pub auto_connect_on_startup: bool,
 }
@@ -42,25 +43,39 @@ impl fmt::Debug for SshTargetSpec {
             .field("host", &self.connect_config.host)
             .field("port", &self.connect_config.port)
             .field("username", &self.connect_config.username)
+            .field("supervisor_config", &self.supervisor_config)
             .field("auto_connect_on_startup", &self.auto_connect_on_startup)
             .finish()
     }
 }
 
 impl SshTargetSpec {
-    /// Builds an [`SshTargetSpec`] from a saved SSH [`Profile`].
+    /// Builds an [`SshTargetSpec`] from a saved SSH [`Profile`] using default global keepalives.
     pub fn from_profile(
         profile: &Profile,
         cols: u16,
         rows: u16,
         scrollback_lines: usize,
-    ) -> Result<Self, SshError> {
+    ) -> Result<Self, termewnal_ssh::SshError> {
+        Self::from_profile_with_config(profile, &AppConfig::default(), cols, rows, scrollback_lines)
+    }
+
+    /// Builds an [`SshTargetSpec`] from a saved SSH [`Profile`] merged with global [`AppConfig`].
+    pub fn from_profile_with_config(
+        profile: &Profile,
+        app_config: &AppConfig,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+    ) -> Result<Self, termewnal_ssh::SshError> {
         let connect_config =
             SshConnectConfig::from_profile(profile, cols, rows, scrollback_lines)?;
+        let supervisor_config = SupervisorConfig::from_configs(app_config, profile);
         Ok(Self {
             profile_id: Some(profile.id.clone()),
             title: profile.name.clone(),
             connect_config,
+            supervisor_config,
             agent_connector: Arc::new(OsAgentConnector::default()),
             auto_connect_on_startup: profile.auto_connect_on_startup(),
         })
@@ -72,6 +87,7 @@ impl SshTargetSpec {
             profile_id: None,
             title: title.into(),
             connect_config,
+            supervisor_config: SupervisorConfig::default(),
             agent_connector: Arc::new(OsAgentConnector::default()),
             auto_connect_on_startup: false,
         }
@@ -86,6 +102,12 @@ impl SshTargetSpec {
     /// Overrides the [`AgentConnector`] implementation (primarily for isolated tests).
     pub fn with_agent_connector(mut self, connector: Arc<dyn AgentConnector>) -> Self {
         self.agent_connector = connector;
+        self
+    }
+
+    /// Overrides the [`SupervisorConfig`] keepalive, backoff, and mux attach behavior.
+    pub fn with_supervisor_config(mut self, supervisor_config: SupervisorConfig) -> Self {
+        self.supervisor_config = supervisor_config;
         self
     }
 }
@@ -131,7 +153,13 @@ pub struct MitmAlert {
 pub enum SshUiEvent {
     Connected {
         generation: u64,
-        session: Arc<SshSession>,
+        session: Option<Arc<SshSession>>,
+        supervisor: Option<ConnectionSupervisor>,
+    },
+    TransportStatus {
+        generation: u64,
+        status: TransportStatus,
+        last_error: Option<String>,
     },
     HostKeyPrompt {
         generation: u64,
@@ -159,6 +187,16 @@ impl fmt::Debug for SshUiEvent {
             Self::Connected { generation, .. } => f
                 .debug_struct("Connected")
                 .field("generation", generation)
+                .finish(),
+            Self::TransportStatus {
+                generation,
+                status,
+                last_error,
+            } => f
+                .debug_struct("TransportStatus")
+                .field("generation", generation)
+                .field("status", status)
+                .field("last_error", last_error)
                 .finish(),
             Self::HostKeyPrompt {
                 generation, prompt, ..
@@ -696,7 +734,7 @@ pub fn connect_ssh_task(
     }))
 }
 
-/// Drives an SSH connection attempt against `spec` and emits [`SshUiEvent`]s on `events_tx`.
+/// Drives a supervised SSH connection lifecycle against `spec` and emits [`SshUiEvent`]s on `events_tx`.
 pub async fn drive_ssh_connect(
     session_id: SessionId,
     generation: u64,
@@ -710,69 +748,118 @@ pub async fn drive_ssh_connect(
         events_tx: events_tx.clone(),
     });
 
-    let cfg = &spec.connect_config;
-    let transport = match SshTransport::connect(
-        cfg,
-        Some(vault.as_ref()),
+    let vault_store: Arc<dyn SecretStore> = vault;
+    let (supervisor, mut sup_rx) = ConnectionSupervisor::connect_on_buffer_with_events(
+        spec.connect_config,
+        spec.supervisor_config,
+        buffer,
+        Some(vault_store),
         interaction,
         Arc::clone(&spec.agent_connector),
-    )
-    .await
-    {
-        Ok(transport) => transport,
-        Err(SshError::HostKeyMismatch {
-            host,
-            port,
-            line,
-            key_type,
-            expected_fingerprint,
-            received_fingerprint,
-        }) => {
-            let _ = events_tx.send(SshUiEvent::MitmBlocked {
-                generation,
-                alert: MitmAlert {
-                    session_id,
-                    host,
-                    port,
-                    line,
-                    key_type,
-                    expected_fingerprint,
-                    received_fingerprint,
-                },
-            });
-            return;
-        }
-        Err(err) => {
-            let _ = events_tx.send(SshUiEvent::Disconnected {
-                generation,
-                error: Some(err.to_string()),
-            });
-            return;
-        }
-    };
+    );
 
-    match SshSession::open_on_buffer(
-        transport,
-        buffer,
-        cfg.cols,
-        cfg.rows,
-        &cfg.term_name,
-    )
-    .await
-    {
-        Ok(session) => {
-            let _ = events_tx.send(SshUiEvent::Connected {
-                generation,
-                session: Arc::new(session),
-            });
-        }
-        Err(err) => {
-            let _ = events_tx.send(SshUiEvent::Disconnected {
-                generation,
-                error: Some(err.to_string()),
-            });
+    let mut sent_initial_connected = false;
+    let mut last_disconnect_error: Option<String> = None;
+
+    while let Some(ev) = sup_rx.recv().await {
+        match ev {
+            SupervisorEvent::StatusChanged(status_ev) => {
+                if !sent_initial_connected {
+                    match status_ev.status {
+                        TransportStatus::Connecting => {}
+                        TransportStatus::Connected { .. } => {
+                            sent_initial_connected = true;
+                            let session = supervisor.current_transport().map(|transport| {
+                                Arc::new(SshSession::from_supervised(transport, &supervisor))
+                            });
+                            if events_tx
+                                .send(SshUiEvent::Connected {
+                                    generation,
+                                    session,
+                                    supervisor: Some(supervisor.clone()),
+                                })
+                                .is_err()
+                            {
+                                break;
+                            }
+                            if let TransportStatus::Connected {
+                                latency_ms: Some(_),
+                            } = status_ev.status
+                            {
+                                let _ = events_tx.send(SshUiEvent::TransportStatus {
+                                    generation,
+                                    status: status_ev.status,
+                                    last_error: status_ev.last_error,
+                                });
+                            }
+                        }
+                        TransportStatus::Disconnected => {
+                            // Initial failure handled by SupervisorEvent::Disconnected right after.
+                        }
+                        other => {
+                            let _ = events_tx.send(SshUiEvent::TransportStatus {
+                                generation,
+                                status: other,
+                                last_error: status_ev.last_error,
+                            });
+                        }
+                    }
+                } else if events_tx
+                    .send(SshUiEvent::TransportStatus {
+                        generation,
+                        status: status_ev.status,
+                        last_error: status_ev.last_error,
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            SupervisorEvent::Reconnected { .. } => {}
+            SupervisorEvent::MitmBlocked {
+                host,
+                port,
+                line,
+                key_type,
+                expected_fingerprint,
+                received_fingerprint,
+            } => {
+                let _ = events_tx.send(SshUiEvent::MitmBlocked {
+                    generation,
+                    alert: MitmAlert {
+                        session_id,
+                        host,
+                        port,
+                        line,
+                        key_type,
+                        expected_fingerprint,
+                        received_fingerprint,
+                    },
+                });
+                supervisor.disconnect();
+                return;
+            }
+            SupervisorEvent::Disconnected { error } => {
+                last_disconnect_error = error.clone();
+                if !sent_initial_connected {
+                    let _ = events_tx.send(SshUiEvent::Disconnected {
+                        generation,
+                        error,
+                    });
+                    supervisor.disconnect();
+                    return;
+                }
+            }
         }
     }
+
+    if sent_initial_connected {
+        let _ = events_tx.send(SshUiEvent::Disconnected {
+            generation,
+            error: last_disconnect_error,
+        });
+    }
+    supervisor.disconnect();
 }
 
 fn mitm_banner_style(_theme: &Theme) -> container::Style {

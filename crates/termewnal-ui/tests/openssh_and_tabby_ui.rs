@@ -101,6 +101,10 @@ Host *
             proxy_jump: Vec::new(),
             auto_connect_on_startup: false,
             tmux_reattach: None,
+            keepalive_interval_secs: None,
+            keepalive_max_missed: None,
+            auto_attach_mux: false,
+            mux_attach_command: None,
         }
     );
 

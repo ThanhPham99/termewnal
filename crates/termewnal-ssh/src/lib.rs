@@ -6,6 +6,7 @@ pub mod error;
 pub mod known_hosts;
 pub mod session;
 pub mod sftp;
+pub mod supervisor;
 pub mod transfer;
 
 pub use auth::{
@@ -13,7 +14,7 @@ pub use auth::{
     InteractivePromptItem, KeyboardInteractiveChallenge, OsAgentConnector,
     RejectAllInteractionHandler, SshInteractionHandler, authenticate_session,
 };
-pub use client::{SshClientHandler, SshConnectConfig, SshTransport};
+pub use client::{SshClientHandler, SshConnectConfig, SshTransport, TcpKeepaliveSettings};
 pub use error::SshError;
 pub use known_hosts::{
     KnownHostStatus, default_known_hosts_path, fingerprint_sha256, record_known_host,
@@ -27,6 +28,12 @@ pub use sftp::{
     RemoteListing, SftpChannelRole, SftpEndpoint, SftpManager, SftpStatusNotice, SftpTransportMode,
     TransferTransportPool, join_remote_path, open_sftp_session, parent_remote_path,
     pipelined_sftp_client_config,
+};
+pub use supervisor::{
+    ConnectionSupervisor, DEFAULT_BACKOFF_MAX, DEFAULT_BACKOFF_MIN, DEFAULT_WAKE_PROBE_TIMEOUT,
+    DefaultTransportConnector, ManualTimeSource, SupervisorConfig, SupervisorEvent,
+    SupervisorInstant, SystemTimeSource, TimeSource, TransportConnector, TransportReadySnapshot,
+    TransportStatusEvent, compute_reconnect_backoff, format_reconnected_divider,
 };
 pub use transfer::{
     DEFAULT_MAX_CONCURRENT_TRANSFERS, DEFAULT_TRANSFER_CHUNK_SIZE, DirectTransferHook,

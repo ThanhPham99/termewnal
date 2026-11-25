@@ -228,3 +228,89 @@ username = "ops"
         .unwrap();
     assert!(roundtrip.profiles[0].auto_connect_on_startup());
 }
+
+#[test]
+fn keepalive_and_mux_attach_defaults_overrides_and_backward_compat_roundtrip() {
+    let temp = TempDir::new().expect("create temp root");
+    let paths = ConfigPaths::from_root(temp.path());
+
+    // Default AppConfig uses 15s keepalive interval and 3 max missed probes.
+    let default_cfg = AppConfig::default();
+    assert_eq!(default_cfg.keepalive_interval_secs, 15);
+    assert_eq!(default_cfg.keepalive_max_missed, 3);
+
+    // Older config.toml without keepalive fields loads cleanly with (15, 3).
+    std::fs::create_dir_all(paths.config_dir()).expect("create config dir");
+    std::fs::write(paths.config_file(), "schema_version = 1\n").expect("write legacy config");
+    let compat_cfg = load_config(&paths).expect("load legacy config");
+    assert_eq!(compat_cfg.keepalive_interval_secs, 15);
+    assert_eq!(compat_cfg.keepalive_max_missed, 3);
+
+    // Explicit global keepalive settings persist and reload.
+    let mut custom_cfg = AppConfig::default();
+    custom_cfg.keepalive_interval_secs = 20;
+    custom_cfg.keepalive_max_missed = 4;
+    save_config(&paths, &custom_cfg).expect("save custom keepalive config");
+    let reloaded_cfg = load_config(&paths).expect("reload custom keepalive config");
+    assert_eq!(reloaded_cfg.keepalive_interval_secs, 20);
+    assert_eq!(reloaded_cfg.keepalive_max_missed, 4);
+
+    // Per-Profile overrides & auto_attach_mux / mux_attach_command round-trip and override global config.
+    let mut profile = Profile::ssh(
+        "Supervised Host",
+        "srv.internal",
+        2222,
+        "ops",
+        SshAuthMethod::Agent,
+    );
+    assert_eq!(profile.resolve_keepalive(&reloaded_cfg), (20, 4));
+    assert_eq!(profile.effective_mux_attach_command(), None);
+
+    profile.set_keepalive_overrides(Some(5), Some(2));
+    profile.set_mux_attach(true, Some("tmux attach -t ops || tmux new -s ops".to_string()));
+    assert_eq!(profile.resolve_keepalive(&reloaded_cfg), (5, 2));
+    assert_eq!(
+        profile.effective_mux_attach_command().as_deref(),
+        Some("tmux attach -t ops || tmux new -s ops")
+    );
+
+    let mut profiles = ProfilesConfig::default();
+    profiles.profiles.push(profile);
+    save_profiles(&paths, &profiles).expect("save profiles with keepalive and mux");
+    let loaded_profiles = load_profiles(&paths).expect("reload profiles");
+    let loaded_ssh = &loaded_profiles.profiles[0];
+    assert_eq!(loaded_ssh.resolve_keepalive(&reloaded_cfg), (5, 2));
+    assert_eq!(
+        loaded_ssh.effective_mux_attach_command().as_deref(),
+        Some("tmux attach -t ops || tmux new -s ops")
+    );
+
+    // When auto_attach_mux is disabled, effective_mux_attach_command returns None even if command is stored.
+    let mut disabled = loaded_ssh.clone();
+    disabled.set_mux_attach(false, Some("screen -xR".to_string()));
+    assert_eq!(disabled.effective_mux_attach_command(), None);
+
+    // Legacy tmux_reattach session name works when auto_attach_mux is enabled and mux_attach_command is None.
+    let tmux_legacy_toml = r#"
+schema_version = 1
+
+[[profiles]]
+id = "ssh-mux"
+name = "Mux Legacy"
+
+[profiles.target]
+kind = "ssh"
+host = "mux.internal"
+username = "ops"
+auto_attach_mux = true
+tmux_reattach = "main"
+"#;
+    let parsed_mux: ProfilesConfig =
+        toml::from_str(tmux_legacy_toml).expect("parse legacy tmux_reattach TOML");
+    assert_eq!(
+        parsed_mux.profiles[0]
+            .effective_mux_attach_command()
+            .as_deref(),
+        Some("tmux attach -t main || tmux new -s main")
+    );
+}

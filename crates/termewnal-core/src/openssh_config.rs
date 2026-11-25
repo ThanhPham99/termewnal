@@ -213,6 +213,10 @@ pub fn clone_openssh_host_to_profile(host: &OpenSshHost, default_username: &str)
             proxy_jump: host.proxy_jump.clone(),
             auto_connect_on_startup: false,
             tmux_reattach: None,
+            keepalive_interval_secs: None,
+            keepalive_max_missed: None,
+            auto_attach_mux: false,
+            mux_attach_command: None,
         },
         tunnels: Vec::new(),
     }

@@ -191,6 +191,10 @@ Host agent-box
             proxy_jump: vec!["bastion".to_string(), "jump2:2202".to_string()],
             auto_connect_on_startup: false,
             tmux_reattach: None,
+            keepalive_interval_secs: None,
+            keepalive_max_missed: None,
+            auto_attach_mux: false,
+            mux_attach_command: None,
         }
     );
 
@@ -206,6 +210,10 @@ Host agent-box
             proxy_jump: Vec::new(),
             auto_connect_on_startup: false,
             tmux_reattach: None,
+            keepalive_interval_secs: None,
+            keepalive_max_missed: None,
+            auto_attach_mux: false,
+            mux_attach_command: None,
         }
     );
 
@@ -338,6 +346,10 @@ unknownPluginBlock:
             proxy_jump: Vec::new(),
             auto_connect_on_startup: false,
             tmux_reattach: None,
+            keepalive_interval_secs: None,
+            keepalive_max_missed: None,
+            auto_attach_mux: false,
+            mux_attach_command: None,
         }
     );
 
@@ -358,6 +370,10 @@ unknownPluginBlock:
             proxy_jump: vec!["jump@bastion.prod.example:2222".to_string()],
             auto_connect_on_startup: false,
             tmux_reattach: None,
+            keepalive_interval_secs: None,
+            keepalive_max_missed: None,
+            auto_attach_mux: false,
+            mux_attach_command: None,
         }
     );
     assert_eq!(app.tunnels.len(), 3);

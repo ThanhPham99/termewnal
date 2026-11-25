@@ -363,6 +363,10 @@ pub fn parse_tabby_config_str(
                         proxy_jump,
                         auto_connect_on_startup: false,
                         tmux_reattach: None,
+                        keepalive_interval_secs: None,
+                        keepalive_max_missed: None,
+                        auto_attach_mux: false,
+                        mux_attach_command: None,
                     },
                     tunnels,
                 });
@@ -959,6 +963,10 @@ fn targets_match_ignoring_secret_refs(a: &ProfileTarget, b: &ProfileTarget) -> b
                 proxy_jump: pj1,
                 auto_connect_on_startup: ac1,
                 tmux_reattach: tr1,
+                keepalive_interval_secs: ki1,
+                keepalive_max_missed: km1,
+                auto_attach_mux: am1,
+                mux_attach_command: mc1,
             },
             ProfileTarget::Ssh {
                 host: h2,
@@ -968,6 +976,10 @@ fn targets_match_ignoring_secret_refs(a: &ProfileTarget, b: &ProfileTarget) -> b
                 proxy_jump: pj2,
                 auto_connect_on_startup: ac2,
                 tmux_reattach: tr2,
+                keepalive_interval_secs: ki2,
+                keepalive_max_missed: km2,
+                auto_attach_mux: am2,
+                mux_attach_command: mc2,
             },
         ) => {
             h1 == h2
@@ -976,6 +988,10 @@ fn targets_match_ignoring_secret_refs(a: &ProfileTarget, b: &ProfileTarget) -> b
                 && pj1 == pj2
                 && ac1 == ac2
                 && tr1 == tr2
+                && ki1 == ki2
+                && km1 == km2
+                && am1 == am2
+                && mc1 == mc2
                 && auth_methods_equivalent(auth1, auth2)
         }
         _ => false,

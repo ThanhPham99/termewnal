@@ -74,6 +74,7 @@ pub struct TransferSummaryHook {
 pub enum StatusBarAction {
     ToggleSidebar,
     OpenCommandPalette,
+    ProbeAll,
     ReconnectSession(SessionId),
     CancelReconnect(SessionId),
     ToggleTunnelsView,
@@ -194,6 +195,19 @@ impl StatusBarSnapshot {
         })
     }
 
+    /// Returns `true` when clicking the Transport health indicator or Probe control can probe/reconnect.
+    pub fn shows_probe_control(&self) -> bool {
+        self.active_session.as_ref().is_some_and(|session| {
+            session.kind == SessionKindLabel::Ssh
+                && matches!(
+                    session.transport_status,
+                    TransportStatus::Connected { .. }
+                        | TransportStatus::Degraded { .. }
+                        | TransportStatus::Reconnecting { .. }
+                )
+        })
+    }
+
     /// Formats the `Tunnel` summary badge text.
     pub fn tunnels_text(&self) -> String {
         if self.tunnels.total == 0
@@ -292,13 +306,23 @@ pub fn render_status_bar(
         _ => Color::from_rgb8(203, 213, 225),
     };
 
-    let mut right = row![
-        text(snapshot.transport_text())
-            .size(11)
-            .color(transport_color),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
+    let transport_label = text(snapshot.transport_text())
+        .size(11)
+        .color(transport_color);
+    let transport_widget: Element<'static, Message, Theme, iced::Renderer> =
+        if snapshot.shows_probe_control() {
+            button(transport_label)
+                .padding([2, 6])
+                .style(button::subtle)
+                .on_press(Message::StatusBarAction(StatusBarAction::ProbeAll))
+                .into()
+        } else {
+            transport_label.into()
+        };
+
+    let mut right = row![transport_widget]
+        .spacing(6)
+        .align_y(Alignment::Center);
 
     if snapshot.shows_reconnect_controls()
         && let Some(session) = &snapshot.active_session
