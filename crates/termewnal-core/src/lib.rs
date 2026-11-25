@@ -3,6 +3,7 @@
 pub mod config;
 pub mod error;
 pub mod hot_reload;
+pub mod layout;
 pub mod profile;
 mod storage;
 pub mod theme;
@@ -17,6 +18,10 @@ pub use hot_reload::{
     ConfigFileKind, ConfigReloader, ConfigWatchEvent, ConfigWatcher, DEFAULT_RELOAD_DEBOUNCE,
     RestoredSnapshot, TomlReloadError, reload_config_snapshot, reload_profiles_snapshot,
     restore_from_backup,
+};
+pub use layout::{
+    LayoutSplitAxis, LayoutSplitNode, SessionDescriptor, TabLayout, WindowLayout, WorkspaceLayout,
+    load_layout, save_layout,
 };
 pub use profile::{
     Profile, ProfileTarget, ProfilesConfig, SshAuthMethod, TunnelDirection, TunnelRule,

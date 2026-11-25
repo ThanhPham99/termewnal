@@ -21,6 +21,7 @@ data-encoding = "2.3"
 directories = "6.0"
 hmac = "0.13"
 iced = { version = "0.14", features = ["tokio", "advanced", "svg", "image", "sysinfo", "sipper"] }
+interprocess = { version = "2.4", features = ["tokio"] }
 keyring = "4.2"
 keyring-core = "1.1"
 notify = { version = "9.0", features = ["tokio"] }

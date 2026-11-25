@@ -84,18 +84,18 @@ impl Profile {
         }
     }
 
-    /// Returns `true` if this `Profile` is configured to connect automatically on workspace restore.
+    /// Returns whether this `Profile` is configured to auto-connect on startup (SSH targets only).
     pub fn auto_connect_on_startup(&self) -> bool {
         match &self.target {
-            ProfileTarget::LocalShell { .. } => false,
             ProfileTarget::Ssh {
                 auto_connect_on_startup,
                 ..
             } => *auto_connect_on_startup,
+            ProfileTarget::LocalShell { .. } => false,
         }
     }
 
-    /// Sets whether an SSH `Profile` connects automatically when restored on startup.
+    /// Sets `auto_connect_on_startup` on SSH `Profile`s (no-op for local shell profiles).
     pub fn set_auto_connect_on_startup(&mut self, enabled: bool) {
         if let ProfileTarget::Ssh {
             auto_connect_on_startup,

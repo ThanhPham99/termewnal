@@ -9,6 +9,7 @@ use alacritty_terminal::index::Side;
 use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, CursorShape};
+use alacritty_terminal::vte::{Parser as VteParser, Perform};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -233,10 +234,13 @@ impl Write for SharedPtyWriter {
 /// Active local shell PTY backed by `portable-pty` and a shared [`TerminalBuffer`].
 pub struct PtySession {
     shell: ShellSpec,
+    child_pid: Option<u32>,
     master: Mutex<Box<dyn MasterPty + Send>>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     buffer: Arc<TerminalBuffer>,
+    last_working_dir: Arc<Mutex<Option<PathBuf>>>,
+    osc7_working_dir: Arc<Mutex<Option<PathBuf>>>,
 }
 
 impl PtySession {
@@ -268,6 +272,7 @@ impl PtySession {
                 program: config.shell.program.clone(),
                 reason: err.to_string(),
             })?;
+        let child_pid = child.process_id();
 
         // CRITICAL ON UNIX: Drop slave in parent immediately so reader receives EOF when child exits.
         drop(pair.slave);
@@ -291,15 +296,27 @@ impl PtySession {
             config.cursor_shape,
         ));
         buffer.set_write_sink(Some(Box::new(SharedPtyWriter(Arc::clone(&writer)))));
+        let last_working_dir = Arc::new(Mutex::new(config.working_dir.clone()));
+        let osc7_working_dir = Arc::new(Mutex::new(None));
 
-        spawn_reader_thread(reader, child, Arc::clone(&buffer));
+        spawn_reader_thread(
+            reader,
+            child,
+            child_pid,
+            Arc::clone(&buffer),
+            Arc::clone(&last_working_dir),
+            Arc::clone(&osc7_working_dir),
+        );
 
         Ok(Self {
             shell: config.shell,
+            child_pid,
             master: Mutex::new(pair.master),
             writer,
             killer: Mutex::new(killer),
             buffer,
+            last_working_dir,
+            osc7_working_dir,
         })
     }
 
@@ -311,6 +328,42 @@ impl PtySession {
     /// Returns the shared [`TerminalBuffer`] backing this session.
     pub fn buffer(&self) -> &Arc<TerminalBuffer> {
         &self.buffer
+    }
+
+    /// Captures the current working directory of this local shell `Session`.
+    ///
+    /// On Linux, queries `/proc/<pid>/cwd` for the live shell (or foreground process group leader)
+    /// and caches the result, falling back to OSC 7 reports or the last retained directory once
+    /// the child exits.
+    pub fn current_working_dir(&self) -> Option<PathBuf> {
+        let exited = self.buffer.is_exited();
+
+        if !exited {
+            let fg_pid = self
+                .master
+                .lock()
+                .ok()
+                .and_then(|master| master.process_group_leader())
+                .and_then(|pid| u32::try_from(pid).ok());
+
+            if let Some(cwd) = read_proc_cwd(self.child_pid).or_else(|| read_proc_cwd(fg_pid)) {
+                if let Ok(mut guard) = self.last_working_dir.lock() {
+                    *guard = Some(cwd.clone());
+                }
+                return Some(cwd);
+            }
+        }
+
+        if let Ok(guard) = self.osc7_working_dir.lock()
+            && let Some(cwd) = guard.clone()
+        {
+            return Some(cwd);
+        }
+
+        self.last_working_dir
+            .lock()
+            .ok()
+            .and_then(|guard| guard.clone())
     }
 
     /// Takes the async event receiver once for driving an external event loop or UI subscription.
@@ -463,11 +516,18 @@ impl Drop for PtySession {
 fn spawn_reader_thread(
     mut reader: Box<dyn Read + Send>,
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    child_pid: Option<u32>,
     buffer: Arc<TerminalBuffer>,
+    last_working_dir: Arc<Mutex<Option<PathBuf>>>,
+    osc7_working_dir: Arc<Mutex<Option<PathBuf>>>,
 ) {
     thread::Builder::new()
         .name("termewnal-pty-reader".to_string())
         .spawn(move || {
+            let mut osc7_parser = VteParser::new();
+            let mut osc7_tracker = Osc7Tracker {
+                osc7_working_dir: Arc::clone(&osc7_working_dir),
+            };
             let mut buf = [0_u8; 8192];
 
             loop {
@@ -477,7 +537,13 @@ fn spawn_reader_thread(
                         break;
                     }
                     Ok(n) => {
+                        osc7_parser.advance(&mut osc7_tracker, &buf[..n]);
                         buffer.feed_bytes(&buf[..n]);
+                        if let Some(cwd) = read_proc_cwd(child_pid)
+                            && let Ok(mut guard) = last_working_dir.lock()
+                        {
+                            *guard = Some(cwd);
+                        }
                     }
                     Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
                     Err(err) => {
@@ -498,4 +564,79 @@ fn spawn_reader_thread(
             buffer.mark_exited(exit_code);
         })
         .expect("spawn PTY reader thread");
+}
+
+struct Osc7Tracker {
+    osc7_working_dir: Arc<Mutex<Option<PathBuf>>>,
+}
+
+impl Perform for Osc7Tracker {
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.len() >= 2
+            && params[0] == b"7"
+            && let Ok(uri) = std::str::from_utf8(params[1])
+            && let Some(path) = parse_osc7_path(uri)
+            && let Ok(mut guard) = self.osc7_working_dir.lock()
+        {
+            *guard = Some(path);
+        }
+    }
+}
+
+fn parse_osc7_path(raw: &str) -> Option<PathBuf> {
+    let trimmed = raw.trim();
+    let encoded_path = if let Some(rest) = trimmed.strip_prefix("file://") {
+        if rest.starts_with('/') {
+            rest
+        } else {
+            let idx = rest.find('/')?;
+            &rest[idx..]
+        }
+    } else if trimmed.starts_with('/') {
+        trimmed
+    } else {
+        return None;
+    };
+
+    let decoded = percent_decode(encoded_path);
+    (!decoded.is_empty()).then(|| PathBuf::from(decoded))
+}
+
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn read_proc_cwd(pid: Option<u32>) -> Option<PathBuf> {
+    let pid = pid?;
+    std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_proc_cwd(_pid: Option<u32>) -> Option<PathBuf> {
+    None
 }

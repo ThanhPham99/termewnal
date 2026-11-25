@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use crate::app::SessionId;
 
 /// Minimum allowed split ratio (`first` fraction).
@@ -470,14 +473,52 @@ impl WorkspaceTab {
     }
 }
 
+/// Shared atomic ID allocator ensuring `TabId`, `PaneId`, and `SplitId` remain unique across windows.
+#[derive(Debug, Clone)]
+pub struct WorkspaceIds {
+    next_tab_id: Arc<AtomicU64>,
+    next_pane_id: Arc<AtomicU64>,
+    next_split_id: Arc<AtomicU64>,
+}
+
+impl Default for WorkspaceIds {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl WorkspaceIds {
+    /// Creates a fresh ID allocator starting at 1 for each ID kind.
+    pub fn new() -> Self {
+        Self {
+            next_tab_id: Arc::new(AtomicU64::new(1)),
+            next_pane_id: Arc::new(AtomicU64::new(1)),
+            next_split_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    /// Allocates the next globally unique [`TabId`].
+    pub fn alloc_tab_id(&self) -> TabId {
+        TabId(self.next_tab_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Allocates the next globally unique [`PaneId`].
+    pub fn alloc_pane_id(&self) -> PaneId {
+        PaneId(self.next_pane_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    /// Allocates the next globally unique [`SplitId`].
+    pub fn alloc_split_id(&self) -> SplitId {
+        SplitId(self.next_split_id.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// Multi-tab workspace layout manager tracking tab order, active selection, and IDs.
 #[derive(Debug, Clone)]
 pub struct Workspace {
     tabs: Vec<WorkspaceTab>,
     active_tab: Option<TabId>,
-    next_tab_id: u64,
-    next_pane_id: u64,
-    next_split_id: u64,
+    ids: WorkspaceIds,
 }
 
 impl Default for Workspace {
@@ -487,15 +528,23 @@ impl Default for Workspace {
 }
 
 impl Workspace {
-    /// Creates an empty [`Workspace`] with no tabs.
+    /// Creates an empty [`Workspace`] with no tabs and an isolated ID allocator.
     pub fn new() -> Self {
+        Self::with_ids(WorkspaceIds::new())
+    }
+
+    /// Creates an empty [`Workspace`] sharing `ids` across multiple windows.
+    pub fn with_ids(ids: WorkspaceIds) -> Self {
         Self {
             tabs: Vec::new(),
             active_tab: None,
-            next_tab_id: 1,
-            next_pane_id: 1,
-            next_split_id: 1,
+            ids,
         }
+    }
+
+    /// Returns the shared [`WorkspaceIds`] allocator backing this workspace.
+    pub fn ids(&self) -> &WorkspaceIds {
+        &self.ids
     }
 
     /// Returns the number of open workspace tabs.
@@ -511,6 +560,40 @@ impl Workspace {
     /// Returns tab IDs in display order.
     pub fn tab_ids(&self) -> Vec<TabId> {
         self.tabs.iter().map(|t| t.id).collect()
+    }
+
+    /// Returns all `SessionId`s hosted across every tab and pane in this workspace.
+    pub fn session_ids(&self) -> Vec<SessionId> {
+        self.tabs
+            .iter()
+            .flat_map(|t| t.root.session_ids())
+            .collect()
+    }
+
+    /// Returns `true` if `tab_id` belongs to this workspace.
+    pub fn contains_tab(&self, tab_id: TabId) -> bool {
+        self.tabs.iter().any(|t| t.id == tab_id)
+    }
+
+    /// Returns `true` if `pane_id` exists in any tab of this workspace.
+    pub fn contains_pane(&self, pane_id: PaneId) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| t.root.session_for_pane(pane_id).is_some())
+    }
+
+    /// Returns `true` if `split_id` exists in any tab of this workspace.
+    pub fn contains_split(&self, split_id: SplitId) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| t.root.find_split(split_id).is_some())
+    }
+
+    /// Returns `true` if `session_id` exists in any tab of this workspace.
+    pub fn contains_session(&self, session_id: SessionId) -> bool {
+        self.tabs
+            .iter()
+            .any(|t| t.root.pane_for_session(session_id).is_some())
     }
 
     /// Returns the currently active `TabId`, if any tab is open.
@@ -535,10 +618,8 @@ impl Workspace {
 
     /// Creates a new tab hosting `session_id` and activates it, returning `(TabId, PaneId)`.
     pub fn create_tab(&mut self, session_id: SessionId, title: Option<String>) -> (TabId, PaneId) {
-        let tab_id = TabId(self.next_tab_id);
-        self.next_tab_id += 1;
-        let pane_id = PaneId(self.next_pane_id);
-        self.next_pane_id += 1;
+        let tab_id = self.ids.alloc_tab_id();
+        let pane_id = self.ids.alloc_pane_id();
 
         self.tabs.push(WorkspaceTab {
             id: tab_id,
@@ -553,6 +634,36 @@ impl Workspace {
         });
         self.active_tab = Some(tab_id);
         (tab_id, pane_id)
+    }
+
+    /// Inserts a pre-built split tree as a restored tab and returns its allocated [`TabId`].
+    pub fn restore_tab(
+        &mut self,
+        title: Option<String>,
+        root: SplitNode,
+        focused_pane: PaneId,
+        zoomed_pane: Option<PaneId>,
+    ) -> TabId {
+        let tab_id = self.ids.alloc_tab_id();
+        self.tabs.push(WorkspaceTab {
+            id: tab_id,
+            title,
+            root,
+            focused_pane,
+            zoomed_pane,
+            broadcast_input: false,
+        });
+        if self.active_tab.is_none() {
+            self.active_tab = Some(tab_id);
+        }
+        tab_id
+    }
+
+    /// Sets the active tab by 0-based tab index (clamped when non-empty).
+    pub fn set_active_tab_index(&mut self, idx: usize) {
+        if let Some(tab) = self.tabs.get(idx).or_else(|| self.tabs.last()) {
+            self.active_tab = Some(tab.id);
+        }
     }
 
     /// Activates the tab identified by `tab_id`, returning `true` if it exists.
@@ -636,8 +747,8 @@ impl Workspace {
         axis: SplitAxis,
         new_session_id: SessionId,
     ) -> Option<(SplitId, PaneId)> {
-        let split_id = SplitId(self.next_split_id);
-        let pane_id = PaneId(self.next_pane_id);
+        let split_id = self.ids.alloc_split_id();
+        let pane_id = self.ids.alloc_pane_id();
         let tab = self.tab_mut(tab_id)?;
         if !tab
             .root
@@ -647,8 +758,6 @@ impl Workspace {
         }
         tab.focused_pane = pane_id;
         tab.zoomed_pane = None;
-        self.next_split_id += 1;
-        self.next_pane_id += 1;
         Some((split_id, pane_id))
     }
 

@@ -157,6 +157,15 @@ impl TerminalBuffer {
         let _ = self.events_tx.send(PtyEvent::Exited(exit_code));
     }
 
+    /// Returns `true` once [`Self::mark_exited`] has recorded stream termination.
+    pub fn is_exited(&self) -> bool {
+        self.update_signal
+            .0
+            .lock()
+            .map(|state| state.1)
+            .unwrap_or(false)
+    }
+
     /// Takes the async event receiver once for driving an external event loop or UI subscription.
     pub fn take_event_receiver(&self) -> Option<mpsc::UnboundedReceiver<PtyEvent>> {
         self.events_rx.lock().ok()?.take()

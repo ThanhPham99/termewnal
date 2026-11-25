@@ -1,7 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use iced::futures::{SinkExt, Stream};
@@ -14,23 +14,31 @@ use iced::{
     clipboard, event, window,
 };
 use termewnal_core::{
-    AppConfig, ConfigFileKind, ConfigPaths, ConfigWatchEvent, ConfigWatcher, Profile,
-    ProfileTarget, ProfilesConfig, SshAuthMethod, TerminalConfig, ThemePalette, TomlReloadError,
-    VaultBackend, VaultSession, ensure_config_files,
+    AppConfig, CURRENT_SCHEMA_VERSION, ConfigFileKind, ConfigPaths, ConfigWatchEvent,
+    ConfigWatcher, LayoutSplitAxis, LayoutSplitNode, Profile, ProfileTarget, ProfilesConfig,
+    SessionDescriptor, SshAuthMethod, TabLayout, TerminalConfig, ThemePalette, TomlReloadError,
+    VaultBackend, VaultSession, WindowLayout, WorkspaceLayout, ensure_config_files, load_layout,
+    save_layout,
 };
 use termewnal_pty::{
     GridSearchMatch, PtyEvent, PtySession, PtySpawnConfig, Scroll, SelectionType, ShellSpec, Side,
     TerminalBuffer, TerminalSnapshot, detect_default_shell,
 };
 use termewnal_ssh::{OsAgentConnector, SshConnectConfig, SshSession, TransportStatus};
-use tracing::error;
+use tokio::sync::mpsc;
+use tracing::{error, warn};
 use zeroize::Zeroize;
 
+use crate::close_guard::{
+    BackgroundWorkSource, BackgroundWorkTracker, CloseGuardState, DaemonLifecycle,
+    wrap_with_close_guard_modal,
+};
 use crate::command_palette::{
     CommandPaletteMode, CommandPaletteState, PaletteAction, PaletteItem, PaletteSessionEntry,
     QuickConnectTarget, command_palette_input_id, quick_connect_input_id, render_command_palette,
 };
 use crate::config_reload_ui::ConfigReloadUiState;
+use crate::ipc::{IpcCommand, IpcServerHandle};
 use crate::sidebar::{
     ActiveTunnelEntry, SidebarSection, SidebarState, SystemSshProfile, render_sidebar,
 };
@@ -48,7 +56,7 @@ use crate::terminal_ergonomics::{
 use crate::terminal_widget::{TerminalViewOptions, TerminalViewport};
 use crate::workspace::{
     ClosePaneOutcome, CycleDirection, FocusDirection, PaneId, SplitAxis, SplitId, SplitNode,
-    TabId, Workspace, WorkspaceTab,
+    TabId, Workspace, WorkspaceIds, WorkspaceTab,
 };
 
 /// Injectable OS URL-launcher boundary (`open::that_detached` by default).
@@ -234,6 +242,7 @@ impl SshSessionSlot {
 pub struct LocalSession {
     id: SessionId,
     profile_id: Option<String>,
+    initial_working_dir: Option<PathBuf>,
     title: String,
     pty: Arc<PtySession>,
     snapshot: Arc<TerminalSnapshot>,
@@ -283,30 +292,50 @@ impl LocalSession {
     }
 }
 
-enum SessionRecord {
+/// Runtime descriptor for a restored or configured remote SSH `Session`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteSession {
+    pub id: SessionId,
+    pub profile_id: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub title: String,
+    pub transport_status: TransportStatus,
+    pub auto_connect_on_startup: bool,
+    pub connect_requested: bool,
+}
+
+/// Connection intent emitted for a remote SSH `Session` (consumed by SSH supervisor wiring).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteConnectIntent {
+    pub session_id: SessionId,
+    pub profile_id: Option<String>,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+}
+
+enum SessionEntry {
     Local(LocalSession),
+    Remote(RemoteSession),
     Ssh(SshSessionSlot),
 }
 
-impl SessionRecord {
+impl SessionEntry {
     fn title(&self) -> &str {
         match self {
             Self::Local(s) => &s.title,
+            Self::Remote(s) => &s.title,
             Self::Ssh(s) => &s.title,
         }
     }
 
-    fn exited(&self) -> Option<Option<i32>> {
+    fn buffer(&self) -> Option<&Arc<TerminalBuffer>> {
         match self {
-            Self::Local(s) => s.exited,
-            Self::Ssh(s) => s.exited,
-        }
-    }
-
-    fn buffer(&self) -> &Arc<TerminalBuffer> {
-        match self {
-            Self::Local(s) => s.pty.buffer(),
-            Self::Ssh(s) => &s.buffer,
+            Self::Local(s) => Some(s.pty.buffer()),
+            Self::Ssh(s) => Some(&s.buffer),
+            Self::Remote(_) => None,
         }
     }
 
@@ -314,13 +343,28 @@ impl SessionRecord {
         match self {
             Self::Local(s) => s.snapshot = Arc::new(s.pty.snapshot()),
             Self::Ssh(s) => s.snapshot = Arc::new(s.buffer.snapshot()),
+            Self::Remote(_) => {}
+        }
+    }
+
+    fn as_local(&self) -> Option<&LocalSession> {
+        match self {
+            Self::Local(s) => Some(s),
+            Self::Remote(_) | Self::Ssh(_) => None,
+        }
+    }
+
+    fn as_remote(&self) -> Option<&RemoteSession> {
+        match self {
+            Self::Remote(s) => Some(s),
+            Self::Local(_) | Self::Ssh(_) => None,
         }
     }
 
     fn as_ssh(&self) -> Option<&SshSessionSlot> {
         match self {
-            Self::Local(_) => None,
             Self::Ssh(s) => Some(s),
+            Self::Local(_) | Self::Remote(_) => None,
         }
     }
 }
@@ -330,7 +374,15 @@ impl SessionRecord {
 pub enum Message {
     WindowOpened(window::Id),
     WindowClosed(window::Id),
+    WindowFocused(window::Id),
+    WindowResized(window::Id, Size),
     CloseRequested(window::Id),
+    NewWindow,
+    IpcCommand(IpcCommand),
+    InWindow {
+        window_id: window::Id,
+        inner: Box<Message>,
+    },
     TerminalInput {
         session_id: SessionId,
         bytes: Vec<u8>,
@@ -434,6 +486,11 @@ pub enum Message {
     TogglePaneZoom,
     ToggleBroadcastInput,
     SetBroadcastInput(bool),
+    CloseGuardCancel,
+    CloseGuardKeepRunningInBackground,
+    CloseGuardStopAndQuit,
+    ConnectRemoteSession(SessionId),
+    SaveWorkspaceLayout,
     ToggleSidebar,
     SetSidebarOpen(bool),
     SidebarFilterChanged(String),
@@ -493,6 +550,12 @@ pub enum Message {
     StatusBarAction(StatusBarAction),
 }
 
+struct WindowState {
+    workspace: Workspace,
+    width: u32,
+    height: u32,
+}
+
 /// Top-level Elm application state for Termewnal.
 pub struct AppState {
     paths: ConfigPaths,
@@ -502,13 +565,25 @@ pub struct AppState {
     reload_ui: ConfigReloadUiState,
     ssh_ui: SshUiState,
     windows: BTreeSet<window::Id>,
-    sessions: BTreeMap<SessionId, SessionRecord>,
-    workspace: Workspace,
+    window_workspaces: BTreeMap<window::Id, WindowState>,
+    pending_windows: VecDeque<WindowState>,
+    retired_final_window: Option<(window::Id, WindowState)>,
+    empty_workspace: Workspace,
+    active_window: Option<window::Id>,
+    workspace_ids: WorkspaceIds,
+    sessions: BTreeMap<SessionId, SessionEntry>,
+    pending_remote_connects: Vec<RemoteConnectIntent>,
     sidebar: SidebarState,
     command_palette: CommandPaletteState,
     status_bar: StatusBarState,
     next_session_id: u64,
     last_error: Option<String>,
+    background_work_tracker: Arc<BackgroundWorkTracker>,
+    background_work_source: Arc<dyn BackgroundWorkSource>,
+    close_guard: CloseGuardState,
+    lifecycle: DaemonLifecycle,
+    ipc_handle: Option<IpcServerHandle>,
+    ipc_rx: Option<Arc<Mutex<Option<mpsc::UnboundedReceiver<IpcCommand>>>>>,
     search: SearchBarState,
     pending_paste: Option<PendingPaste>,
     last_copied: Option<String>,
@@ -516,28 +591,59 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// Boots the desktop daemon with XDG paths and opens the initial GUI window.
+    /// Boots the desktop daemon with XDG paths and opens the initial GUI window(s).
     pub fn boot_daemon() -> (Self, Task<Message>) {
         let paths = ConfigPaths::detect_xdg()
             .unwrap_or_else(|_| ConfigPaths::from_root(std::env::temp_dir().join("termewnal")));
-        let state = Self::boot_with_paths(paths).unwrap_or_else(|err| {
+        Self::boot_daemon_with_ipc(paths, None)
+    }
+
+    /// Boots the desktop daemon with explicit `paths` and an optional primary [`IpcServerHandle`].
+    pub fn boot_daemon_with_ipc(
+        paths: ConfigPaths,
+        ipc_handle: Option<IpcServerHandle>,
+    ) -> (Self, Task<Message>) {
+        let mut state = Self::boot_with_paths(paths).unwrap_or_else(|err| {
             error!(error = %err, "failed to boot AppState");
             panic!("failed to initialize Termewnal: {err}");
         });
+        if let Some(handle) = ipc_handle {
+            state.attach_ipc(handle);
+        }
 
-        let (_win_id, open_task) = window::open(window::Settings {
-            exit_on_close_request: false,
-            size: Size::new(
-                state.config.window.width as f32,
-                state.config.window.height as f32,
-            ),
-            ..window::Settings::default()
-        });
+        let mut tasks = state.open_pending_windows();
 
-        (state, open_task.map(Message::WindowOpened))
+        for intent in &state.pending_remote_connects {
+            tasks.push(Task::done(Message::ConnectRemoteSession(intent.session_id)));
+        }
+
+        (state, Task::batch(tasks))
     }
 
-    /// Initializes configuration files under `paths` and spawns the initial local shell `Session`.
+    fn open_pending_windows(&mut self) -> Vec<Task<Message>> {
+        let mut tasks = Vec::new();
+        while let Some(win_state) = self.pending_windows.pop_front() {
+            let (win_id, open_task) = window::open(window::Settings {
+                exit_on_close_request: false,
+                size: Size::new(win_state.width as f32, win_state.height as f32),
+                ..window::Settings::default()
+            });
+            self.windows.insert(win_id);
+            self.window_workspaces.insert(win_id, win_state);
+            self.active_window = Some(win_id);
+            tasks.push(open_task.map(Message::WindowOpened));
+        }
+        tasks
+    }
+
+    fn close_window_sessions(&mut self, win_state: WindowState) {
+        for sid in win_state.workspace.session_ids() {
+            self.remove_session(sid);
+        }
+    }
+
+    /// Initializes configuration files under `paths` and restores `layout.toml` (or spawns a
+    /// default local shell `Session` when no persisted layout exists).
     pub fn boot_with_paths(paths: ConfigPaths) -> Result<Self, String> {
         let (config, profiles) =
             ensure_config_files(&paths).map_err(|err| format!("failed to load config: {err}"))?;
@@ -562,6 +668,10 @@ impl AppState {
         profiles: ProfilesConfig,
         vault: Arc<VaultSession>,
     ) -> Result<Self, String> {
+        let tracker = Arc::new(BackgroundWorkTracker::new());
+        let source: Arc<dyn BackgroundWorkSource> =
+            Arc::clone(&tracker) as Arc<dyn BackgroundWorkSource>;
+        let workspace_ids = WorkspaceIds::new();
         let mut state = Self {
             paths,
             config,
@@ -570,21 +680,44 @@ impl AppState {
             reload_ui: ConfigReloadUiState::default(),
             ssh_ui: SshUiState::default(),
             windows: BTreeSet::new(),
+            window_workspaces: BTreeMap::new(),
+            pending_windows: VecDeque::new(),
+            retired_final_window: None,
+            empty_workspace: Workspace::with_ids(workspace_ids.clone()),
+            active_window: None,
+            workspace_ids,
             sessions: BTreeMap::new(),
-            workspace: Workspace::new(),
+            pending_remote_connects: Vec::new(),
             sidebar: SidebarState::new(),
             command_palette: CommandPaletteState::new(),
             status_bar: StatusBarState::new(),
             next_session_id: 1,
             last_error: None,
+            background_work_tracker: tracker,
+            background_work_source: source,
+            close_guard: CloseGuardState::Idle,
+            lifecycle: DaemonLifecycle::Active,
+            ipc_handle: None,
+            ipc_rx: None,
             search: SearchBarState::default(),
             pending_paste: None,
             last_copied: None,
             url_opener: Arc::new(open_url_with_system),
         };
 
-        let initial_session = state.spawn_default_local_session()?;
-        state.workspace.create_tab(initial_session, None);
+        let restored = match load_layout(&state.paths) {
+            Ok(layout) if !layout.windows.is_empty() => state.restore_from_layout(&layout)?,
+            Ok(_) => false,
+            Err(err) => {
+                warn!(error = %err, "failed to load saved layout.toml; starting fresh workspace");
+                state.last_error = Some(format!("failed to restore workspace layout: {err}"));
+                false
+            }
+        };
+
+        if !restored {
+            state.push_default_pending_window()?;
+        }
         Ok(state)
     }
 
@@ -592,6 +725,189 @@ impl AppState {
     pub fn with_url_opener(mut self, opener: UrlOpener) -> Self {
         self.url_opener = opener;
         self
+    }
+
+    fn push_default_pending_window(&mut self) -> Result<(), String> {
+        let mut workspace = Workspace::with_ids(self.workspace_ids.clone());
+        let initial_session = self.spawn_default_local_session()?;
+        workspace.create_tab(initial_session, None);
+        self.pending_windows.push_back(WindowState {
+            workspace,
+            width: self.config.window.width,
+            height: self.config.window.height,
+        });
+        Ok(())
+    }
+
+    fn restore_from_layout(&mut self, layout: &WorkspaceLayout) -> Result<bool, String> {
+        let mut restored_any = false;
+        for win_layout in &layout.windows {
+            if win_layout.tabs.is_empty() {
+                continue;
+            }
+            let mut workspace = Workspace::with_ids(self.workspace_ids.clone());
+            for tab_layout in &win_layout.tabs {
+                let mut leaf_panes = Vec::new();
+                let root = self.restore_split_node(&tab_layout.root, &mut leaf_panes)?;
+                let Some(&first_pane) = leaf_panes.first() else {
+                    continue;
+                };
+                let focused_pane = leaf_panes
+                    .get(tab_layout.focused_pane)
+                    .copied()
+                    .unwrap_or(first_pane);
+                let zoomed_pane = tab_layout
+                    .zoomed_pane
+                    .and_then(|idx| leaf_panes.get(idx).copied());
+                workspace.restore_tab(tab_layout.title.clone(), root, focused_pane, zoomed_pane);
+            }
+            if workspace.tab_count() == 0 {
+                continue;
+            }
+            workspace.set_active_tab_index(win_layout.active_tab);
+            self.pending_windows.push_back(WindowState {
+                workspace,
+                width: win_layout.width.max(200),
+                height: win_layout.height.max(150),
+            });
+            restored_any = true;
+        }
+        Ok(restored_any)
+    }
+
+    fn restore_split_node(
+        &mut self,
+        node: &LayoutSplitNode,
+        leaf_panes: &mut Vec<PaneId>,
+    ) -> Result<SplitNode, String> {
+        match node {
+            LayoutSplitNode::Leaf { session } => {
+                let session_id = self.restore_session_descriptor(session)?;
+                let pane_id = self.workspace_ids.alloc_pane_id();
+                leaf_panes.push(pane_id);
+                Ok(SplitNode::Leaf {
+                    pane_id,
+                    session_id,
+                })
+            }
+            LayoutSplitNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+            } => {
+                let first_node = self.restore_split_node(first, leaf_panes)?;
+                let second_node = self.restore_split_node(second, leaf_panes)?;
+                let split_id = self.workspace_ids.alloc_split_id();
+                let ui_axis = match axis {
+                    LayoutSplitAxis::Horizontal => SplitAxis::Horizontal,
+                    LayoutSplitAxis::Vertical => SplitAxis::Vertical,
+                };
+                Ok(SplitNode::Split {
+                    split_id,
+                    axis: ui_axis,
+                    ratio: ratio.clamp(crate::workspace::MIN_SPLIT_RATIO, crate::workspace::MAX_SPLIT_RATIO),
+                    first: Box::new(first_node),
+                    second: Box::new(second_node),
+                })
+            }
+        }
+    }
+
+    fn restore_session_descriptor(&mut self, desc: &SessionDescriptor) -> Result<SessionId, String> {
+        match desc {
+            SessionDescriptor::Local {
+                profile_id,
+                title,
+                working_dir,
+                shell,
+            } => {
+                let spec = self.resolve_shell_spec(shell.as_deref(), &[]);
+                let valid_cwd = working_dir.as_ref().filter(|dir| dir.is_dir()).cloned();
+                self.spawn_local_session(
+                    spec,
+                    valid_cwd,
+                    title.clone(),
+                    profile_id.clone(),
+                )
+            }
+            SessionDescriptor::Remote {
+                profile_id,
+                host,
+                port,
+                username,
+                title,
+                auto_connect_on_startup,
+            } => {
+                let profile_auto = profile_id
+                    .as_deref()
+                    .and_then(|pid| self.profiles.profiles.iter().find(|p| p.id == pid))
+                    .map(|p| p.auto_connect_on_startup());
+                let effective_auto = profile_auto.unwrap_or(*auto_connect_on_startup);
+                Ok(self.insert_remote_session(
+                    profile_id.clone(),
+                    host.clone(),
+                    *port,
+                    username.clone(),
+                    title.clone(),
+                    effective_auto,
+                ))
+            }
+        }
+    }
+
+    fn insert_remote_session(
+        &mut self,
+        profile_id: Option<String>,
+        host: String,
+        port: u16,
+        username: Option<String>,
+        title: Option<String>,
+        auto_connect_on_startup: bool,
+    ) -> SessionId {
+        let id = SessionId(self.next_session_id);
+        self.next_session_id += 1;
+        let display_title = title
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| match &username {
+                Some(u) if !u.is_empty() => format!("{u}@{host}"),
+                _ => host.clone(),
+            });
+
+        let connect_requested = auto_connect_on_startup;
+        if connect_requested {
+            self.pending_remote_connects.push(RemoteConnectIntent {
+                session_id: id,
+                profile_id: profile_id.clone(),
+                host: host.clone(),
+                port,
+                username: username.clone(),
+            });
+        }
+
+        self.sessions.insert(
+            id,
+            SessionEntry::Remote(RemoteSession {
+                id,
+                profile_id,
+                host,
+                port,
+                username,
+                title: display_title,
+                transport_status: TransportStatus::Disconnected,
+                auto_connect_on_startup,
+                connect_requested,
+            }),
+        );
+        id
+    }
+
+    /// Wires an active primary [`IpcServerHandle`] so incoming secondary launches drive `AppState`.
+    pub fn attach_ipc(&mut self, handle: IpcServerHandle) {
+        self.ipc_rx = handle
+            .take_receiver()
+            .map(|rx| Arc::new(Mutex::new(Some(rx))));
+        self.ipc_handle = Some(handle);
     }
 
     fn spawn_default_local_session(&mut self) -> Result<SessionId, String> {
@@ -634,7 +950,7 @@ impl AppState {
             rows: 24,
             scrollback_lines: self.config.terminal.scrollback_lines,
             cursor_shape: cursor_style_to_shape(self.config.terminal.cursor_style),
-            working_dir,
+            working_dir: working_dir.clone(),
         };
 
         let pty = Arc::new(
@@ -652,6 +968,7 @@ impl AppState {
         let session = LocalSession {
             id,
             profile_id,
+            initial_working_dir: working_dir,
             title,
             pty,
             snapshot,
@@ -659,7 +976,7 @@ impl AppState {
             exited: None,
         };
 
-        self.sessions.insert(id, SessionRecord::Local(session));
+        self.sessions.insert(id, SessionEntry::Local(session));
         Ok(id)
     }
 
@@ -673,7 +990,7 @@ impl AppState {
         let target = SshSessionTarget::from_target_spec(&spec);
         let tab_title = (!spec.title.trim().is_empty()).then(|| spec.title.clone());
         let id = self.insert_ssh_session_slot(target, spec);
-        self.workspace.create_tab(id, tab_title);
+        let _ = self.open_session_with_disposition(None, id, tab_title, LaunchDisposition::NewTab);
 
         if auto_connect {
             let task = self.start_ssh_connect(id);
@@ -722,13 +1039,13 @@ impl AppState {
             active: None,
             last_error: None,
         };
-        self.sessions.insert(id, SessionRecord::Ssh(slot));
+        self.sessions.insert(id, SessionEntry::Ssh(slot));
         id
     }
 
     fn start_ssh_connect(&mut self, session_id: SessionId) -> Task<Message> {
         self.ssh_ui.clear_session_prompts(session_id);
-        let Some(SessionRecord::Ssh(slot)) = self.sessions.get_mut(&session_id) else {
+        let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) else {
             return Task::none();
         };
 
@@ -758,7 +1075,7 @@ impl AppState {
 
     fn disconnect_ssh_session(&mut self, session_id: SessionId) {
         self.ssh_ui.clear_session_prompts(session_id);
-        if let Some(SessionRecord::Ssh(slot)) = self.sessions.get_mut(&session_id) {
+        if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) {
             if let Some(ssh) = slot.active.take() {
                 ssh.disconnect();
             }
@@ -769,40 +1086,44 @@ impl AppState {
 
     fn open_session_with_disposition(
         &mut self,
+        window_scope: Option<window::Id>,
         session_id: SessionId,
         tab_title: Option<String>,
         disposition: LaunchDisposition,
     ) -> bool {
+        let Some(ws) = self.target_workspace_mut(window_scope) else {
+            self.remove_session(session_id);
+            return false;
+        };
         match disposition {
             LaunchDisposition::NewTab => {
-                self.workspace.create_tab(session_id, tab_title);
+                ws.create_tab(session_id, tab_title);
                 true
             }
             LaunchDisposition::Split(axis) => {
-                if let Some((tab_id, target_pane)) = self
-                    .workspace
-                    .active_tab()
-                    .map(|tab| (tab.id, tab.focused_pane))
+                if let Some((tab_id, target_pane)) =
+                    ws.active_tab().map(|tab| (tab.id, tab.focused_pane))
                 {
-                    if self
-                        .workspace
-                        .split_pane(tab_id, target_pane, axis, session_id)
-                        .is_none()
-                    {
+                    if ws.split_pane(tab_id, target_pane, axis, session_id).is_none() {
                         self.remove_session(session_id);
                         false
                     } else {
                         true
                     }
                 } else {
-                    self.workspace.create_tab(session_id, tab_title);
+                    ws.create_tab(session_id, tab_title);
                     true
                 }
             }
         }
     }
 
-    fn launch_profile_entry(&mut self, profile: &Profile, disposition: LaunchDisposition) -> Task<Message> {
+    fn launch_profile_entry(
+        &mut self,
+        window_scope: Option<window::Id>,
+        profile: &Profile,
+        disposition: LaunchDisposition,
+    ) -> Task<Message> {
         match &profile.target {
             ProfileTarget::LocalShell {
                 shell,
@@ -818,7 +1139,12 @@ impl AppState {
                     Some(profile.id.clone()),
                 ) {
                     Ok(sid) => {
-                        let _ = self.open_session_with_disposition(sid, title, disposition);
+                        let _ = self.open_session_with_disposition(
+                            window_scope,
+                            sid,
+                            title,
+                            disposition,
+                        );
                     }
                     Err(err) => {
                         error!(profile_id = %profile.id, error = %err, "failed to launch local Profile");
@@ -855,7 +1181,7 @@ impl AppState {
                     self.config.terminal.scrollback_lines,
                 );
                 let sid = self.insert_ssh_session_slot(target, spec);
-                if self.open_session_with_disposition(sid, tab_title, disposition) {
+                if self.open_session_with_disposition(window_scope, sid, tab_title, disposition) {
                     self.start_ssh_connect(sid)
                 } else {
                     Task::none()
@@ -864,7 +1190,11 @@ impl AppState {
         }
     }
 
-    fn launch_quick_connect(&mut self, target: QuickConnectTarget) -> Task<Message> {
+    fn launch_quick_connect(
+        &mut self,
+        window_scope: Option<window::Id>,
+        target: QuickConnectTarget,
+    ) -> Task<Message> {
         let label = target.display_addr();
         let ssh_target = SshSessionTarget {
             profile_id: None,
@@ -884,14 +1214,24 @@ impl AppState {
             self.config.terminal.scrollback_lines,
         );
         let sid = self.insert_ssh_session_slot(ssh_target, spec);
-        if self.open_session_with_disposition(sid, Some(label), LaunchDisposition::NewTab) {
+        if self.open_session_with_disposition(
+            window_scope,
+            sid,
+            Some(label),
+            LaunchDisposition::NewTab,
+        ) {
             self.start_ssh_connect(sid)
         } else {
             Task::none()
         }
     }
 
-    fn launch_system_ssh_entry(&mut self, alias: &str, disposition: LaunchDisposition) -> Task<Message> {
+    fn launch_system_ssh_entry(
+        &mut self,
+        window_scope: Option<window::Id>,
+        alias: &str,
+        disposition: LaunchDisposition,
+    ) -> Task<Message> {
         let Some(host) = self
             .sidebar
             .system_ssh_profiles()
@@ -919,14 +1259,19 @@ impl AppState {
             self.config.terminal.scrollback_lines,
         );
         let sid = self.insert_ssh_session_slot(target, spec);
-        if self.open_session_with_disposition(sid, Some(host.alias), disposition) {
+        if self.open_session_with_disposition(
+            window_scope,
+            sid,
+            Some(host.alias),
+            disposition,
+        ) {
             self.start_ssh_connect(sid)
         } else {
             Task::none()
         }
     }
 
-    fn handle_command_palette_confirm(&mut self) -> Task<Message> {
+    fn handle_command_palette_confirm(&mut self, window_scope: Option<window::Id>) -> Task<Message> {
         match self.command_palette.mode() {
             CommandPaletteMode::QuickConnect => {
                 if let Some(target) =
@@ -934,7 +1279,7 @@ impl AppState {
                 {
                     self.last_error = None;
                     self.command_palette.close();
-                    self.launch_quick_connect(target)
+                    self.launch_quick_connect(window_scope, target)
                 } else {
                     self.last_error =
                         Some("Invalid Quick Connect target (expected user@host[:port])".to_string());
@@ -948,7 +1293,7 @@ impl AppState {
                 }
                 let idx = self.command_palette.selected_index().min(items.len() - 1);
                 let action = items[idx].action.clone();
-                self.execute_palette_action(action)
+                self.execute_palette_action(window_scope, action)
             }
         }
     }
@@ -978,7 +1323,11 @@ impl AppState {
         }
     }
 
-    fn execute_palette_action(&mut self, action: PaletteAction) -> Task<Message> {
+    fn execute_palette_action(
+        &mut self,
+        window_scope: Option<window::Id>,
+        action: PaletteAction,
+    ) -> Task<Message> {
         match action {
             PaletteAction::OpenQuickConnectPrompt => {
                 self.command_palette.enter_quick_connect("");
@@ -986,49 +1335,55 @@ impl AppState {
             }
             PaletteAction::NewTab => {
                 self.command_palette.close();
-                self.update(Message::NewTab)
+                self.update_in_window(window_scope, Message::NewTab)
             }
             PaletteAction::SplitPane(axis) => {
                 self.command_palette.close();
-                self.update(Message::SplitFocusedPane(axis))
+                self.update_in_window(window_scope, Message::SplitFocusedPane(axis))
             }
             PaletteAction::TogglePaneZoom => {
                 self.command_palette.close();
-                self.update(Message::TogglePaneZoom)
+                self.update_in_window(window_scope, Message::TogglePaneZoom)
             }
             PaletteAction::ToggleBroadcastInput => {
                 self.command_palette.close();
-                self.update(Message::ToggleBroadcastInput)
+                self.update_in_window(window_scope, Message::ToggleBroadcastInput)
             }
             PaletteAction::ToggleSidebar => {
                 self.command_palette.close();
-                self.update(Message::ToggleSidebar)
+                self.update_in_window(window_scope, Message::ToggleSidebar)
             }
             PaletteAction::CloseFocusedPane => {
                 self.command_palette.close();
-                self.update(Message::CloseFocusedPane)
+                self.update_in_window(window_scope, Message::CloseFocusedPane)
             }
             PaletteAction::QuickConnect(target) => {
                 self.command_palette.close();
-                self.launch_quick_connect(target)
+                self.launch_quick_connect(window_scope, target)
             }
             PaletteAction::SwitchSession(session_id) => {
                 self.command_palette.close();
-                self.update(Message::FocusSession(session_id))
+                self.update_in_window(window_scope, Message::FocusSession(session_id))
             }
             PaletteAction::LaunchProfile {
                 profile_id,
                 disposition,
             } => {
                 self.command_palette.close();
-                self.update(Message::LaunchProfile {
-                    profile_id,
-                    disposition,
-                })
+                self.update_in_window(
+                    window_scope,
+                    Message::LaunchProfile {
+                        profile_id,
+                        disposition,
+                    },
+                )
             }
             PaletteAction::LaunchSystemSsh { alias, disposition } => {
                 self.command_palette.close();
-                self.update(Message::LaunchSystemSsh { alias, disposition })
+                self.update_in_window(
+                    window_scope,
+                    Message::LaunchSystemSsh { alias, disposition },
+                )
             }
             PaletteAction::ToggleTunnel(tunnel_id) => {
                 self.command_palette.close();
@@ -1041,24 +1396,30 @@ impl AppState {
     fn remove_session(&mut self, session_id: SessionId) {
         self.ssh_ui.clear_session_prompts(session_id);
         match self.sessions.remove(&session_id) {
-            Some(SessionRecord::Local(session)) => session.pty.terminate(),
-            Some(SessionRecord::Ssh(slot)) => {
+            Some(SessionEntry::Local(session)) => session.pty.terminate(),
+            Some(SessionEntry::Ssh(slot)) => {
                 if let Some(ssh) = slot.active {
                     ssh.disconnect();
                 }
             }
-            None => {}
+            Some(SessionEntry::Remote(_)) | None => {}
         }
     }
 
-    fn split_target_pane(&mut self, tab_id: TabId, target_pane: PaneId, axis: SplitAxis) {
+    fn split_target_pane(
+        &mut self,
+        window_scope: Option<window::Id>,
+        tab_id: TabId,
+        target_pane: PaneId,
+        axis: SplitAxis,
+    ) {
         match self.spawn_default_local_session() {
             Ok(session_id) => {
-                if self
-                    .workspace
-                    .split_pane(tab_id, target_pane, axis, session_id)
-                    .is_none()
-                {
+                let inserted = self
+                    .workspace_for_tab_mut(window_scope, tab_id)
+                    .and_then(|ws| ws.split_pane(tab_id, target_pane, axis, session_id))
+                    .is_some();
+                if !inserted {
                     self.remove_session(session_id);
                 }
             }
@@ -1069,8 +1430,16 @@ impl AppState {
         }
     }
 
-    fn close_target_pane(&mut self, tab_id: TabId, pane_id: PaneId) {
-        if let Some(outcome) = self.workspace.close_pane(tab_id, pane_id) {
+    fn close_target_pane(
+        &mut self,
+        window_scope: Option<window::Id>,
+        tab_id: TabId,
+        pane_id: PaneId,
+    ) {
+        if let Some(outcome) = self
+            .workspace_for_tab_mut(window_scope, tab_id)
+            .and_then(|ws| ws.close_pane(tab_id, pane_id))
+        {
             let sid = match outcome {
                 ClosePaneOutcome::ClosedPane { session_id, .. }
                 | ClosePaneOutcome::ClosedTab { session_id } => session_id,
@@ -1079,27 +1448,412 @@ impl AppState {
         }
     }
 
+    fn target_window_id(&self, window_scope: Option<window::Id>) -> Option<window::Id> {
+        if let Some(wid) = window_scope
+            && self.window_workspaces.contains_key(&wid)
+        {
+            return Some(wid);
+        }
+        if let Some(wid) = self.active_window
+            && self.window_workspaces.contains_key(&wid)
+        {
+            return Some(wid);
+        }
+        self.window_workspaces.keys().next().copied()
+    }
+
+    fn primary_workspace(&self) -> Option<&Workspace> {
+        if let Some(wid) = self.target_window_id(None) {
+            return self.window_workspaces.get(&wid).map(|w| &w.workspace);
+        }
+        self.pending_windows
+            .front()
+            .map(|w| &w.workspace)
+            .or_else(|| self.retired_final_window.as_ref().map(|(_, w)| &w.workspace))
+    }
+
+    fn target_workspace(&self, window_scope: Option<window::Id>) -> Option<&Workspace> {
+        if let Some(wid) = self.target_window_id(window_scope) {
+            return self.window_workspaces.get(&wid).map(|w| &w.workspace);
+        }
+        self.pending_windows.front().map(|w| &w.workspace)
+    }
+
+    fn target_workspace_mut(&mut self, window_scope: Option<window::Id>) -> Option<&mut Workspace> {
+        if let Some(wid) = self.target_window_id(window_scope) {
+            return self.window_workspaces.get_mut(&wid).map(|w| &mut w.workspace);
+        }
+        self.pending_windows.front_mut().map(|w| &mut w.workspace)
+    }
+
+    fn workspace_for_tab_mut(
+        &mut self,
+        window_scope: Option<window::Id>,
+        tab_id: TabId,
+    ) -> Option<&mut Workspace> {
+        if let Some(wid) = self
+            .window_workspaces
+            .iter()
+            .find_map(|(&wid, w)| w.workspace.contains_tab(tab_id).then_some(wid))
+        {
+            self.active_window = Some(wid);
+            return self.window_workspaces.get_mut(&wid).map(|w| &mut w.workspace);
+        }
+        if let Some(idx) = self
+            .pending_windows
+            .iter()
+            .position(|w| w.workspace.contains_tab(tab_id))
+        {
+            return self.pending_windows.get_mut(idx).map(|w| &mut w.workspace);
+        }
+        self.target_workspace_mut(window_scope)
+    }
+
+    fn workspace_for_split_mut(&mut self, split_id: SplitId) -> Option<&mut Workspace> {
+        if let Some(wid) = self
+            .window_workspaces
+            .iter()
+            .find_map(|(&wid, w)| w.workspace.contains_split(split_id).then_some(wid))
+        {
+            return self.window_workspaces.get_mut(&wid).map(|w| &mut w.workspace);
+        }
+        self.pending_windows
+            .iter_mut()
+            .find(|w| w.workspace.contains_split(split_id))
+            .map(|w| &mut w.workspace)
+    }
+
+    fn workspace_for_pane_mut(&mut self, pane_id: PaneId) -> Option<&mut Workspace> {
+        if let Some(wid) = self
+            .window_workspaces
+            .iter()
+            .find_map(|(&wid, w)| w.workspace.contains_pane(pane_id).then_some(wid))
+        {
+            self.active_window = Some(wid);
+            return self.window_workspaces.get_mut(&wid).map(|w| &mut w.workspace);
+        }
+        self.pending_windows
+            .iter_mut()
+            .find(|w| w.workspace.contains_pane(pane_id))
+            .map(|w| &mut w.workspace)
+    }
+
+    fn workspace_for_session_mut(&mut self, session_id: SessionId) -> Option<&mut Workspace> {
+        if let Some(wid) = self
+            .window_workspaces
+            .iter()
+            .find_map(|(&wid, w)| w.workspace.contains_session(session_id).then_some(wid))
+        {
+            return self.window_workspaces.get_mut(&wid).map(|w| &mut w.workspace);
+        }
+        self.pending_windows
+            .iter_mut()
+            .find(|w| w.workspace.contains_session(session_id))
+            .map(|w| &mut w.workspace)
+    }
+
+    fn open_coordinated_window(&mut self) -> Task<Message> {
+        let mut workspace = Workspace::with_ids(self.workspace_ids.clone());
+        match self.spawn_default_local_session() {
+            Ok(session_id) => {
+                workspace.create_tab(session_id, None);
+            }
+            Err(err) => {
+                error!(error = %err, "failed to spawn session for new window");
+                self.last_error = Some(err);
+            }
+        }
+        let width = self.config.window.width;
+        let height = self.config.window.height;
+        let (win_id, open_task) = window::open(window::Settings {
+            exit_on_close_request: false,
+            size: Size::new(width as f32, height as f32),
+            ..window::Settings::default()
+        });
+        self.windows.insert(win_id);
+        self.window_workspaces.insert(
+            win_id,
+            WindowState {
+                workspace,
+                width,
+                height,
+            },
+        );
+        self.active_window = Some(win_id);
+        self.lifecycle = DaemonLifecycle::Active;
+        open_task.map(Message::WindowOpened)
+    }
+
+    fn open_tab_in_window(
+        &mut self,
+        window_scope: Option<window::Id>,
+        profile_id: Option<&str>,
+    ) -> Task<Message> {
+        let target_win = self.target_window_id(window_scope);
+        if target_win.is_none() && self.pending_windows.is_empty() {
+            let task = self.open_coordinated_window();
+            if profile_id.is_none() {
+                return task;
+            }
+            let new_win = self.active_window;
+            return Task::batch([task, self.spawn_profile_tab(new_win, profile_id)]);
+        }
+        let extra = self.spawn_profile_tab(target_win, profile_id);
+        if let Some(wid) = target_win {
+            self.active_window = Some(wid);
+            Task::batch([window::gain_focus(wid), extra])
+        } else {
+            extra
+        }
+    }
+
+    fn spawn_profile_tab(
+        &mut self,
+        target_win: Option<window::Id>,
+        profile_id: Option<&str>,
+    ) -> Task<Message> {
+        let profile = profile_id
+            .and_then(|pid| self.profiles.profiles.iter().find(|p| p.id == pid))
+            .cloned();
+
+        let spawned = match profile {
+            Some(prof) => match prof.target {
+                ProfileTarget::LocalShell {
+                    shell,
+                    working_dir,
+                    args,
+                } => {
+                    let spec = self.resolve_shell_spec(shell.as_deref(), &args);
+                    let valid_cwd = working_dir.filter(|d| d.is_dir());
+                    self.spawn_local_session(spec, valid_cwd, Some(prof.name), Some(prof.id))
+                        .map(|sid| (sid, None))
+                }
+                ProfileTarget::Ssh {
+                    host,
+                    port,
+                    username,
+                    auto_connect_on_startup,
+                    ..
+                } => {
+                    let sid = self.insert_remote_session(
+                        Some(prof.id),
+                        host,
+                        port,
+                        Some(username),
+                        Some(prof.name),
+                        auto_connect_on_startup,
+                    );
+                    Ok((sid, Some(sid)))
+                }
+            },
+            None => self.spawn_default_local_session().map(|sid| (sid, None)),
+        };
+
+        match spawned {
+            Ok((session_id, auto_remote)) => {
+                if let Some(ws) = self.target_workspace_mut(target_win) {
+                    ws.create_tab(session_id, None);
+                } else {
+                    self.remove_session(session_id);
+                }
+                if let Some(remote_sid) = auto_remote {
+                    return Task::done(Message::ConnectRemoteSession(remote_sid));
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "failed to create new tab session");
+                self.last_error = Some(err);
+            }
+        }
+        Task::none()
+    }
+
     /// Processes a top-level Elm [`Message`] and returns any follow-up [`Task`].
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        self.update_in_window(None, message)
+    }
+
+    fn update_in_window(
+        &mut self,
+        window_scope: Option<window::Id>,
+        message: Message,
+    ) -> Task<Message> {
         match message {
+            Message::InWindow { window_id, inner } => {
+                self.active_window = Some(window_id);
+                self.update_in_window(Some(window_id), *inner)
+            }
             Message::WindowOpened(id) => {
                 self.windows.insert(id);
+                self.retired_final_window = None;
+                self.lifecycle = DaemonLifecycle::Active;
+                self.active_window = Some(id);
+                if !self.window_workspaces.contains_key(&id) {
+                    let win_state = if let Some(pending) = self.pending_windows.pop_front() {
+                        pending
+                    } else {
+                        let mut workspace = Workspace::with_ids(self.workspace_ids.clone());
+                        match self.spawn_default_local_session() {
+                            Ok(session_id) => {
+                                workspace.create_tab(session_id, None);
+                            }
+                            Err(err) => {
+                                error!(error = %err, "failed to spawn session for opened window");
+                                self.last_error = Some(err);
+                            }
+                        }
+                        WindowState {
+                            workspace,
+                            width: self.config.window.width,
+                            height: self.config.window.height,
+                        }
+                    };
+                    self.window_workspaces.insert(id, win_state);
+                }
                 Task::none()
             }
-            Message::CloseRequested(id) => window::close(id),
+            Message::WindowFocused(id) => {
+                if self.windows.contains(&id) {
+                    self.active_window = Some(id);
+                }
+                Task::none()
+            }
+            Message::WindowResized(id, size) => {
+                if let Some(win_state) = self.window_workspaces.get_mut(&id) {
+                    win_state.width = size.width.max(100.0).round() as u32;
+                    win_state.height = size.height.max(100.0).round() as u32;
+                }
+                Task::none()
+            }
+            Message::NewWindow => self.open_coordinated_window(),
+            Message::IpcCommand(cmd) => match cmd {
+                IpcCommand::OpenWindow => {
+                    if self.windows.is_empty()
+                        && self.lifecycle == DaemonLifecycle::BackgroundRunning
+                        && let Ok(layout) = load_layout(&self.paths)
+                        && !layout.windows.is_empty()
+                        && self.restore_from_layout(&layout).unwrap_or(false)
+                    {
+                        let tasks = self.open_pending_windows();
+                        self.lifecycle = DaemonLifecycle::Active;
+                        return Task::batch(tasks);
+                    }
+                    self.open_coordinated_window()
+                }
+                IpcCommand::OpenTab { profile_id } => {
+                    self.open_tab_in_window(None, profile_id.as_deref())
+                }
+            },
+            Message::CloseRequested(id) => {
+                let is_last_window = self.windows.len() <= 1;
+                if is_last_window {
+                    let status = self.background_work_source.status();
+                    if status.has_active_work() {
+                        self.close_guard = CloseGuardState::Confirming {
+                            window_id: id,
+                            active_standalone_tunnels: status.active_standalone_tunnels,
+                            active_transfers: status.active_transfers,
+                        };
+                        return Task::none();
+                    }
+                    self.save_layout_best_effort();
+                }
+                self.close_guard = CloseGuardState::Idle;
+                window::close(id)
+            }
             Message::WindowClosed(id) => {
                 self.windows.remove(&id);
+                let removed_win = self.window_workspaces.remove(&id);
+                if self.active_window == Some(id) {
+                    self.active_window = self.windows.iter().next_back().copied();
+                }
+                if matches!(self.close_guard, CloseGuardState::Confirming { window_id, .. } if window_id == id)
+                {
+                    self.close_guard = CloseGuardState::Idle;
+                }
                 if self.windows.is_empty() {
-                    iced::exit()
+                    if self.lifecycle == DaemonLifecycle::BackgroundRunning {
+                        if let Some(win_state) = removed_win {
+                            self.close_window_sessions(win_state);
+                        }
+                        Task::none()
+                    } else {
+                        self.retired_final_window = removed_win.map(|w| (id, w));
+                        self.lifecycle = DaemonLifecycle::Exiting;
+                        self.ipc_handle.take();
+                        iced::exit()
+                    }
                 } else {
+                    if let Some(win_state) = removed_win {
+                        self.close_window_sessions(win_state);
+                    }
                     Task::none()
                 }
             }
+            Message::CloseGuardCancel => {
+                self.close_guard = CloseGuardState::Idle;
+                Task::none()
+            }
+            Message::CloseGuardKeepRunningInBackground => {
+                self.save_layout_best_effort();
+                let target_window = match self.close_guard {
+                    CloseGuardState::Confirming { window_id, .. } => Some(window_id),
+                    CloseGuardState::Idle => self.windows.iter().next().copied(),
+                };
+                self.close_guard = CloseGuardState::Idle;
+                self.lifecycle = DaemonLifecycle::BackgroundRunning;
+                match target_window {
+                    Some(id) => window::close(id),
+                    None => Task::none(),
+                }
+            }
+            Message::CloseGuardStopAndQuit => {
+                self.save_layout_best_effort();
+                self.close_guard = CloseGuardState::Idle;
+                self.lifecycle = DaemonLifecycle::Exiting;
+                self.background_work_source.stop_all();
+                self.ipc_handle.take();
+                self.retired_final_window = None;
+                let session_ids: Vec<SessionId> = self.sessions.keys().copied().collect();
+                for sid in session_ids {
+                    self.remove_session(sid);
+                }
+                let mut tasks: Vec<Task<Message>> =
+                    self.windows.iter().copied().map(window::close).collect();
+                tasks.push(iced::exit());
+                Task::batch(tasks)
+            }
+            Message::ConnectRemoteSession(session_id) => {
+                if let Some(SessionEntry::Remote(remote)) = self.sessions.get_mut(&session_id) {
+                    remote.connect_requested = true;
+                    let already_queued = self
+                        .pending_remote_connects
+                        .iter()
+                        .any(|i| i.session_id == session_id);
+                    if !already_queued {
+                        self.pending_remote_connects.push(RemoteConnectIntent {
+                            session_id,
+                            profile_id: remote.profile_id.clone(),
+                            host: remote.host.clone(),
+                            port: remote.port,
+                            username: remote.username.clone(),
+                        });
+                    }
+                }
+                Task::none()
+            }
+            Message::SaveWorkspaceLayout => {
+                self.save_layout_best_effort();
+                Task::none()
+            }
             Message::TerminalInput { session_id, bytes } => {
-                let targets = self.workspace.input_targets_for_session(session_id);
+                let targets = self
+                    .workspace_for_session_mut(session_id)
+                    .map(|ws| ws.input_targets_for_session(session_id))
+                    .unwrap_or_else(|| vec![session_id]);
                 if targets.len() == 1
                     && (bytes.contains(&b'\r') || bytes.contains(&b'\n'))
-                    && let Some(SessionRecord::Ssh(slot)) = self.sessions.get(&session_id)
+                    && let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id)
                     && slot.active.is_none()
                     && slot.transport_status == TransportStatus::Disconnected
                 {
@@ -1114,7 +1868,7 @@ impl AppState {
                 rows,
             } => {
                 match self.sessions.get_mut(&session_id) {
-                    Some(SessionRecord::Local(session)) => {
+                    Some(SessionEntry::Local(session)) => {
                         if let Err(err) = session.pty.resize(cols, rows) {
                             error!(session = session_id.0, error = %err, "failed to resize PTY");
                             self.last_error = Some(err.to_string());
@@ -1122,7 +1876,7 @@ impl AppState {
                             session.snapshot = Arc::new(session.pty.snapshot());
                         }
                     }
-                    Some(SessionRecord::Ssh(slot)) => {
+                    Some(SessionEntry::Ssh(slot)) => {
                         slot.cols = cols.max(1);
                         slot.rows = rows.max(1);
                         if let Some(ssh) = &slot.active {
@@ -1139,44 +1893,46 @@ impl AppState {
                         }
                         slot.snapshot = Arc::new(slot.buffer.snapshot());
                     }
-                    None => {}
+                    Some(SessionEntry::Remote(_)) | None => {}
                 }
                 Task::none()
             }
             Message::PtyEvent { session_id, event } => {
                 let is_active_session = Some(session_id) == self.active_session_id();
-                if let Some(record) = self.sessions.get_mut(&session_id) {
+                if let Some(entry) = self.sessions.get_mut(&session_id) {
                     match event {
                         PtyEvent::Output => {
-                            record.refresh_snapshot();
+                            entry.refresh_snapshot();
                             if is_active_session
                                 && self.search.open
                                 && !self.search.query.is_empty()
                             {
-                                let buf = Arc::clone(record.buffer());
-                                self.search.refresh_matches_buffer(Some(buf.as_ref()), false);
+                                let buf = entry.buffer().cloned();
+                                self.search.refresh_matches_buffer(buf.as_deref(), false);
                             }
                         }
                         PtyEvent::Title(title) => {
                             if !title.is_empty() {
-                                match record {
-                                    SessionRecord::Local(s) => s.title = title,
-                                    SessionRecord::Ssh(s) => s.title = title,
+                                match entry {
+                                    SessionEntry::Local(s) => s.title = title,
+                                    SessionEntry::Ssh(s) => s.title = title,
+                                    SessionEntry::Remote(_) => {}
                                 }
                             }
                         }
                         PtyEvent::Bell => {}
                         PtyEvent::Exited(code) => {
-                            record.refresh_snapshot();
-                            match record {
-                                SessionRecord::Local(s) => s.exited = Some(code),
-                                SessionRecord::Ssh(slot) => {
+                            entry.refresh_snapshot();
+                            match entry {
+                                SessionEntry::Local(s) => s.exited = Some(code),
+                                SessionEntry::Ssh(slot) => {
                                     slot.exited = Some(code);
                                     slot.active = None;
                                     slot.transport_status = TransportStatus::Disconnected;
                                     slot.status_message =
                                         format_ssh_slot_message(&slot.target, &slot.transport_status);
                                 }
+                                SessionEntry::Remote(_) => {}
                             }
                         }
                     }
@@ -1192,10 +1948,9 @@ impl AppState {
                 let active_buf = self
                     .active_session_id()
                     .and_then(|id| self.sessions.get(&id))
-                    .map(|r| Arc::clone(r.buffer()));
-                let target = self
-                    .search
-                    .open_buffer(active_buf.as_deref());
+                    .and_then(SessionEntry::buffer)
+                    .cloned();
+                let target = self.search.open_buffer(active_buf.as_deref());
                 self.focus_search_match(target);
                 operation::focus(search_input_id())
             }
@@ -1207,10 +1962,9 @@ impl AppState {
                 let active_buf = self
                     .active_session_id()
                     .and_then(|id| self.sessions.get(&id))
-                    .map(|r| Arc::clone(r.buffer()));
-                let target = self
-                    .search
-                    .set_query_buffer(query, active_buf.as_deref());
+                    .and_then(SessionEntry::buffer)
+                    .cloned();
+                let target = self.search.set_query_buffer(query, active_buf.as_deref());
                 self.focus_search_match(target);
                 Task::none()
             }
@@ -1245,23 +1999,29 @@ impl AppState {
                 session_id,
                 delta_lines,
             } => {
-                if let Some(record) = self.sessions.get_mut(&session_id) {
-                    record.buffer().scroll_display(Scroll::Delta(delta_lines));
-                    record.refresh_snapshot();
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
+                {
+                    buf.scroll_display(Scroll::Delta(delta_lines));
+                    entry.refresh_snapshot();
                 }
                 Task::none()
             }
             Message::ScrollToTop(session_id) => {
-                if let Some(record) = self.sessions.get_mut(&session_id) {
-                    record.buffer().scroll_display(Scroll::Top);
-                    record.refresh_snapshot();
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
+                {
+                    buf.scroll_display(Scroll::Top);
+                    entry.refresh_snapshot();
                 }
                 Task::none()
             }
             Message::ScrollToBottom(session_id) => {
-                if let Some(record) = self.sessions.get_mut(&session_id) {
-                    record.buffer().scroll_to_bottom();
-                    record.refresh_snapshot();
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
+                {
+                    buf.scroll_to_bottom();
+                    entry.refresh_snapshot();
                 }
                 Task::none()
             }
@@ -1272,11 +2032,11 @@ impl AppState {
                 side,
                 selection_type,
             } => {
-                if let Some(record) = self.sessions.get_mut(&session_id) {
-                    record
-                        .buffer()
-                        .start_selection(col, row, side, selection_type);
-                    record.refresh_snapshot();
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
+                {
+                    buf.start_selection(col, row, side, selection_type);
+                    entry.refresh_snapshot();
                 }
                 Task::none()
             }
@@ -1286,16 +2046,20 @@ impl AppState {
                 row,
                 side,
             } => {
-                if let Some(record) = self.sessions.get_mut(&session_id) {
-                    record.buffer().update_selection(col, row, side);
-                    record.refresh_snapshot();
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
+                {
+                    buf.update_selection(col, row, side);
+                    entry.refresh_snapshot();
                 }
                 Task::none()
             }
             Message::SelectionFinish { session_id } => {
-                let copied = if let Some(record) = self.sessions.get_mut(&session_id) {
-                    let selected = record.buffer().finish_selection();
-                    record.refresh_snapshot();
+                let copied = if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
+                {
+                    let selected = buf.finish_selection();
+                    entry.refresh_snapshot();
                     if self.config.terminal.copy_on_select {
                         selected
                     } else {
@@ -1315,7 +2079,8 @@ impl AppState {
                 let copied = self
                     .sessions
                     .get(&session_id)
-                    .and_then(|record| record.buffer().selection_text());
+                    .and_then(SessionEntry::buffer)
+                    .and_then(|buf| buf.selection_text());
                 if let Some(text) = copied {
                     self.copy_text_to_clipboard(text)
                 } else {
@@ -1362,7 +2127,7 @@ impl AppState {
                 let is_ssh = self
                     .sessions
                     .get(&session_id)
-                    .and_then(SessionRecord::as_ssh)
+                    .and_then(SessionEntry::as_ssh)
                     .is_some();
                 let action = classify_file_drop(session_id, &path, is_ssh, shift_held, false);
                 match action {
@@ -1458,35 +2223,38 @@ impl AppState {
                 Task::none()
             }
             Message::NewTab => {
-                match self.spawn_default_local_session() {
-                    Ok(session_id) => {
-                        self.workspace.create_tab(session_id, None);
-                    }
-                    Err(err) => {
-                        error!(error = %err, "failed to create new tab session");
-                        self.last_error = Some(err);
-                    }
-                }
+                let _ = self.open_tab_in_window(window_scope, None);
                 Task::none()
             }
             Message::SelectTab(tab_id) => {
-                self.workspace.select_tab(tab_id);
+                if let Some(ws) = self.workspace_for_tab_mut(window_scope, tab_id) {
+                    ws.select_tab(tab_id);
+                }
                 Task::none()
             }
             Message::CycleTab(direction) => {
-                self.workspace.cycle_tab(direction);
+                if let Some(ws) = self.target_workspace_mut(window_scope) {
+                    ws.cycle_tab(direction);
+                }
                 Task::none()
             }
             Message::MoveTab { tab_id, to_index } => {
-                self.workspace.reorder_tab(tab_id, to_index);
+                if let Some(ws) = self.workspace_for_tab_mut(window_scope, tab_id) {
+                    ws.reorder_tab(tab_id, to_index);
+                }
                 Task::none()
             }
             Message::MoveTabBy { tab_id, delta } => {
-                self.workspace.move_tab_by(tab_id, delta);
+                if let Some(ws) = self.workspace_for_tab_mut(window_scope, tab_id) {
+                    ws.move_tab_by(tab_id, delta);
+                }
                 Task::none()
             }
             Message::CloseTab(tab_id) => {
-                if let Some(removed_sessions) = self.workspace.close_tab(tab_id) {
+                if let Some(removed_sessions) = self
+                    .workspace_for_tab_mut(window_scope, tab_id)
+                    .and_then(|ws| ws.close_tab(tab_id))
+                {
                     for sid in removed_sessions {
                         self.remove_session(sid);
                     }
@@ -1495,79 +2263,118 @@ impl AppState {
             }
             Message::SplitFocusedPane(axis) => {
                 if let Some((tab_id, target_pane)) = self
-                    .workspace
-                    .active_tab()
+                    .target_workspace(window_scope)
+                    .and_then(|ws| ws.active_tab())
                     .map(|tab| (tab.id, tab.focused_pane))
                 {
-                    self.split_target_pane(tab_id, target_pane, axis);
+                    self.split_target_pane(window_scope, tab_id, target_pane, axis);
                 }
                 Task::none()
             }
             Message::SplitPane { pane_id, axis } => {
-                if let Some(tab_id) = self.workspace.active_tab_id() {
-                    self.split_target_pane(tab_id, pane_id, axis);
+                if let Some(tab_id) = self
+                    .workspace_for_pane_mut(pane_id)
+                    .and_then(|ws| ws.tabs().iter().find(|t| t.root.session_for_pane(pane_id).is_some()))
+                    .map(|t| t.id)
+                {
+                    self.split_target_pane(window_scope, tab_id, pane_id, axis);
                 }
                 Task::none()
             }
             Message::ClosePane(pane_id) => {
-                if let Some(tab_id) = self.workspace.active_tab_id() {
-                    self.close_target_pane(tab_id, pane_id);
+                if let Some(tab_id) = self
+                    .workspace_for_pane_mut(pane_id)
+                    .and_then(|ws| ws.tabs().iter().find(|t| t.root.session_for_pane(pane_id).is_some()))
+                    .map(|t| t.id)
+                {
+                    self.close_target_pane(window_scope, tab_id, pane_id);
                 }
                 Task::none()
             }
             Message::CloseFocusedPane => {
                 if let Some((tab_id, pane_id)) = self
-                    .workspace
-                    .active_tab()
+                    .target_workspace(window_scope)
+                    .and_then(|ws| ws.active_tab())
                     .map(|tab| (tab.id, tab.focused_pane))
                 {
-                    self.close_target_pane(tab_id, pane_id);
+                    self.close_target_pane(window_scope, tab_id, pane_id);
                 }
                 Task::none()
             }
             Message::ResizeSplit { split_id, ratio } => {
-                if let Some(tab_id) = self.workspace.active_tab_id() {
-                    self.workspace.resize_split(tab_id, split_id, ratio);
+                if let Some(ws) = self.workspace_for_split_mut(split_id)
+                    && let Some(tab_id) = ws
+                        .tabs()
+                        .iter()
+                        .find(|t| t.root.find_split(split_id).is_some())
+                        .map(|t| t.id)
+                {
+                    ws.resize_split(tab_id, split_id, ratio);
                 }
                 Task::none()
             }
             Message::FocusPane(pane_id) => {
-                if let Some(tab_id) = self.workspace.active_tab_id() {
-                    self.workspace.focus_pane(tab_id, pane_id);
+                if let Some(ws) = self.workspace_for_pane_mut(pane_id)
+                    && let Some(tab_id) = ws
+                        .tabs()
+                        .iter()
+                        .find(|t| t.root.session_for_pane(pane_id).is_some())
+                        .map(|t| t.id)
+                {
+                    ws.focus_pane(tab_id, pane_id);
                 }
                 Task::none()
             }
             Message::FocusSession(session_id) => {
-                self.workspace.focus_session(session_id);
+                if let Some(wid) = self
+                    .window_workspaces
+                    .iter()
+                    .find_map(|(&wid, w)| w.workspace.contains_session(session_id).then_some(wid))
+                {
+                    self.active_window = Some(wid);
+                }
+                if let Some(ws) = self.workspace_for_session_mut(session_id) {
+                    ws.focus_session(session_id);
+                }
                 Task::none()
             }
             Message::MoveFocus(direction) => {
-                if let Some(tab_id) = self.workspace.active_tab_id() {
-                    self.workspace.move_focus(tab_id, direction);
+                if let Some(ws) = self.target_workspace_mut(window_scope)
+                    && let Some(tab_id) = ws.active_tab_id()
+                {
+                    ws.move_focus(tab_id, direction);
                 }
                 Task::none()
             }
             Message::CycleFocus(direction) => {
-                if let Some(tab_id) = self.workspace.active_tab_id() {
-                    self.workspace.cycle_focus(tab_id, direction);
+                if let Some(ws) = self.target_workspace_mut(window_scope)
+                    && let Some(tab_id) = ws.active_tab_id()
+                {
+                    ws.cycle_focus(tab_id, direction);
                 }
                 Task::none()
             }
             Message::TogglePaneZoom => {
-                if let Some(tab_id) = self.workspace.active_tab_id() {
-                    self.workspace.toggle_zoom(tab_id);
+                if let Some(ws) = self.target_workspace_mut(window_scope)
+                    && let Some(tab_id) = ws.active_tab_id()
+                {
+                    ws.toggle_zoom(tab_id);
                 }
                 Task::none()
             }
             Message::ToggleBroadcastInput => {
-                if let Some(tab_id) = self.workspace.active_tab_id() {
-                    self.workspace.toggle_broadcast_input(tab_id);
+                if let Some(ws) = self.target_workspace_mut(window_scope)
+                    && let Some(tab_id) = ws.active_tab_id()
+                {
+                    ws.toggle_broadcast_input(tab_id);
                 }
                 Task::none()
             }
             Message::SetBroadcastInput(enabled) => {
-                if let Some(tab_id) = self.workspace.active_tab_id() {
-                    self.workspace.set_broadcast_input(tab_id, enabled);
+                if let Some(ws) = self.target_workspace_mut(window_scope)
+                    && let Some(tab_id) = ws.active_tab_id()
+                {
+                    ws.set_broadcast_input(tab_id, enabled);
                 }
                 Task::none()
             }
@@ -1684,7 +2491,7 @@ impl AppState {
                     .find(|p| p.id == profile_id)
                     .cloned()
                 {
-                    self.launch_profile_entry(&profile, disposition)
+                    self.launch_profile_entry(window_scope, &profile, disposition)
                 } else {
                     self.last_error = Some(format!("unknown profile id: {profile_id}"));
                     Task::none()
@@ -1692,7 +2499,7 @@ impl AppState {
             }
             Message::LaunchSystemSsh { alias, disposition } => {
                 self.command_palette.close();
-                self.launch_system_ssh_entry(&alias, disposition)
+                self.launch_system_ssh_entry(window_scope, &alias, disposition)
             }
             Message::SetSessionTransportStatus { session_id, status } => {
                 self.update_ssh_slot_status(session_id, status);
@@ -1748,11 +2555,13 @@ impl AppState {
                 self.command_palette.set_quick_connect_input(input);
                 Task::none()
             }
-            Message::CommandPaletteConfirm => self.handle_command_palette_confirm(),
-            Message::CommandPaletteExecuteItem(action) => self.execute_palette_action(action),
+            Message::CommandPaletteConfirm => self.handle_command_palette_confirm(window_scope),
+            Message::CommandPaletteExecuteItem(action) => {
+                self.execute_palette_action(window_scope, action)
+            }
             Message::QuickConnect(target) => {
                 self.command_palette.close();
-                self.launch_quick_connect(target)
+                self.launch_quick_connect(window_scope, target)
             }
             Message::SetTunnelSummary(summary) => {
                 self.status_bar.set_tunnels(summary);
@@ -1767,7 +2576,7 @@ impl AppState {
     }
 
     fn handle_ssh_event(&mut self, session_id: SessionId, event: SshUiEvent) {
-        let Some(SessionRecord::Ssh(slot)) = self.sessions.get_mut(&session_id) else {
+        let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) else {
             return;
         };
 
@@ -1835,15 +2644,18 @@ impl AppState {
     fn sync_terminal_options_to_sessions(&mut self) {
         let shape = cursor_style_to_shape(self.config.terminal.cursor_style);
         let scrollback = self.config.terminal.scrollback_lines;
-        for record in self.sessions.values_mut() {
-            record.buffer().apply_options(scrollback, shape);
-            record.refresh_snapshot();
+        for entry in self.sessions.values_mut() {
+            if let Some(buf) = entry.buffer() {
+                buf.apply_options(scrollback, shape);
+                entry.refresh_snapshot();
+            }
         }
         if self.search.open && !self.search.query.is_empty() {
             let active_buf = self
                 .active_session_id()
                 .and_then(|id| self.sessions.get(&id))
-                .map(|r| Arc::clone(r.buffer()));
+                .and_then(SessionEntry::buffer)
+                .cloned();
             self.search
                 .refresh_matches_buffer(active_buf.as_deref(), false);
         }
@@ -1851,12 +2663,13 @@ impl AppState {
 
     fn focus_search_match(&mut self, target: Option<GridSearchMatch>) {
         if let Some(matched) = target
-            && let Some(record) = self
+            && let Some(entry) = self
                 .active_session_id()
                 .and_then(|id| self.sessions.get_mut(&id))
+            && let Some(buf) = entry.buffer().cloned()
         {
-            record.buffer().scroll_to_match(matched);
-            record.refresh_snapshot();
+            buf.scroll_to_match(matched);
+            entry.refresh_snapshot();
         }
     }
 
@@ -1869,10 +2682,14 @@ impl AppState {
     }
 
     fn dispatch_paste_to_session(&mut self, session_id: SessionId, text: &str) {
-        let Some(record) = self.sessions.get(&session_id) else {
+        let Some(buf) = self
+            .sessions
+            .get(&session_id)
+            .and_then(SessionEntry::buffer)
+        else {
             return;
         };
-        let bytes = format_paste_bytes(text, record.buffer().is_bracketed_paste());
+        let bytes = format_paste_bytes(text, buf.is_bracketed_paste());
         self.write_bytes_to_session(session_id, &bytes);
     }
 
@@ -1880,14 +2697,17 @@ impl AppState {
         if bytes.is_empty() {
             return;
         }
-        let targets = self.workspace.input_targets_for_session(session_id);
+        let targets = self
+            .workspace_for_session_mut(session_id)
+            .map(|ws| ws.input_targets_for_session(session_id))
+            .unwrap_or_else(|| vec![session_id]);
         let is_broadcast = targets.len() > 1;
         for target_id in targets {
             if is_broadcast {
                 let skip = match self.sessions.get(&target_id) {
-                    Some(SessionRecord::Local(s)) => s.exited.is_some(),
-                    Some(SessionRecord::Ssh(s)) => s.active.is_none(),
-                    None => true,
+                    Some(SessionEntry::Local(s)) => s.exited.is_some(),
+                    Some(SessionEntry::Ssh(s)) => s.active.is_none(),
+                    Some(SessionEntry::Remote(_)) | None => true,
                 };
                 if skip {
                     continue;
@@ -1901,36 +2721,40 @@ impl AppState {
         if bytes.is_empty() {
             return;
         }
-        let Some(record) = self.sessions.get_mut(&session_id) else {
+        let Some(entry) = self.sessions.get_mut(&session_id) else {
             return;
         };
-        let write_result = match record {
-            SessionRecord::Local(session) => session.pty.write_bytes(bytes).map_err(|e| e.to_string()),
-            SessionRecord::Ssh(slot) => {
+        let write_result = match entry {
+            SessionEntry::Local(session) => session.pty.write_bytes(bytes).map_err(|e| e.to_string()),
+            SessionEntry::Ssh(slot) => {
                 if let Some(ssh) = &slot.active {
                     ssh.write_bytes(bytes).map_err(|e| e.to_string())
                 } else {
                     return;
                 }
             }
+            SessionEntry::Remote(_) => return,
         };
         if let Err(err) = write_result {
             error!(session = session_id.0, error = %err, "failed to write terminal input");
             self.last_error = Some(err);
-        } else if record.buffer().display_offset() > 0 {
-            record.buffer().scroll_to_bottom();
-            record.refresh_snapshot();
+        } else if let Some(buf) = entry.buffer().cloned()
+            && buf.display_offset() > 0
+        {
+            buf.scroll_to_bottom();
+            entry.refresh_snapshot();
         }
     }
 
     /// Renders the workspace tab strip, collapsible Left Sidebar, status/reload/Vault/SSH banners,
-    /// active split panes, Status Bar, Search/Paste overlays, and Command Palette modal.
-    pub fn view(&self, _window_id: window::Id) -> Element<'_, Message, Theme, iced::Renderer> {
-        let mut main_pane_col = column![self.render_tab_strip()]
+    /// active split panes, Status Bar, Search/Paste overlays, Command Palette, and Close Guard modal.
+    pub fn view(&self, window_id: window::Id) -> Element<'_, Message, Theme, iced::Renderer> {
+        let ws = self.window_workspaces.get(&window_id).map(|w| &w.workspace);
+        let mut main_pane_col = column![self.render_tab_strip(ws)]
             .width(Length::Fill)
             .height(Length::Fill);
 
-        if let Some(banner_text) = self.broadcast_banner_text() {
+        if let Some(banner_text) = ws.and_then(Self::broadcast_banner_for_workspace) {
             main_pane_col = main_pane_col.push(render_broadcast_banner(banner_text));
         }
 
@@ -1951,7 +2775,7 @@ impl AppState {
             main_pane_col = main_pane_col.push(vault_bar);
         }
 
-        let body = match self.workspace.active_tab() {
+        let body = match ws.and_then(|w| w.active_tab()) {
             Some(tab) => self.render_tab_body(tab),
             None => self.render_empty_workspace(),
         };
@@ -1969,7 +2793,7 @@ impl AppState {
             main_pane_col.into()
         };
 
-        let status_snapshot = self.status_bar_snapshot();
+        let status_snapshot = self.status_bar_snapshot_for_workspace(ws);
         let base_layout: Element<'_, Message, Theme, iced::Renderer> = column![
             workspace_row,
             render_status_bar(&status_snapshot),
@@ -1997,72 +2821,94 @@ impl AppState {
             ));
         }
 
-        ShortcutInterceptor::with_palette(
+        let active_tab = ws.and_then(|w| w.active_tab_id());
+        let intercepted = ShortcutInterceptor::with_palette(
             layers.into(),
-            self.active_tab_id(),
+            active_tab,
             self.command_palette.is_open(),
+        );
+        let scoped = intercepted.map(move |msg| Message::InWindow {
+            window_id,
+            inner: Box::new(msg),
+        });
+        wrap_with_close_guard_modal(
+            scoped,
+            self.close_guard,
+            window_id,
+            Message::CloseGuardCancel,
+            Message::CloseGuardKeepRunningInBackground,
+            Message::CloseGuardStopAndQuit,
         )
     }
 
-    fn render_tab_strip(&self) -> Element<'_, Message, Theme, iced::Renderer> {
-        let active_tab_id = self.active_tab_id();
-        let tab_count = self.workspace.tab_count();
+    fn render_tab_strip(
+        &self,
+        ws: Option<&Workspace>,
+    ) -> Element<'_, Message, Theme, iced::Renderer> {
+        let active_tab_id = ws.and_then(|w| w.active_tab_id());
+        let tab_count = ws.map_or(0, |w| w.tab_count());
 
         let mut tabs_row = row![].spacing(4).align_y(Alignment::Center);
 
-        for (idx, tab) in self.workspace.tabs().iter().enumerate() {
-            let is_active = Some(tab.id) == active_tab_id;
-            let label = self.tab_display_title(tab);
+        if let Some(ws) = ws {
+            for (idx, tab) in ws.tabs().iter().enumerate() {
+                let is_active = Some(tab.id) == active_tab_id;
+                let label = self.tab_display_title(tab);
 
-            let mut tab_controls = row![].spacing(2).align_y(Alignment::Center);
-            tab_controls = tab_controls.push(
-                button(text(label).size(13))
-                    .padding([4, 8])
-                    .style(if is_active {
-                        button::primary
-                    } else {
-                        button::secondary
-                    })
-                    .on_press(Message::SelectTab(tab.id)),
-            );
+                let mut tab_controls = row![].spacing(2).align_y(Alignment::Center);
+                tab_controls = tab_controls.push(
+                    button(text(label).size(13))
+                        .padding([4, 8])
+                        .style(if is_active {
+                            button::primary
+                        } else {
+                            button::secondary
+                        })
+                        .on_press(Message::SelectTab(tab.id)),
+                );
 
-            if tab_count > 1 {
-                if idx > 0 {
-                    tab_controls = tab_controls.push(
-                        button(text("<").size(11))
-                            .padding([4, 5])
-                            .style(button::subtle)
-                            .on_press(Message::MoveTabBy {
-                                tab_id: tab.id,
-                                delta: -1,
-                            }),
-                    );
+                if tab_count > 1 {
+                    if idx > 0 {
+                        tab_controls = tab_controls.push(
+                            button(text("<").size(11))
+                                .padding([4, 5])
+                                .style(button::subtle)
+                                .on_press(Message::MoveTabBy {
+                                    tab_id: tab.id,
+                                    delta: -1,
+                                }),
+                        );
+                    }
+                    if idx + 1 < tab_count {
+                        tab_controls = tab_controls.push(
+                            button(text(">").size(11))
+                                .padding([4, 5])
+                                .style(button::subtle)
+                                .on_press(Message::MoveTabBy {
+                                    tab_id: tab.id,
+                                    delta: 1,
+                                }),
+                        );
+                    }
                 }
-                if idx + 1 < tab_count {
-                    tab_controls = tab_controls.push(
-                        button(text(">").size(11))
-                            .padding([4, 5])
-                            .style(button::subtle)
-                            .on_press(Message::MoveTabBy {
-                                tab_id: tab.id,
-                                delta: 1,
-                            }),
-                    );
-                }
+
+                tab_controls = tab_controls.push(
+                    button(text("x").size(11))
+                        .padding([4, 6])
+                        .style(button::subtle)
+                        .on_press(Message::CloseTab(tab.id)),
+                );
+
+                tabs_row = tabs_row.push(tab_controls);
             }
-
-            tab_controls = tab_controls.push(
-                button(text("x").size(11))
-                    .padding([4, 6])
-                    .style(button::subtle)
-                    .on_press(Message::CloseTab(tab.id)),
-            );
-
-            tabs_row = tabs_row.push(tab_controls);
         }
 
-        let active_zoomed = self.active_tab_zoomed_pane().is_some();
-        let active_broadcast = self.is_broadcast_banner_visible();
+        let active_zoomed = ws
+            .and_then(|w| w.active_tab())
+            .is_some_and(|t| t.zoomed_pane.is_some());
+        let active_broadcast = ws
+            .and_then(|w| w.active_tab())
+            .is_some_and(|t| t.broadcast_input);
 
         let mut actions = row![
             button(text("Palette").size(12))
@@ -2073,6 +2919,10 @@ impl AppState {
                 .padding([4, 8])
                 .style(button::secondary)
                 .on_press(Message::NewTab),
+            button(text("+ Win").size(12))
+                .padding([4, 8])
+                .style(button::subtle)
+                .on_press(Message::NewWindow),
         ]
         .spacing(4)
         .align_y(Alignment::Center);
@@ -2231,7 +3081,7 @@ impl AppState {
         };
 
         let content = match self.sessions.get(&session_id) {
-            Some(SessionRecord::Local(session)) => TerminalViewport::with_focus(
+            Some(SessionEntry::Local(session)) => TerminalViewport::with_focus(
                 session.id,
                 Arc::clone(&session.snapshot),
                 options,
@@ -2239,7 +3089,8 @@ impl AppState {
                 active_match,
                 terminal_focused,
             ),
-            Some(SessionRecord::Ssh(slot)) => {
+            Some(SessionEntry::Remote(remote)) => render_remote_placeholder(remote),
+            Some(SessionEntry::Ssh(slot)) => {
                 let viewport = TerminalViewport::with_focus(
                     slot.id,
                     Arc::clone(&slot.snapshot),
@@ -2300,7 +3151,7 @@ impl AppState {
             .or_else(|| {
                 tab.focused_session_id()
                     .and_then(|sid| self.sessions.get(&sid))
-                    .map(SessionRecord::title)
+                    .map(SessionEntry::title)
             })
             .unwrap_or("Shell");
 
@@ -2320,18 +3171,44 @@ impl AppState {
     }
 
     /// Computes the window title for `window_id`.
-    pub fn title(&self, _window_id: window::Id) -> String {
-        if let Some(record) = self.active_session_id().and_then(|id| self.sessions.get(&id)) {
-            let session_title = record.title();
-            let mut title = match record.exited() {
-                Some(Some(code)) => format!("Termewnal — {session_title} [exited: {code}]"),
-                Some(None) => format!("Termewnal — {session_title} [exited]"),
-                None => format!("Termewnal — {session_title}"),
+    pub fn title(&self, window_id: window::Id) -> String {
+        let ws = self
+            .window_workspaces
+            .get(&window_id)
+            .map(|w| &w.workspace)
+            .or_else(|| {
+                self.retired_final_window
+                    .as_ref()
+                    .filter(|(id, _)| *id == window_id)
+                    .map(|(_, w)| &w.workspace)
+            })
+            .or_else(|| self.primary_workspace());
+        let tab = ws.and_then(|w| w.active_tab());
+        if let Some(entry) = tab
+            .and_then(|t| t.focused_session_id())
+            .and_then(|id| self.sessions.get(&id))
+        {
+            let mut title = match entry {
+                SessionEntry::Local(session) => match session.exited {
+                    Some(Some(code)) => format!("Termewnal — {} [exited: {code}]", session.title),
+                    Some(None) => format!("Termewnal — {} [exited]", session.title),
+                    None => format!("Termewnal — {}", session.title),
+                },
+                SessionEntry::Remote(remote) => format!(
+                    "Termewnal — {} [{}]",
+                    remote.title,
+                    remote.transport_status.label()
+                ),
+                SessionEntry::Ssh(slot) => format!(
+                    "Termewnal — {} [{}]",
+                    slot.title,
+                    slot.transport_status.label()
+                ),
             };
-            if self.active_tab_zoomed_pane().is_some() {
+            if tab.is_some_and(|t| t.zoomed_pane.is_some()) {
                 title.push_str(" [ZOOM]");
             }
-            if self.is_broadcast_banner_visible() {
+            if tab.is_some_and(|t| t.broadcast_input) {
                 title.push_str(" [BROADCAST INPUT]");
             }
             title
@@ -2345,11 +3222,12 @@ impl AppState {
         iced_theme_from_name(&self.config.terminal.theme)
     }
 
-    /// Subscribes to window lifecycle events, live PTY output streams, config hot-reload, and
-    /// Vault auto-lock ticks.
+    /// Subscribes to window lifecycle events, single-instance IPC commands, config hot-reload,
+    /// Vault auto-lock ticks, and live PTY output streams.
     pub fn subscription(&self) -> Subscription<Message> {
         let close_requests = window::close_requests().map(Message::CloseRequested);
         let closed = window::close_events().map(Message::WindowClosed);
+        let win_events = window::events().filter_map(map_window_event);
         let shortcuts = event::listen_with(window_shortcut_event);
         let config_watch = Subscription::run_with(
             ConfigWatchSubKey {
@@ -2359,13 +3237,23 @@ impl AppState {
             config_watch_stream,
         );
 
-        let pty_subs = self.sessions.iter().map(|(&session_id, record)| {
-            Subscription::run_with(
+        let pty_subs = self.sessions.iter().filter_map(|(&session_id, entry)| {
+            let buffer = entry.buffer()?;
+            Some(Subscription::run_with(
                 PtySubKey {
                     session_id,
-                    buffer: Arc::clone(record.buffer()),
+                    buffer: Arc::clone(buffer),
                 },
                 pty_event_stream,
+            ))
+        });
+
+        let ipc_sub = self.ipc_rx.as_ref().map(|rx| {
+            Subscription::run_with(
+                IpcSubKey {
+                    rx: Arc::clone(rx),
+                },
+                ipc_event_stream,
             )
         });
 
@@ -2374,9 +3262,10 @@ impl AppState {
         .then(|| iced::time::every(Duration::from_secs(15)).map(|_| Message::VaultAutoLockTick));
 
         Subscription::batch(
-            [close_requests, closed, shortcuts, config_watch]
+            [close_requests, closed, win_events, shortcuts, config_watch]
                 .into_iter()
                 .chain(vault_tick)
+                .chain(ipc_sub)
                 .chain(pty_subs),
         )
     }
@@ -2425,9 +3314,21 @@ impl AppState {
         password.zeroize();
     }
 
-    /// Returns the workspace tab and split-pane layout state.
+    /// Returns the active window's workspace tab and split-pane layout state.
     pub fn workspace(&self) -> &Workspace {
-        &self.workspace
+        self.primary_workspace().unwrap_or(&self.empty_workspace)
+    }
+
+    /// Returns the workspace state owned by `window_id`, if present.
+    pub fn window_workspace(&self, window_id: window::Id) -> Option<&Workspace> {
+        self.window_workspaces
+            .get(&window_id)
+            .map(|w| &w.workspace)
+    }
+
+    /// Returns all currently open window IDs in deterministic order.
+    pub fn window_ids(&self) -> Vec<window::Id> {
+        self.windows.iter().copied().collect()
     }
 
     /// Returns the collapsible Left Sidebar state.
@@ -2442,14 +3343,18 @@ impl AppState {
 
     /// Computes an inspectable [`StatusBarSnapshot`] from the active `Session`, `Tunnel`, and `Transfer` state.
     pub fn status_bar_snapshot(&self) -> StatusBarSnapshot {
-        let active_tab = self.workspace.active_tab();
+        self.status_bar_snapshot_for_workspace(self.primary_workspace())
+    }
+
+    fn status_bar_snapshot_for_workspace(&self, ws: Option<&Workspace>) -> StatusBarSnapshot {
+        let active_tab = ws.and_then(|w| w.active_tab());
         let zoomed = active_tab.is_some_and(|tab| tab.zoomed_pane.is_some());
         let broadcast = active_tab.is_some_and(|tab| tab.broadcast_input);
         let active_session = active_tab
             .and_then(|tab| tab.focused_session_id())
             .and_then(|sid| self.sessions.get(&sid))
-            .map(|record| match record {
-                SessionRecord::Local(s) => {
+            .map(|entry| match entry {
+                SessionEntry::Local(s) => {
                     let (cols, rows) = (s.snapshot.cols, s.snapshot.rows);
                     SessionStatusHook {
                         session_id: s.id,
@@ -2464,7 +3369,25 @@ impl AppState {
                         broadcast,
                     }
                 }
-                SessionRecord::Ssh(slot) => SessionStatusHook {
+                SessionEntry::Remote(remote) => {
+                    let target = match &remote.username {
+                        Some(u) if !u.is_empty() => format!("{u}@{}:{}", remote.host, remote.port),
+                        _ => format!("{}:{}", remote.host, remote.port),
+                    };
+                    SessionStatusHook {
+                        session_id: remote.id,
+                        kind: SessionKindLabel::Ssh,
+                        title: remote.title.clone(),
+                        target,
+                        cols: 80,
+                        rows: 24,
+                        exited: None,
+                        transport_status: remote.transport_status.clone(),
+                        zoomed,
+                        broadcast,
+                    }
+                }
+                SessionEntry::Ssh(slot) => SessionStatusHook {
                     session_id: slot.id,
                     kind: SessionKindLabel::Ssh,
                     title: slot.title.clone(),
@@ -2492,27 +3415,44 @@ impl AppState {
     pub fn command_palette_items(&self) -> Vec<PaletteItem> {
         let active_sid = self.active_session_id();
         let mut sessions = Vec::new();
-        for tab in self.workspace.tabs() {
-            for sid in tab.root.session_ids() {
-                if let Some(record) = self.sessions.get(&sid) {
-                    let target_label = match record {
-                        SessionRecord::Local(s) => {
-                            format!("Local · {}", s.pty.shell().display_name)
-                        }
-                        SessionRecord::Ssh(slot) => {
-                            format!(
-                                "SSH · {} ({})",
-                                slot.target.display_addr(),
-                                slot.transport_status.label()
-                            )
-                        }
-                    };
-                    sessions.push(PaletteSessionEntry {
-                        session_id: sid,
-                        title: record.title().to_string(),
-                        target_label,
-                        is_active: active_sid == Some(sid),
-                    });
+        let workspaces: Box<dyn Iterator<Item = &Workspace> + '_> =
+            if !self.window_workspaces.is_empty() {
+                Box::new(self.window_workspaces.values().map(|w| &w.workspace))
+            } else {
+                Box::new(self.pending_windows.iter().map(|w| &w.workspace))
+            };
+        for ws in workspaces {
+            for tab in ws.tabs() {
+                for sid in tab.root.session_ids() {
+                    if let Some(entry) = self.sessions.get(&sid) {
+                        let target_label = match entry {
+                            SessionEntry::Local(s) => {
+                                format!("Local · {}", s.pty.shell().display_name)
+                            }
+                            SessionEntry::Remote(remote) => {
+                                let addr = match &remote.username {
+                                    Some(u) if !u.is_empty() => {
+                                        format!("{u}@{}:{}", remote.host, remote.port)
+                                    }
+                                    _ => format!("{}:{}", remote.host, remote.port),
+                                };
+                                format!("SSH · {addr} ({})", remote.transport_status.label())
+                            }
+                            SessionEntry::Ssh(slot) => {
+                                format!(
+                                    "SSH · {} ({})",
+                                    slot.target.display_addr(),
+                                    slot.transport_status.label()
+                                )
+                            }
+                        };
+                        sessions.push(PaletteSessionEntry {
+                            session_id: sid,
+                            title: entry.title().to_string(),
+                            target_label,
+                            is_active: active_sid == Some(sid),
+                        });
+                    }
                 }
             }
         }
@@ -2526,31 +3466,32 @@ impl AppState {
 
     /// Returns the currently active `TabId`, if any tab is open.
     pub fn active_tab_id(&self) -> Option<TabId> {
-        self.workspace.active_tab_id()
+        self.primary_workspace().and_then(|w| w.active_tab_id())
     }
 
     /// Returns the currently active `SessionId`.
     pub fn active_session_id(&self) -> Option<SessionId> {
-        self.workspace
-            .active_tab()
+        self.primary_workspace()
+            .and_then(|w| w.active_tab())
             .and_then(|tab| tab.focused_session_id())
     }
 
     /// Returns the zoomed `PaneId` in the active tab, if pane zoom is currently active.
     pub fn active_tab_zoomed_pane(&self) -> Option<PaneId> {
-        self.workspace.active_tab().and_then(|tab| tab.zoomed_pane)
+        self.primary_workspace()
+            .and_then(|w| w.active_tab())
+            .and_then(|tab| tab.zoomed_pane)
     }
 
     /// Returns `true` when the active workspace tab has Broadcast Input mode enabled.
     pub fn is_broadcast_banner_visible(&self) -> bool {
-        self.workspace
-            .active_tab()
+        self.primary_workspace()
+            .and_then(|w| w.active_tab())
             .is_some_and(|tab| tab.broadcast_input)
     }
 
-    /// Returns the warning banner copy when Broadcast Input is active in the current tab.
-    pub fn broadcast_banner_text(&self) -> Option<String> {
-        let tab = self.workspace.active_tab()?;
+    fn broadcast_banner_for_workspace(ws: &Workspace) -> Option<String> {
+        let tab = ws.active_tab()?;
         if !tab.broadcast_input {
             return None;
         }
@@ -2566,26 +3507,173 @@ impl AppState {
         &self.ssh_ui
     }
 
-    /// Returns an immutable reference to a runtime local shell `Session` by `id`.
+    /// Returns the warning banner copy when Broadcast Input is active in the current tab.
+    pub fn broadcast_banner_text(&self) -> Option<String> {
+        let ws = self.primary_workspace()?;
+        Self::broadcast_banner_for_workspace(ws)
+    }
+
+    /// Returns an immutable reference to a runtime local `Session` by `id`.
     pub fn session(&self, id: SessionId) -> Option<&LocalSession> {
-        match self.sessions.get(&id) {
-            Some(SessionRecord::Local(session)) => Some(session),
-            _ => None,
-        }
+        self.sessions.get(&id).and_then(SessionEntry::as_local)
+    }
+
+    /// Returns an immutable reference to a restored or pending remote `Session` by `id`.
+    pub fn remote_session(&self, id: SessionId) -> Option<&RemoteSession> {
+        self.sessions.get(&id).and_then(SessionEntry::as_remote)
     }
 
     /// Returns an immutable reference to an SSH `Session` slot by `id`.
     pub fn ssh_session(&self, id: SessionId) -> Option<&SshSessionSlot> {
         match self.sessions.get(&id) {
-            Some(SessionRecord::Ssh(slot)) => Some(slot),
+            Some(SessionEntry::Ssh(slot)) => Some(slot),
             _ => None,
         }
     }
 
     fn update_ssh_slot_status(&mut self, session_id: SessionId, status: TransportStatus) {
-        if let Some(SessionRecord::Ssh(slot)) = self.sessions.get_mut(&session_id) {
-            slot.status_message = format_ssh_slot_message(&slot.target, &status);
-            slot.transport_status = status;
+        match self.sessions.get_mut(&session_id) {
+            Some(SessionEntry::Ssh(slot)) => {
+                slot.status_message = format_ssh_slot_message(&slot.target, &status);
+                slot.transport_status = status;
+            }
+            Some(SessionEntry::Remote(remote)) => {
+                remote.transport_status = status;
+            }
+            _ => {}
+        }
+    }
+
+    /// Returns connection intents recorded for remote `Session`s on startup or manual connect.
+    pub fn pending_remote_connects(&self) -> &[RemoteConnectIntent] {
+        &self.pending_remote_connects
+    }
+
+    /// Exports the current multi-window workspace geometry and session descriptors to [`WorkspaceLayout`].
+    pub fn to_workspace_layout(&self) -> WorkspaceLayout {
+        let windows_iter: Box<dyn Iterator<Item = &WindowState> + '_> =
+            if !self.window_workspaces.is_empty() {
+                Box::new(self.window_workspaces.values())
+            } else {
+                Box::new(self.pending_windows.iter())
+            };
+
+        let windows = windows_iter
+            .filter(|w| w.workspace.tab_count() > 0)
+            .map(|win_state| {
+                let ws = &win_state.workspace;
+                let active_tab = ws
+                    .active_tab_id()
+                    .and_then(|aid| ws.tabs().iter().position(|t| t.id == aid))
+                    .unwrap_or(0);
+                let tabs = ws
+                    .tabs()
+                    .iter()
+                    .map(|tab| {
+                        let pane_ids = tab.root.pane_ids();
+                        let focused_pane = pane_ids
+                            .iter()
+                            .position(|&pid| pid == tab.focused_pane)
+                            .unwrap_or(0);
+                        let zoomed_pane = tab
+                            .zoomed_pane
+                            .and_then(|zp| pane_ids.iter().position(|&pid| pid == zp));
+                        TabLayout {
+                            title: tab.title.clone(),
+                            focused_pane,
+                            zoomed_pane,
+                            root: self.export_split_node(&tab.root),
+                        }
+                    })
+                    .collect();
+
+                WindowLayout {
+                    width: win_state.width,
+                    height: win_state.height,
+                    active_tab,
+                    tabs,
+                }
+            })
+            .collect();
+
+        WorkspaceLayout {
+            schema_version: CURRENT_SCHEMA_VERSION,
+            windows,
+        }
+    }
+
+    fn export_split_node(&self, node: &SplitNode) -> LayoutSplitNode {
+        match node {
+            SplitNode::Leaf { session_id, .. } => LayoutSplitNode::Leaf {
+                session: self.export_session_descriptor(*session_id),
+            },
+            SplitNode::Split {
+                axis,
+                ratio,
+                first,
+                second,
+                ..
+            } => LayoutSplitNode::Split {
+                axis: match axis {
+                    SplitAxis::Horizontal => LayoutSplitAxis::Horizontal,
+                    SplitAxis::Vertical => LayoutSplitAxis::Vertical,
+                },
+                ratio: *ratio,
+                first: Box::new(self.export_split_node(first)),
+                second: Box::new(self.export_split_node(second)),
+            },
+        }
+    }
+
+    fn export_session_descriptor(&self, session_id: SessionId) -> SessionDescriptor {
+        match self.sessions.get(&session_id) {
+            Some(SessionEntry::Local(local)) => SessionDescriptor::Local {
+                profile_id: local.profile_id.clone(),
+                title: Some(local.title.clone()),
+                working_dir: local
+                    .pty
+                    .current_working_dir()
+                    .or_else(|| local.initial_working_dir.clone()),
+                shell: Some(local.pty.shell().program.clone()),
+            },
+            Some(SessionEntry::Remote(remote)) => SessionDescriptor::Remote {
+                profile_id: remote.profile_id.clone(),
+                host: remote.host.clone(),
+                port: remote.port,
+                username: remote.username.clone(),
+                title: Some(remote.title.clone()),
+                auto_connect_on_startup: remote.auto_connect_on_startup,
+            },
+            Some(SessionEntry::Ssh(slot)) => SessionDescriptor::Remote {
+                profile_id: slot.target.profile_id.clone(),
+                host: slot.target.host.clone(),
+                port: slot.target.port,
+                username: Some(slot.target.username.clone()),
+                title: Some(slot.title.clone()),
+                auto_connect_on_startup: slot.target.auto_connect_on_startup,
+            },
+            None => SessionDescriptor::Local {
+                profile_id: None,
+                title: None,
+                working_dir: None,
+                shell: None,
+            },
+        }
+    }
+
+    /// Atomically persists the current workspace layout to `layout.toml`.
+    pub fn save_workspace_layout(&self) -> Result<(), String> {
+        let layout = self.to_workspace_layout();
+        save_layout(&self.paths, &layout).map_err(|err| err.to_string())
+    }
+
+    fn save_layout_best_effort(&self) {
+        let layout = self.to_workspace_layout();
+        if layout.windows.is_empty() {
+            return;
+        }
+        if let Err(err) = save_layout(&self.paths, &layout) {
+            warn!(error = %err, "failed to save workspace layout");
         }
     }
 
@@ -2597,6 +3685,26 @@ impl AppState {
     /// Returns the most recent non-fatal runtime error message, if any.
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
+    }
+
+    /// Returns the default atomic tracker for Standalone `Tunnel` and `Transfer` counts.
+    pub fn background_work_tracker(&self) -> &Arc<BackgroundWorkTracker> {
+        &self.background_work_tracker
+    }
+
+    /// Replaces the [`BackgroundWorkSource`] queried when closing the final window.
+    pub fn set_background_work_source(&mut self, source: Arc<dyn BackgroundWorkSource>) {
+        self.background_work_source = source;
+    }
+
+    /// Returns the current Close Guard modal state.
+    pub fn close_guard(&self) -> CloseGuardState {
+        self.close_guard
+    }
+
+    /// Returns the current daemon lifecycle state (`Active`, `BackgroundRunning`, or `Exiting`).
+    pub fn lifecycle(&self) -> DaemonLifecycle {
+        self.lifecycle
     }
 
     /// Returns the active `Ctrl+F` search bar state.
@@ -2729,6 +3837,39 @@ fn pty_event_stream(
     }))
 }
 
+#[derive(Clone)]
+struct IpcSubKey {
+    rx: Arc<Mutex<Option<mpsc::UnboundedReceiver<IpcCommand>>>>,
+}
+
+impl Hash for IpcSubKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        (Arc::as_ptr(&self.rx) as usize).hash(state);
+    }
+}
+
+fn ipc_event_stream(key: &IpcSubKey) -> std::pin::Pin<Box<dyn Stream<Item = Message> + Send>> {
+    let rx_slot = Arc::clone(&key.rx);
+    Box::pin(iced::stream::channel(32, async move |mut output| {
+        let maybe_rx = rx_slot.lock().ok().and_then(|mut g| g.take());
+        if let Some(mut rx) = maybe_rx {
+            while let Some(command) = rx.recv().await {
+                if output.send(Message::IpcCommand(command)).await.is_err() {
+                    break;
+                }
+            }
+        }
+    }))
+}
+
+fn map_window_event((id, event): (window::Id, window::Event)) -> Option<Message> {
+    match event {
+        window::Event::Focused => Some(Message::WindowFocused(id)),
+        window::Event::Resized(size) => Some(Message::WindowResized(id, size)),
+        _ => None,
+    }
+}
+
 /// Maps a pressed key + modifiers to a workspace-level [`Message`], if any matches.
 pub fn shortcut_for_key_event(
     key: &Key,
@@ -2824,6 +3965,41 @@ pub fn shortcut_for_key_event_with_palette(
     }
 
     shortcut_for_key_event(key, modifiers, active_tab)
+}
+
+fn render_remote_placeholder(
+    remote: &RemoteSession,
+) -> Element<'static, Message, Theme, iced::Renderer> {
+    let target = match &remote.username {
+        Some(user) if !user.is_empty() => format!("{user}@{}:{}", remote.host, remote.port),
+        _ => format!("{}:{}", remote.host, remote.port),
+    };
+    let status_line = format!("Status: {}", remote.transport_status.label());
+    let mut card = column![
+        text(remote.title.clone()).size(18),
+        text(target).size(14),
+        text(status_line).size(13),
+    ]
+    .spacing(8)
+    .align_x(Alignment::Center);
+
+    if remote.connect_requested {
+        card = card.push(text("Connection requested — awaiting SSH transport wiring").size(12));
+    } else {
+        card = card.push(
+            button(text("Connect").size(14))
+                .padding([6, 16])
+                .style(button::primary)
+                .on_press(Message::ConnectRemoteSession(remote.id)),
+        );
+    }
+
+    container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .into()
 }
 
 fn render_broadcast_banner(banner_text: String) -> Element<'static, Message, Theme, iced::Renderer> {
