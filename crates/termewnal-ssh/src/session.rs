@@ -13,6 +13,7 @@ use crate::TransportStatus;
 use crate::auth::{AgentConnector, SshInteractionHandler};
 use crate::client::{SshConnectConfig, SshTransport};
 use crate::error::SshError;
+use crate::supervisor::ConnectionSupervisor;
 
 enum SessionCmd {
     WriteBytes(Vec<u8>),
@@ -37,8 +38,10 @@ impl Write for ChannelWriteSink {
 
 /// Interactive PTY-backed SSH `Session` streaming terminal I/O into [`TerminalBuffer`].
 pub struct SshSession {
+    transport: Arc<SshTransport>,
     buffer: Arc<TerminalBuffer>,
-    cmd_tx: mpsc::UnboundedSender<SessionCmd>,
+    cmd_tx: Option<mpsc::UnboundedSender<SessionCmd>>,
+    supervisor: Option<ConnectionSupervisor>,
     status: Arc<Mutex<TransportStatus>>,
     used_interactive_auth: bool,
 }
@@ -90,6 +93,7 @@ impl SshSession {
         let rows = rows.max(1);
         buffer.resize(cols, rows);
 
+        let transport = Arc::new(transport);
         let channel = transport.open_session_channel().await?;
         let (mut rx, tx) = channel.split();
 
@@ -110,7 +114,7 @@ impl SshSession {
         let used_interactive_auth = transport.used_interactive_auth();
 
         spawn_channel_pump(
-            transport,
+            Arc::clone(&transport),
             rx,
             tx,
             cmd_rx,
@@ -119,11 +123,32 @@ impl SshSession {
         );
 
         Ok(Self {
+            transport,
             buffer,
-            cmd_tx,
+            cmd_tx: Some(cmd_tx),
+            supervisor: None,
             status,
             used_interactive_auth,
         })
+    }
+
+    /// Wraps an active supervised [`SshTransport`] and [`ConnectionSupervisor`] as an [`SshSession`]
+    /// adapter for `Primary Transport` consumers (e.g. SFTP fallback and UI session callers).
+    pub fn from_supervised(transport: Arc<SshTransport>, supervisor: &ConnectionSupervisor) -> Self {
+        let used_interactive_auth = transport.used_interactive_auth();
+        Self {
+            transport,
+            buffer: Arc::clone(supervisor.buffer()),
+            cmd_tx: None,
+            supervisor: Some(supervisor.clone()),
+            status: Arc::new(Mutex::new(supervisor.status())),
+            used_interactive_auth,
+        }
+    }
+
+    /// Returns the active SSH `Primary Transport` backing this `Session`.
+    pub fn primary_transport(&self) -> &Arc<SshTransport> {
+        &self.transport
     }
 
     /// Returns the shared [`TerminalBuffer`] fed by this SSH session.
@@ -141,17 +166,27 @@ impl SshSession {
         if bytes.is_empty() {
             return Ok(());
         }
+        if let Some(sup) = &self.supervisor {
+            return sup.write_bytes(bytes);
+        }
         self.cmd_tx
+            .as_ref()
+            .ok_or(SshError::Disconnected)?
             .send(SessionCmd::WriteBytes(bytes.to_vec()))
             .map_err(|_| SshError::Disconnected)
     }
 
     /// Resizes the local [`TerminalBuffer`] and notifies the remote SSH PTY via `window_change`.
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), SshError> {
+        if let Some(sup) = &self.supervisor {
+            return sup.resize(cols, rows);
+        }
         let cols = cols.max(1);
         let rows = rows.max(1);
         self.buffer.resize(cols, rows);
         self.cmd_tx
+            .as_ref()
+            .ok_or(SshError::Disconnected)?
             .send(SessionCmd::Resize { cols, rows })
             .map_err(|_| SshError::Disconnected)
     }
@@ -184,6 +219,9 @@ impl SshSession {
 
     /// Returns the current [`TransportStatus`] snapshot for this SSH session.
     pub fn transport_status(&self) -> TransportStatus {
+        if let Some(sup) = &self.supervisor {
+            return sup.status();
+        }
         self.status
             .lock()
             .expect("ssh status mutex poisoned")
@@ -197,13 +235,19 @@ impl SshSession {
 
     /// Gracefully closes the SSH session channel and underlying transport.
     pub fn disconnect(&self) {
-        let _ = self.cmd_tx.send(SessionCmd::Disconnect);
+        if let Some(sup) = &self.supervisor {
+            sup.disconnect();
+        } else if let Some(tx) = &self.cmd_tx {
+            let _ = tx.send(SessionCmd::Disconnect);
+        }
     }
 }
 
 impl Drop for SshSession {
     fn drop(&mut self) {
-        self.disconnect();
+        if self.supervisor.is_none() {
+            self.disconnect();
+        }
     }
 }
 
@@ -233,7 +277,7 @@ async fn await_channel_reply(
 }
 
 fn spawn_channel_pump(
-    transport: SshTransport,
+    transport: Arc<SshTransport>,
     mut rx: russh::ChannelReadHalf,
     tx: russh::ChannelWriteHalf<ClientMsg>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
@@ -299,6 +343,6 @@ fn spawn_channel_pump(
             *guard = TransportStatus::Disconnected;
         }
         buffer.mark_exited(exit_code);
-        let _ = transport.disconnect().await;
+        let _ = transport.disconnect_shared().await;
     });
 }

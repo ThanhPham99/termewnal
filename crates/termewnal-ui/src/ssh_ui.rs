@@ -769,10 +769,13 @@ pub async fn drive_ssh_connect(
                         TransportStatus::Connecting => {}
                         TransportStatus::Connected { .. } => {
                             sent_initial_connected = true;
+                            let session = supervisor.current_transport().map(|transport| {
+                                Arc::new(SshSession::from_supervised(transport, &supervisor))
+                            });
                             if events_tx
                                 .send(SshUiEvent::Connected {
                                     generation,
-                                    session: None,
+                                    session,
                                     supervisor: Some(supervisor.clone()),
                                 })
                                 .is_err()

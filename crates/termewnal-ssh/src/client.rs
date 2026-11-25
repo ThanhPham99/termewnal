@@ -318,16 +318,21 @@ impl SshTransport {
     }
 
     /// Sends an SSH `SSH_MSG_DISCONNECT` cleanly without consuming the shared transport handle.
-    pub async fn close(&self) -> Result<(), SshError> {
+    pub async fn disconnect_shared(&self) -> Result<(), SshError> {
         self.handle
             .disconnect(Disconnect::ByApplication, "closed by user", "en")
             .await?;
         Ok(())
     }
 
+    /// Alias for [`Self::disconnect_shared`] used by supervisor teardown paths.
+    pub async fn close(&self) -> Result<(), SshError> {
+        self.disconnect_shared().await
+    }
+
     /// Sends an SSH `SSH_MSG_DISCONNECT` cleanly and shuts down the transport.
     pub async fn disconnect(self) -> Result<(), SshError> {
-        self.close().await
+        self.disconnect_shared().await
     }
 }
 

@@ -5,7 +5,9 @@ pub mod client;
 pub mod error;
 pub mod known_hosts;
 pub mod session;
+pub mod sftp;
 pub mod supervisor;
+pub mod transfer;
 
 pub use auth::{
     AgentConnector, AuthOutcome, BoxFuture, BoxedAgentClient, HostKeyDecision, HostKeyPrompt,
@@ -19,11 +21,24 @@ pub use known_hosts::{
     record_known_host_path, verify_known_host, verify_known_host_path,
 };
 pub use session::SshSession;
+pub use sftp::{
+    AcquiredSftpSession, DEFAULT_SFTP_MAX_CONCURRENT_READS, DEFAULT_SFTP_MAX_CONCURRENT_WRITES,
+    DEFAULT_SFTP_MAX_PACKET_LEN, DEFAULT_SFTP_MAX_WRITE_PACKET_LEN,
+    DEFAULT_SFTP_REQUEST_TIMEOUT_SECS, ProfileTransportKey, RemoteDirEntry, RemoteEntryKind,
+    RemoteListing, SftpChannelRole, SftpEndpoint, SftpManager, SftpStatusNotice, SftpTransportMode,
+    TransferTransportPool, join_remote_path, open_sftp_session, parent_remote_path,
+    pipelined_sftp_client_config,
+};
 pub use supervisor::{
     ConnectionSupervisor, DEFAULT_BACKOFF_MAX, DEFAULT_BACKOFF_MIN, DEFAULT_WAKE_PROBE_TIMEOUT,
     DefaultTransportConnector, ManualTimeSource, SupervisorConfig, SupervisorEvent,
     SupervisorInstant, SystemTimeSource, TimeSource, TransportConnector, TransportReadySnapshot,
     TransportStatusEvent, compute_reconnect_backoff, format_reconnected_divider,
+};
+pub use transfer::{
+    DEFAULT_MAX_CONCURRENT_TRANSFERS, DEFAULT_TRANSFER_CHUNK_SIZE, DirectTransferHook,
+    DownloadTargetPlan, TransferDirection, TransferExecutorHook, TransferId, TransferQueue,
+    TransferQueueConfig, TransferQueueSnapshot, TransferSnapshot, TransferStatus, UploadTargetPlan,
 };
 
 /// Connection lifecycle state of an SSH `Transport`.

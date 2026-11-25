@@ -509,6 +509,11 @@ impl ConnectionSupervisor {
         self.transport_rx.clone()
     }
 
+    /// Returns the currently active [`SshTransport`], if `Connected` or `Degraded`.
+    pub fn current_transport(&self) -> Option<Arc<SshTransport>> {
+        self.transport_rx.borrow().clone()
+    }
+
     /// Subscribes to the combined [`TransportReadySnapshot`] (epoch + status + transport handle) for `Tunnel`s.
     pub fn subscribe_ready(&self) -> watch::Receiver<TransportReadySnapshot> {
         self.ready_rx.clone()
