@@ -432,6 +432,7 @@ async fn end_to_end_app_state_drives_tofu_vault_auth_terminal_io_resize_and_mitm
                 vault_secret_ref: Some("ssh/ui-test".to_string()),
             },
             known_hosts_path: Some(known_hosts.clone()),
+            proxy_jump: Vec::new(),
             nodelay: true,
             term_name: "xterm-256color".to_string(),
             cols: 80,

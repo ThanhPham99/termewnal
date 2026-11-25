@@ -704,6 +704,7 @@ fn connect_cfg(addr: SocketAddr, user: &str, auth: SshAuthMethod, kh: &Path) -> 
         username: user.to_string(),
         auth,
         known_hosts_path: Some(kh.to_path_buf()),
+        proxy_jump: Vec::new(),
         nodelay: true,
         term_name: "xterm-256color".to_string(),
         cols: 80,

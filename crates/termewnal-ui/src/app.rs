@@ -27,10 +27,12 @@ use termewnal_pty::{
     TerminalBuffer, TerminalSnapshot, detect_default_shell,
 };
 use termewnal_ssh::{
-    ConnectionSupervisor, OsAgentConnector, ProfileTransportKey, RejectAllInteractionHandler,
-    RemoteListing, SftpEndpoint, SftpManager, SshConnectConfig, SshSession,
-    StandaloneTransportSpec, SupervisorConfig, TransferId, TransferQueue, TransferQueueSnapshot,
-    TransportStatus, TunnelManager, TunnelManagerSnapshot, join_remote_path, parent_remote_path,
+    ConflictResolution, ConnectionSupervisor, DirectoryTransferSummary, JumpHopSpec,
+    OsAgentConnector, ProfileTransportKey, RejectAllInteractionHandler, RemoteListing,
+    SftpEndpoint, SftpManager, SshConnectConfig, SshSession, StandaloneTransportSpec,
+    SupervisorConfig, TransferId, TransferNotice, TransferQueue, TransferQueueConfig,
+    TransferQueueSnapshot, TransportStatus, TunnelManager, TunnelManagerSnapshot, join_remote_path,
+    parent_remote_path, resolve_proxy_jump_hops,
 };
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -46,7 +48,9 @@ use crate::command_palette::{
 };
 use crate::config_reload_ui::ConfigReloadUiState;
 use crate::ipc::{IpcCommand, IpcServerHandle};
-use crate::sftp_drawer::{SftpDrawerDock, SftpDrawerState, render_sftp_drawer};
+use crate::sftp_drawer::{
+    SftpDrawerDock, SftpDrawerState, render_conflict_resolution_modal, render_sftp_drawer,
+};
 use crate::sidebar::{
     ActiveTunnelEntry, SidebarSection, SidebarState, SystemSshProfile, render_sidebar,
 };
@@ -136,7 +140,12 @@ impl SshSessionTarget {
             port: spec.connect_config.port,
             username: spec.connect_config.username.clone(),
             auth: spec.connect_config.auth.clone(),
-            proxy_jump: Vec::new(),
+            proxy_jump: spec
+                .connect_config
+                .proxy_jump
+                .iter()
+                .map(JumpHopSpec::display_addr)
+                .collect(),
             auto_connect_on_startup: spec.auto_connect_on_startup,
             tmux_reattach: None,
             keepalive_interval_secs: Some(spec.supervisor_config.keepalive_interval.as_secs()),
@@ -146,12 +155,13 @@ impl SshSessionTarget {
         }
     }
 
-    fn to_target_spec(
+    fn to_target_spec_with_hops(
         &self,
         title: &str,
         cols: u16,
         rows: u16,
         app_config: &AppConfig,
+        proxy_jump: Vec<JumpHopSpec>,
     ) -> SshTargetSpec {
         let (ka_secs, ka_max) = self.resolve_keepalive(app_config);
         let mut supervisor_config = SupervisorConfig::from_app_config(app_config);
@@ -168,6 +178,7 @@ impl SshSessionTarget {
                 username: self.username.clone(),
                 auth: self.auth.clone(),
                 known_hosts_path: None,
+                proxy_jump,
                 nodelay: true,
                 term_name: "xterm-256color".to_string(),
                 cols: cols.max(1),
@@ -178,6 +189,18 @@ impl SshSessionTarget {
             agent_connector: Arc::new(OsAgentConnector::default()),
             auto_connect_on_startup: self.auto_connect_on_startup,
         }
+    }
+
+    fn to_target_spec(
+        &self,
+        title: &str,
+        cols: u16,
+        rows: u16,
+        app_config: &AppConfig,
+    ) -> SshTargetSpec {
+        let hops = resolve_proxy_jump_hops(&self.proxy_jump, &[], &[], &self.username, None)
+            .unwrap_or_default();
+        self.to_target_spec_with_hops(title, cols, rows, app_config, hops)
     }
 }
 
@@ -652,6 +675,10 @@ pub enum Message {
         remote_path: String,
         file_name: String,
     },
+    SftpDownloadDir {
+        remote_path: String,
+        dir_name: String,
+    },
     SftpDrawerFileDropped {
         path: PathBuf,
     },
@@ -664,7 +691,17 @@ pub enum Message {
         session_id: SessionId,
         result: Result<(), String>,
     },
+    SftpDirEnqueueResult {
+        result: Result<DirectoryTransferSummary, String>,
+    },
     TransferQueueUpdated(TransferQueueSnapshot),
+    TransferConflictRenameInputChanged(String),
+    TransferConflictApplyToAllToggled(bool),
+    ResolveTransferConflict {
+        transfer_id: TransferId,
+        resolution: ConflictResolution,
+        apply_to_all: bool,
+    },
     PauseTransfer(TransferId),
     ResumeTransfer(TransferId),
     CancelTransfer(TransferId),
@@ -823,7 +860,13 @@ impl AppState {
             Arc::clone(&tracker) as Arc<dyn BackgroundWorkSource>;
         let workspace_ids = WorkspaceIds::new();
         let sftp_manager = SftpManager::new();
-        let transfer_queue = TransferQueue::new(sftp_manager.clone());
+        let transfer_queue = TransferQueue::with_config(
+            sftp_manager.clone(),
+            TransferQueueConfig {
+                transfer: config.transfer.clone(),
+                ..TransferQueueConfig::default()
+            },
+        );
         let tunnel_manager = TunnelManager::new();
         let download_dir = paths.cache_dir().join("downloads");
         let mut state = Self {
@@ -1427,13 +1470,67 @@ impl AppState {
                     mux_attach_command: mux_attach_command.clone(),
                 };
                 let tab_title = (!profile.name.trim().is_empty()).then(|| profile.name.clone());
-                let spec = target.to_target_spec(&profile.name, 80, 24, &self.config);
+                self.launch_resolved_ssh_target(window_scope, target, &profile.name, tab_title, disposition)
+            }
+        }
+    }
+
+    fn build_target_spec(
+        &self,
+        target: &SshSessionTarget,
+        title: &str,
+        cols: u16,
+        rows: u16,
+    ) -> Result<SshTargetSpec, String> {
+        let hops = resolve_proxy_jump_hops(
+            &target.proxy_jump,
+            &self.profiles.profiles,
+            &self.openssh_hosts,
+            &target.username,
+            None,
+        )
+        .map_err(|err| err.to_string())?;
+        Ok(target.to_target_spec_with_hops(title, cols, rows, &self.config, hops))
+    }
+
+    fn launch_resolved_ssh_target(
+        &mut self,
+        window_scope: Option<window::Id>,
+        target: SshSessionTarget,
+        spec_title: &str,
+        tab_title: Option<String>,
+        disposition: LaunchDisposition,
+    ) -> Task<Message> {
+        match self.build_target_spec(&target, spec_title, 80, 24) {
+            Ok(spec) => {
                 let sid = self.insert_ssh_session_slot(target, spec);
                 if self.open_session_with_disposition(window_scope, sid, tab_title, disposition) {
                     self.start_ssh_connect(sid)
                 } else {
                     Task::none()
                 }
+            }
+            Err(err) => {
+                warn!(target = %target.name, error = %err, "failed resolving ProxyJump hops");
+                self.last_error = Some(err.clone());
+                let fallback_spec = target.to_target_spec_with_hops(
+                    spec_title,
+                    80,
+                    24,
+                    &self.config,
+                    Vec::new(),
+                );
+                let sid = self.insert_ssh_session_slot(target, fallback_spec);
+                if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&sid) {
+                    slot.last_error = Some(err);
+                }
+                let _ = self.open_session_with_disposition(
+                    window_scope,
+                    sid,
+                    tab_title,
+                    disposition,
+                );
+                Task::none()
             }
         }
     }
@@ -1560,18 +1657,8 @@ impl AppState {
             auto_attach_mux: false,
             mux_attach_command: None,
         };
-        let spec = target.to_target_spec(&host.alias, 80, 24, &self.config);
-        let sid = self.insert_ssh_session_slot(target, spec);
-        if self.open_session_with_disposition(
-            window_scope,
-            sid,
-            Some(host.alias),
-            disposition,
-        ) {
-            self.start_ssh_connect(sid)
-        } else {
-            Task::none()
-        }
+        let alias = host.alias.clone();
+        self.launch_resolved_ssh_target(window_scope, target, &alias, Some(host.alias), disposition)
     }
 
     fn handle_command_palette_confirm(&mut self, window_scope: Option<window::Id>) -> Task<Message> {
@@ -2544,6 +2631,8 @@ impl AppState {
                             );
                             if matches!(reloaded, Ok(true)) {
                                 self.sync_terminal_options_to_sessions();
+                                self.transfer_queue
+                                    .set_transfer_config(self.config.transfer.clone());
                             }
                             reloaded
                         }
@@ -2576,6 +2665,8 @@ impl AppState {
                         self.last_error = None;
                         if kind == ConfigFileKind::AppConfig {
                             self.sync_terminal_options_to_sessions();
+                            self.transfer_queue
+                                .set_transfer_config(self.config.transfer.clone());
                         }
                     }
                     Err(err) => {
@@ -2767,9 +2858,11 @@ impl AppState {
                 Task::none()
             }
             Message::OpenSshProfile(profile) => {
-                match SshTargetSpec::from_profile_with_config(
+                match SshTargetSpec::from_profile_with_sources(
                     &profile,
                     &self.config,
+                    &self.profiles.profiles,
+                    &self.openssh_hosts,
                     80,
                     24,
                     self.config.terminal.scrollback_lines,
@@ -2785,9 +2878,11 @@ impl AppState {
                 }
             }
             Message::RestoreSshProfile(profile) => {
-                match SshTargetSpec::from_profile_with_config(
+                match SshTargetSpec::from_profile_with_sources(
                     &profile,
                     &self.config,
+                    &self.profiles.profiles,
+                    &self.openssh_hosts,
                     80,
                     24,
                     self.config.terminal.scrollback_lines,
@@ -3037,6 +3132,10 @@ impl AppState {
                 self.enqueue_sftp_download(remote_path, file_name);
                 Task::none()
             }
+            Message::SftpDownloadDir {
+                remote_path,
+                dir_name,
+            } => self.enqueue_sftp_download_dir(remote_path, dir_name),
             Message::SftpDrawerFileDropped { path } => {
                 if let Some(session_id) = self.resolve_sftp_session_id() {
                     let action =
@@ -3071,8 +3170,39 @@ impl AppState {
                     Task::none()
                 }
             },
+            Message::SftpDirEnqueueResult { result } => {
+                match result {
+                    Ok(summary) => {
+                        self.record_dir_transfer_notices(&summary);
+                        self.sync_transfer_telemetry();
+                    }
+                    Err(err) => {
+                        self.sftp_drawer.set_browser_error(Some(err));
+                    }
+                }
+                Task::none()
+            }
             Message::TransferQueueUpdated(snap) => {
                 self.sftp_drawer.set_queue_snapshot(snap);
+                self.sync_transfer_telemetry();
+                Task::none()
+            }
+            Message::TransferConflictRenameInputChanged(input) => {
+                self.sftp_drawer.set_conflict_rename_input(input);
+                Task::none()
+            }
+            Message::TransferConflictApplyToAllToggled(apply_to_all) => {
+                self.sftp_drawer.set_conflict_apply_to_all(apply_to_all);
+                Task::none()
+            }
+            Message::ResolveTransferConflict {
+                transfer_id,
+                resolution,
+                apply_to_all,
+            } => {
+                let _ = self
+                    .transfer_queue
+                    .resolve_conflict(transfer_id, resolution, apply_to_all);
                 self.sync_transfer_telemetry();
                 Task::none()
             }
@@ -3281,9 +3411,10 @@ impl AppState {
                 supervisor,
                 ..
             } => {
+                let sftp_key = slot.sftp_key();
                 if let Some(ref session) = ssh {
                     self.sftp_manager.register_primary_transport(
-                        slot.sftp_key(),
+                        sftp_key.clone(),
                         Arc::clone(session.primary_transport()),
                     );
                 }
@@ -3296,6 +3427,9 @@ impl AppState {
                 slot.snapshot = Arc::new(slot.buffer.snapshot());
                 let profile_id = slot.target.profile_id.clone();
                 let supervisor_handle = slot.supervisor.clone();
+                if self.transfer_queue.resume_reconnected(&sftp_key) > 0 {
+                    self.sync_transfer_telemetry();
+                }
                 let mut tasks = Vec::new();
                 if let Some(sup) = supervisor_handle {
                     tasks.push(self.auto_start_session_tunnels(
@@ -3318,11 +3452,13 @@ impl AppState {
             SshUiEvent::TransportStatus {
                 status, last_error, ..
             } => {
+                let sftp_key = slot.sftp_key();
+                let mut resumed = 0;
                 if !matches!(
                     status,
                     TransportStatus::Connected { .. } | TransportStatus::Degraded { .. }
                 ) {
-                    self.sftp_manager.clear_primary_transport(&slot.sftp_key());
+                    self.sftp_manager.clear_primary_transport(&sftp_key);
                     slot.active = None;
                 }
                 if matches!(status, TransportStatus::Connected { .. }) {
@@ -3330,13 +3466,12 @@ impl AppState {
                     slot.exited = None;
                     if let Some(sup) = &slot.supervisor {
                         if let Some(transport) = sup.current_transport() {
-                            self.sftp_manager.register_primary_transport(
-                                slot.sftp_key(),
-                                Arc::clone(&transport),
-                            );
+                            self.sftp_manager
+                                .register_primary_transport(sftp_key.clone(), Arc::clone(&transport));
                             slot.active = Some(Arc::new(SshSession::from_supervised(transport, sup)));
                         }
                     }
+                    resumed = self.transfer_queue.resume_reconnected(&sftp_key);
                 } else if let Some(err) = last_error {
                     slot.last_error = Some(err.clone());
                     self.last_error = Some(err);
@@ -3344,6 +3479,9 @@ impl AppState {
                 slot.transport_status = status;
                 slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
                 slot.snapshot = Arc::new(slot.buffer.snapshot());
+                if resumed > 0 {
+                    self.sync_transfer_telemetry();
+                }
                 Task::none()
             }
             SshUiEvent::HostKeyPrompt {
@@ -3610,6 +3748,11 @@ impl AppState {
         }
         if self.tabby_import.is_open() {
             layers = layers.push(self.tabby_import.view(&palette, self.vault.requires_unlock()));
+        }
+        if let Some(conflict_modal) =
+            render_conflict_resolution_modal(&self.sftp_drawer, &palette)
+        {
+            layers = layers.push(conflict_modal);
         }
         if let Some(tunnel_modal) = self
             .tunnel_ui
@@ -4741,10 +4884,29 @@ impl AppState {
         )
     }
 
+    fn reset_transfer_conflict_override_if_idle(&self) {
+        let snap = self.transfer_queue.snapshot();
+        if !snap.has_incomplete_work() && snap.awaiting_conflict_count == 0 {
+            self.transfer_queue.reset_conflict_policy_override();
+        }
+    }
+
+    fn record_dir_transfer_notices(&mut self, summary: &DirectoryTransferSummary) {
+        if let Some(first_skipped) = summary.skipped_symlinks.first() {
+            let notice = TransferNotice::SymlinkSkipped {
+                path: first_skipped.clone(),
+                is_loop: !summary.skipped_symlink_loops.is_empty(),
+            };
+            self.sftp_drawer
+                .set_last_transfer_notice(Some(notice.summary()));
+        }
+    }
+
     fn enqueue_sftp_upload(&mut self, session_id: SessionId, local_path: PathBuf) {
         let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
             return;
         };
+        self.reset_transfer_conflict_override_if_idle();
         let file_name = local_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -4756,9 +4918,18 @@ impl AppState {
             join_remote_path(&remote_dir, &file_name)
         };
         let endpoint = slot.sftp_endpoint(&self.vault);
-        self.transfer_queue
-            .enqueue_upload(endpoint, local_path, remote_path);
-        self.sync_transfer_telemetry();
+        match self
+            .transfer_queue
+            .enqueue_upload_path(endpoint, local_path, remote_path)
+        {
+            Ok(summary) => {
+                self.record_dir_transfer_notices(&summary);
+                self.sync_transfer_telemetry();
+            }
+            Err(err) => {
+                self.sftp_drawer.set_browser_error(Some(err.to_string()));
+            }
+        }
     }
 
     fn enqueue_sftp_download(&mut self, remote_path: String, file_name: String) {
@@ -4771,11 +4942,37 @@ impl AppState {
         let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
             return;
         };
+        self.reset_transfer_conflict_override_if_idle();
         let local_path = self.sftp_drawer.download_dir().join(&file_name);
         let endpoint = slot.sftp_endpoint(&self.vault);
         self.transfer_queue
             .enqueue_download(endpoint, remote_path, local_path);
         self.sync_transfer_telemetry();
+    }
+
+    fn enqueue_sftp_download_dir(&mut self, remote_path: String, dir_name: String) -> Task<Message> {
+        let Some(session_id) = self.resolve_sftp_session_id() else {
+            self.sftp_drawer.set_browser_error(Some(
+                "Connect an SSH Session before downloading folders.".to_string(),
+            ));
+            return Task::none();
+        };
+        let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
+            return Task::none();
+        };
+        self.reset_transfer_conflict_override_if_idle();
+        let local_dir = self.sftp_drawer.download_dir().join(&dir_name);
+        let endpoint = slot.sftp_endpoint(&self.vault);
+        let queue = self.transfer_queue.clone();
+        Task::perform(
+            async move {
+                queue
+                    .enqueue_download_dir(endpoint, remote_path, local_dir)
+                    .await
+                    .map_err(|err| err.to_string())
+            },
+            |result| Message::SftpDirEnqueueResult { result },
+        )
     }
 
     fn sync_transfer_telemetry(&mut self) {
@@ -5154,9 +5351,11 @@ impl AppState {
     ) -> Option<SshTargetSpec> {
         if let Some(pid) = profile_id
             && let Some(profile) = self.profiles.profiles.iter().find(|p| p.id == pid)
-            && let Ok(spec) = SshTargetSpec::from_profile_with_config(
+            && let Ok(spec) = SshTargetSpec::from_profile_with_sources(
                 profile,
                 &self.config,
+                &self.profiles.profiles,
+                &self.openssh_hosts,
                 80,
                 24,
                 self.config.terminal.scrollback_lines,

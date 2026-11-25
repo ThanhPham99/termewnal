@@ -2,8 +2,10 @@
 
 pub mod auth;
 pub mod client;
+mod dir_transfer;
 pub mod error;
 pub mod known_hosts;
+pub mod proxy_jump;
 pub mod session;
 pub mod sftp;
 pub mod supervisor;
@@ -24,6 +26,7 @@ pub use known_hosts::{
     KnownHostStatus, default_known_hosts_path, fingerprint_sha256, record_known_host,
     record_known_host_path, verify_known_host, verify_known_host_path,
 };
+pub use proxy_jump::{JumpHopSpec, SshTransportChain, connect_transport_chain, resolve_proxy_jump_hops};
 pub use session::SshSession;
 pub use sftp::{
     AcquiredSftpSession, DEFAULT_SFTP_MAX_CONCURRENT_READS, DEFAULT_SFTP_MAX_CONCURRENT_WRITES,
@@ -40,9 +43,12 @@ pub use supervisor::{
     TransportStatusEvent, compute_reconnect_backoff, format_reconnected_divider,
 };
 pub use transfer::{
-    DEFAULT_MAX_CONCURRENT_TRANSFERS, DEFAULT_TRANSFER_CHUNK_SIZE, DirectTransferHook,
-    DownloadTargetPlan, TransferDirection, TransferExecutorHook, TransferId, TransferQueue,
-    TransferQueueConfig, TransferQueueSnapshot, TransferSnapshot, TransferStatus, UploadTargetPlan,
+    ConflictCheck, ConflictResolution, DEFAULT_MAX_CONCURRENT_TRANSFERS,
+    DEFAULT_MAX_TRANSPORT_RETRIES, DEFAULT_RECONNECT_RETRY_DELAY, DEFAULT_TRANSFER_CHUNK_SIZE,
+    DirectTransferHook, DirectoryTransferSummary, DownloadTargetPlan, ResilientTransferHook,
+    TransferConflict, TransferDirection, TransferExecutorHook, TransferId, TransferNotice,
+    TransferQueue, TransferQueueConfig, TransferQueueSnapshot, TransferSnapshot, TransferStatus,
+    UploadPlanOptions, UploadTargetPlan, disambiguate_filename, part_path_for,
 };
 pub use tunnel::{
     DEFAULT_TUNNEL_HOLD_GRACE, RemoteForwardBackoffConfig, StandaloneTransportSpec, TunnelManager,

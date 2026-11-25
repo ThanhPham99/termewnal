@@ -699,6 +699,7 @@ async fn live_app_state_browses_remote_sftp_uploads_downloads_and_surfaces_mux_f
             username: "secops".to_string(),
             auth: SshAuthMethod::KeyboardInteractive,
             known_hosts_path: Some(known_hosts),
+            proxy_jump: Vec::new(),
             nodelay: true,
             term_name: "xterm-256color".to_string(),
             cols: 80,

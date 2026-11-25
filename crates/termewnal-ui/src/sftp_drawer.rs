@@ -6,18 +6,22 @@ use iced::advanced::renderer::{self, Quad, Renderer as _};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget};
 use iced::widget::{
-    button, column, container, progress_bar, row, rule, scrollable, space, text, text_input,
+    button, checkbox, column, container, opaque, progress_bar, row, rule, scrollable, space, text,
+    text_input,
 };
 use iced::{
-    Alignment, Background, Border, Color, Element, Event, Length, Point, Rectangle, Size, Theme,
-    Vector, mouse, window,
+    Alignment, Background, Border, Color, Element, Event, Length, Point, Rectangle, Shadow, Size,
+    Theme, Vector, mouse, window,
 };
+use termewnal_core::ThemePalette;
 use termewnal_ssh::{
-    RemoteDirEntry, RemoteEntryKind, RemoteListing, SftpStatusNotice, SftpTransportMode,
+    ConflictResolution, RemoteDirEntry, RemoteEntryKind, RemoteListing, SftpStatusNotice,
+    SftpTransportMode, TransferConflict, TransferDirection, TransferId, TransferNotice,
     TransferQueueSnapshot, TransferSnapshot, TransferStatus,
 };
 
 use crate::app::{Message, SessionId};
+use crate::terminal_ergonomics::rgb_to_iced;
 
 /// Default width in logical pixels of the right-docked SFTP Browser & `Transfer` Drawer.
 pub const DEFAULT_SFTP_DRAWER_WIDTH: f32 = 360.0;
@@ -42,6 +46,10 @@ pub struct SftpDrawerState {
     loading: bool,
     browser_error: Option<String>,
     transport_notice: Option<SftpStatusNotice>,
+    last_transfer_notice: Option<String>,
+    active_conflict_id: Option<TransferId>,
+    conflict_rename_input: String,
+    conflict_apply_to_all: bool,
     download_dir: PathBuf,
     queue_snapshot: TransferQueueSnapshot,
     list_generation: u64,
@@ -61,6 +69,10 @@ impl Default for SftpDrawerState {
             loading: false,
             browser_error: None,
             transport_notice: None,
+            last_transfer_notice: None,
+            active_conflict_id: None,
+            conflict_rename_input: String::new(),
+            conflict_apply_to_all: false,
             download_dir,
             queue_snapshot: TransferQueueSnapshot::default(),
             list_generation: 0,
@@ -240,6 +252,48 @@ impl SftpDrawerState {
         self.transport_notice = notice;
     }
 
+    /// Returns the latest non-blocking `Transfer` status notice (e.g., `.part` fallback or
+    /// skipped symlink notice), if any.
+    pub fn last_transfer_notice(&self) -> Option<&str> {
+        self.last_transfer_notice.as_deref()
+    }
+
+    /// Sets or clears the latest non-blocking `Transfer` status notice.
+    pub fn set_last_transfer_notice(&mut self, notice: Option<String>) {
+        self.last_transfer_notice = notice;
+    }
+
+    /// Returns the currently focused pending conflict prompt, if any.
+    pub fn active_conflict(&self) -> Option<&TransferConflict> {
+        let conflicts = self.queue_snapshot.pending_conflicts();
+        if let Some(active_id) = self.active_conflict_id
+            && let Some(found) = conflicts.iter().find(|c| c.transfer_id == active_id)
+        {
+            return Some(*found);
+        }
+        conflicts.into_iter().next()
+    }
+
+    /// Returns the editable target filename shown in the conflict resolution dialog.
+    pub fn conflict_rename_input(&self) -> &str {
+        &self.conflict_rename_input
+    }
+
+    /// Updates the conflict rename input field text.
+    pub fn set_conflict_rename_input(&mut self, input: String) {
+        self.conflict_rename_input = input;
+    }
+
+    /// Returns whether "Apply to all" is toggled in the conflict resolution dialog.
+    pub fn conflict_apply_to_all(&self) -> bool {
+        self.conflict_apply_to_all
+    }
+
+    /// Updates the "Apply to all" checkbox state in the conflict resolution dialog.
+    pub fn set_conflict_apply_to_all(&mut self, apply_to_all: bool) {
+        self.conflict_apply_to_all = apply_to_all;
+    }
+
     /// Returns the local directory used as default destination for SFTP downloads.
     pub fn download_dir(&self) -> &PathBuf {
         &self.download_dir
@@ -261,6 +315,29 @@ impl SftpDrawerState {
             })
         {
             self.transport_notice = Some(latest_notice);
+        }
+        if let Some(latest_transfer_notice) = snapshot.transfers.iter().rev().find_map(|t| {
+            t.notice
+                .as_ref()
+                .map(TransferNotice::summary)
+                .or_else(|| t.status_notice.clone())
+        }) {
+            self.last_transfer_notice = Some(latest_transfer_notice);
+        }
+        let next_conflict = snapshot.pending_conflicts().into_iter().next().cloned();
+        match next_conflict {
+            Some(conflict) => {
+                if self.active_conflict_id != Some(conflict.transfer_id) {
+                    self.active_conflict_id = Some(conflict.transfer_id);
+                    self.conflict_rename_input = conflict.suggested_name;
+                    self.conflict_apply_to_all = false;
+                }
+            }
+            None => {
+                self.active_conflict_id = None;
+                self.conflict_rename_input.clear();
+                self.conflict_apply_to_all = false;
+            }
         }
         self.queue_snapshot = snapshot;
     }
@@ -680,6 +757,18 @@ pub fn render_sftp_drawer<'a>(
     .align_y(Alignment::Center);
     content = content.push(mkdir_row);
 
+    if let Some(notice) = state.last_transfer_notice() {
+        content = content.push(
+            container(
+                text(notice.to_string())
+                    .size(11)
+                    .color(Color::from_rgb8(251, 191, 36)),
+            )
+            .width(Length::Fill)
+            .padding([3, 8]),
+        );
+    }
+
     if let Some(err) = state.browser_error() {
         content = content.push(
             text(err.to_string())
@@ -770,12 +859,22 @@ fn render_browser_entries<'a>(
         .align_y(Alignment::Center);
 
         if entry.is_dir() {
-            row_el = row_el.push(
-                button(text("Open").size(11))
-                    .padding([2, 6])
-                    .style(button::secondary)
-                    .on_press(Message::SftpNavigateTo(entry.path.clone())),
-            );
+            row_el = row_el
+                .push(
+                    button(text("Open").size(11))
+                        .padding([2, 6])
+                        .style(button::secondary)
+                        .on_press(Message::SftpNavigateTo(entry.path.clone())),
+                )
+                .push(
+                    button(text("Get Dir").size(11))
+                        .padding([2, 6])
+                        .style(button::primary)
+                        .on_press(Message::SftpDownloadDir {
+                            remote_path: entry.path.clone(),
+                            dir_name: entry.name.clone(),
+                        }),
+                );
         } else {
             row_el = row_el.push(
                 button(text("Get").size(11))
@@ -888,7 +987,30 @@ fn render_transfer_queue_section<'a>(
                             .on_press(Message::RetryTransfer(item.id)),
                     );
                 }
-                TransferStatus::Completed => {}
+                TransferStatus::AwaitingConflict => {
+                    controls = controls
+                        .push(
+                            button(text("Overwrite").size(10))
+                                .padding([2, 6])
+                                .style(button::primary)
+                                .on_press(Message::ResolveTransferConflict {
+                                    transfer_id: item.id,
+                                    resolution: ConflictResolution::Overwrite,
+                                    apply_to_all: false,
+                                }),
+                        )
+                        .push(
+                            button(text("Skip").size(10))
+                                .padding([2, 6])
+                                .style(button::subtle)
+                                .on_press(Message::ResolveTransferConflict {
+                                    transfer_id: item.id,
+                                    resolution: ConflictResolution::Skip,
+                                    apply_to_all: false,
+                                }),
+                        );
+                }
+                TransferStatus::Completed | TransferStatus::Skipped => {}
             }
 
             let mut item_col = column![
@@ -900,6 +1022,19 @@ fn render_transfer_queue_section<'a>(
                     .color(Color::from_rgb8(148, 163, 184)),
             ]
             .spacing(3);
+
+            if let Some(notice) = item
+                .notice
+                .as_ref()
+                .map(TransferNotice::summary)
+                .or_else(|| item.status_notice.clone())
+            {
+                item_col = item_col.push(
+                    text(notice)
+                        .size(10)
+                        .color(Color::from_rgb8(251, 191, 36)),
+                );
+            }
 
             if let TransferStatus::Failed { error } = &item.status {
                 item_col = item_col.push(
@@ -940,4 +1075,160 @@ pub fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{bytes} B")
     }
+}
+
+/// Renders a modal prompt when a `Transfer` pauses in [`TransferStatus::AwaitingConflict`].
+pub fn render_conflict_resolution_modal<'a>(
+    state: &'a SftpDrawerState,
+    palette: &ThemePalette,
+) -> Option<Element<'a, Message, Theme, iced::Renderer>> {
+    let conflict = state.active_conflict()?;
+    let surface = rgb_to_iced(palette.ui_surface);
+    let bg = rgb_to_iced(palette.background);
+    let border_color = rgb_to_iced(palette.ui_border);
+    let fg = rgb_to_iced(palette.foreground);
+    let accent = rgb_to_iced(palette.ui_accent);
+    let transfer_id = conflict.transfer_id;
+    let apply_to_all = state.conflict_apply_to_all();
+    let rename_value = state.conflict_rename_input();
+    let trimmed_rename = rename_value.trim().to_string();
+
+    let heading = text(format!("File conflict: {}", conflict.file_name))
+        .size(15)
+        .color(fg);
+
+    let mut details = format!(
+        "Target already exists ({} vs source {}).",
+        format_bytes(conflict.existing_target_size),
+        format_bytes(conflict.source_size),
+    );
+    if let Some(part_len) = conflict.part_file_size {
+        details.push_str(&format!(
+            " Staged .termewnal.part: {}.",
+            format_bytes(part_len)
+        ));
+    }
+
+    let detail_box = container(text(details).size(12).color(fg))
+        .width(Length::Fill)
+        .padding(8)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(bg)),
+            text_color: Some(fg),
+            border: Border {
+                color: border_color,
+                width: 1.0,
+                radius: 4.0.into(),
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        });
+
+    let rename_btn = button(text("Rename").size(12))
+        .padding([4, 10])
+        .style(button::secondary)
+        .on_press_maybe((!trimmed_rename.is_empty()).then(|| {
+            Message::ResolveTransferConflict {
+                transfer_id,
+                resolution: ConflictResolution::Rename {
+                    new_name: trimmed_rename,
+                },
+                apply_to_all,
+            }
+        }));
+
+    let rename_row = row![
+        text_input("New filename...", rename_value)
+            .on_input(Message::TransferConflictRenameInputChanged)
+            .size(12)
+            .padding([5, 8])
+            .width(Length::Fill),
+        rename_btn,
+    ]
+    .spacing(6)
+    .align_y(Alignment::Center);
+
+    let apply_toggle = checkbox(apply_to_all)
+        .label("Apply to all conflicts in this batch")
+        .on_toggle(Message::TransferConflictApplyToAllToggled)
+        .size(15);
+
+    let actions = row![
+        button(text("Skip").size(12))
+            .padding([5, 12])
+            .style(button::subtle)
+            .on_press(Message::ResolveTransferConflict {
+                transfer_id,
+                resolution: ConflictResolution::Skip,
+                apply_to_all,
+            }),
+        button(text("Resume").size(12))
+            .padding([5, 12])
+            .style(button::secondary)
+            .on_press(Message::ResolveTransferConflict {
+                transfer_id,
+                resolution: ConflictResolution::Resume,
+                apply_to_all,
+            }),
+        button(text("Overwrite").size(12))
+            .padding([5, 12])
+            .style(button::primary)
+            .on_press(Message::ResolveTransferConflict {
+                transfer_id,
+                resolution: ConflictResolution::Overwrite,
+                apply_to_all,
+            }),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
+
+    let dest_label = match conflict.direction {
+        TransferDirection::Upload => conflict.remote_path.clone(),
+        TransferDirection::Download => conflict.local_path.display().to_string(),
+    };
+    let card = opaque(
+        container(
+            column![
+                heading,
+                text(format!("Destination: {dest_label}"))
+                    .size(11)
+                    .color(Color { a: 0.78, ..fg }),
+                detail_box,
+                rename_row,
+                apply_toggle,
+                row![space::horizontal(), actions],
+            ]
+            .spacing(10),
+        )
+        .width(Length::Fixed(480.0))
+        .padding(16)
+        .style(move |_theme| container::Style {
+            background: Some(Background::Color(surface)),
+            text_color: Some(fg),
+            border: Border {
+                color: accent,
+                width: 1.0,
+                radius: 8.0.into(),
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        }),
+    );
+
+    let backdrop = container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(|_theme| container::Style {
+            background: Some(Background::Color(Color {
+                r: 0.0,
+                g: 0.0,
+                b: 0.0,
+                a: 0.45,
+            })),
+            ..container::Style::default()
+        });
+
+    Some(opaque(backdrop))
 }
