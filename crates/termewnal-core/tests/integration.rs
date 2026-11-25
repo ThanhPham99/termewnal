@@ -6,6 +6,8 @@ mod layout_persistence;
 mod openssh_and_tabby;
 #[path = "suite/themes_and_ergonomics_config.rs"]
 mod themes_and_ergonomics_config;
+#[path = "suite/transfer_config.rs"]
+mod transfer_config;
 #[path = "suite/tunnel_rules.rs"]
 mod tunnel_rules;
 #[path = "suite/vault_and_hot_reload.rs"]

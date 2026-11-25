@@ -2,6 +2,7 @@
 
 pub mod auth;
 pub mod client;
+mod dir_transfer;
 pub mod error;
 pub mod known_hosts;
 pub mod proxy_jump;
@@ -39,9 +40,12 @@ pub use supervisor::{
     TransportStatusEvent, compute_reconnect_backoff, format_reconnected_divider,
 };
 pub use transfer::{
-    DEFAULT_MAX_CONCURRENT_TRANSFERS, DEFAULT_TRANSFER_CHUNK_SIZE, DirectTransferHook,
-    DownloadTargetPlan, TransferDirection, TransferExecutorHook, TransferId, TransferQueue,
-    TransferQueueConfig, TransferQueueSnapshot, TransferSnapshot, TransferStatus, UploadTargetPlan,
+    ConflictCheck, ConflictResolution, DEFAULT_MAX_CONCURRENT_TRANSFERS,
+    DEFAULT_MAX_TRANSPORT_RETRIES, DEFAULT_RECONNECT_RETRY_DELAY, DEFAULT_TRANSFER_CHUNK_SIZE,
+    DirectTransferHook, DirectoryTransferSummary, DownloadTargetPlan, ResilientTransferHook,
+    TransferConflict, TransferDirection, TransferExecutorHook, TransferId, TransferNotice,
+    TransferQueue, TransferQueueConfig, TransferQueueSnapshot, TransferSnapshot, TransferStatus,
+    UploadPlanOptions, UploadTargetPlan, disambiguate_filename, part_path_for,
 };
 pub use tunnel::{
     DEFAULT_TUNNEL_HOLD_GRACE, StandaloneTransportSpec, TunnelManager, TunnelManagerSnapshot,

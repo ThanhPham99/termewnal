@@ -7,7 +7,7 @@ use russh_sftp::client::SftpSession;
 use russh_sftp::client::fs::Metadata;
 use russh_sftp::protocol::{FileAttributes, FileType};
 use termewnal_core::vault::SecretStore;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 use zeroize::Zeroizing;
 
 use crate::auth::{
@@ -291,12 +291,18 @@ pub struct TransferTransportPool {
     entries: Mutex<HashMap<ProfileTransportKey, PooledTransportEntry>>,
     primary_transports: Mutex<HashMap<ProfileTransportKey, Arc<SshTransport>>>,
     key_locks: Mutex<HashMap<ProfileTransportKey, Arc<AsyncMutex<()>>>>,
+    reconnect_notify: Arc<Notify>,
 }
 
 impl TransferTransportPool {
     /// Creates an empty [`TransferTransportPool`].
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Returns a shared [`Notify`] triggered whenever a `Primary Transport` registers/reconnects.
+    pub fn reconnect_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.reconnect_notify)
     }
 
     /// Registers or refreshes the active `Primary Transport` for `key` (used for 2FA mux fallback).
@@ -308,6 +314,7 @@ impl TransferTransportPool {
         if let Ok(mut primaries) = self.primary_transports.lock() {
             primaries.insert(key, transport);
         }
+        self.reconnect_notify.notify_waiters();
     }
 
     /// Removes any registered `Primary Transport` and clears mux-fallback cache entries for `key`.
@@ -437,27 +444,40 @@ impl TransferTransportPool {
         match self.try_cached(&endpoint.key, role, active_primary.as_ref()) {
             Ok(Some(acquired)) => return Ok(acquired),
             Err(ready) => {
-                let sftp = Arc::new(open_sftp_session(&ready.transport).await?);
-                let mut entries = self.entries.lock().expect("pool entries mutex poisoned");
-                if let Some(entry) = entries.get_mut(&endpoint.key) {
-                    match ready.mode {
-                        SftpTransportMode::IsolatedTransferTransport => match role {
-                            SftpChannelRole::Browser => entry.browser_sftp = Some(Arc::clone(&sftp)),
-                            SftpChannelRole::Transfer => {
-                                entry.transfer_sftp = Some(Arc::clone(&sftp))
+                match open_sftp_session(&ready.transport).await {
+                    Ok(session) => {
+                        let sftp = Arc::new(session);
+                        let mut entries = self.entries.lock().expect("pool entries mutex poisoned");
+                        if let Some(entry) = entries.get_mut(&endpoint.key) {
+                            match ready.mode {
+                                SftpTransportMode::IsolatedTransferTransport => match role {
+                                    SftpChannelRole::Browser => {
+                                        entry.browser_sftp = Some(Arc::clone(&sftp))
+                                    }
+                                    SftpChannelRole::Transfer => {
+                                        entry.transfer_sftp = Some(Arc::clone(&sftp))
+                                    }
+                                },
+                                SftpTransportMode::MuxFallback => {
+                                    entry.browser_sftp = Some(Arc::clone(&sftp));
+                                    entry.transfer_sftp = Some(Arc::clone(&sftp));
+                                }
                             }
-                        },
-                        SftpTransportMode::MuxFallback => {
-                            entry.browser_sftp = Some(Arc::clone(&sftp));
-                            entry.transfer_sftp = Some(Arc::clone(&sftp));
+                        }
+                        return Ok(AcquiredSftpSession {
+                            session: sftp,
+                            mode: ready.mode,
+                            notice: ready.notice,
+                        });
+                    }
+                    Err(err) => {
+                        // Cached transport died before channel open; invalidate and re-establish cleanly.
+                        self.invalidate(&endpoint.key);
+                        if ready.mode == SftpTransportMode::MuxFallback {
+                            return Err(err);
                         }
                     }
                 }
-                return Ok(AcquiredSftpSession {
-                    session: sftp,
-                    mode: ready.mode,
-                    notice: ready.notice,
-                });
             }
             Ok(None) => {}
         }

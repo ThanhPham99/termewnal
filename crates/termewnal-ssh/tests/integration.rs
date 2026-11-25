@@ -6,6 +6,8 @@ mod known_hosts;
 mod proxy_jump;
 #[path = "suite/sftp_and_transfers.rs"]
 mod sftp_and_transfers;
+#[path = "suite/sftp_resilience_and_conflicts.rs"]
+mod sftp_resilience_and_conflicts;
 #[path = "suite/ssh_auth_and_session.rs"]
 mod ssh_auth_and_session;
 #[path = "suite/stub.rs"]
