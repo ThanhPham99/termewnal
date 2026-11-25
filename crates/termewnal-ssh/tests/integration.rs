@@ -2,6 +2,8 @@
 mod connection_supervisor;
 #[path = "suite/known_hosts.rs"]
 mod known_hosts;
+#[path = "suite/remote_tunnels.rs"]
+mod remote_tunnels;
 #[path = "suite/sftp_and_transfers.rs"]
 mod sftp_and_transfers;
 #[path = "suite/ssh_auth_and_session.rs"]

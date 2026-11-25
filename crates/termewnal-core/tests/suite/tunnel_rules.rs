@@ -92,3 +92,36 @@ fn public_bind_guard_flags_unspecified_and_non_loopback_hosts_until_opted_in() {
     rule.allow_public_bind = true;
     assert!(!rule.requires_public_bind_opt_in());
 }
+
+#[test]
+fn remote_tunnel_rule_roundtrips_and_does_not_trigger_local_public_bind_guard() {
+    let mut rule = TunnelRule::remote("Remote Web", 8080, "127.0.0.1", 3000);
+    assert_eq!(rule.direction, TunnelDirection::Remote);
+    assert_eq!(rule.bind_host, "127.0.0.1");
+    assert_eq!(rule.bind_port, 8080);
+    assert_eq!(rule.target_host.as_deref(), Some("127.0.0.1"));
+    assert_eq!(rule.target_port, Some(3000));
+    assert!(!rule.requires_public_bind_opt_in());
+
+    rule.bind_host = "0.0.0.0".to_string();
+    assert!(!rule.requires_public_bind_opt_in());
+
+    let temp = TempDir::new().expect("create temp dir");
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut profile = Profile::ssh("App", "app.internal", 22, "deploy", SshAuthMethod::Agent);
+    profile.tunnels.push(rule);
+
+    let cfg = ProfilesConfig {
+        schema_version: 1,
+        profiles: vec![profile],
+    };
+    save_profiles(&paths, &cfg).expect("save profiles");
+    let loaded = load_profiles(&paths).expect("reload profiles");
+    let reloaded = &loaded.profiles[0].tunnels[0];
+    assert_eq!(reloaded.direction, TunnelDirection::Remote);
+    assert_eq!(reloaded.bind_host, "0.0.0.0");
+    assert_eq!(reloaded.bind_port, 8080);
+    assert_eq!(reloaded.target_host.as_deref(), Some("127.0.0.1"));
+    assert_eq!(reloaded.target_port, Some(3000));
+    assert!(!reloaded.requires_public_bind_opt_in());
+}

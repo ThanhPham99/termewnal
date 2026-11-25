@@ -34,6 +34,7 @@ pub struct TunnelSummaryHook {
     pub active: usize,
     pub holding: usize,
     pub reconnecting: usize,
+    pub retrying: usize,
     pub error: usize,
 }
 
@@ -49,6 +50,7 @@ impl TunnelSummaryHook {
                 TunnelRuntimeState::Active => summary.active += 1,
                 TunnelRuntimeState::Holding => summary.holding += 1,
                 TunnelRuntimeState::Reconnecting => summary.reconnecting += 1,
+                TunnelRuntimeState::Retrying { .. } => summary.retrying += 1,
                 TunnelRuntimeState::Error(_) => summary.error += 1,
                 TunnelRuntimeState::Stopped | TunnelRuntimeState::Starting => {}
             }
@@ -215,6 +217,7 @@ impl StatusBarSnapshot {
             && self.tunnels.active == 0
             && self.tunnels.holding == 0
             && self.tunnels.reconnecting == 0
+            && self.tunnels.retrying == 0
             && self.tunnels.error == 0
         {
             return "Tunnels: 0".to_string();
@@ -223,6 +226,12 @@ impl StatusBarSnapshot {
             return format!(
                 "Tunnels: {} active, {} err",
                 self.tunnels.active, self.tunnels.error
+            );
+        }
+        if self.tunnels.retrying > 0 {
+            return format!(
+                "Tunnels: {} active, {} retrying",
+                self.tunnels.active, self.tunnels.retrying
             );
         }
         if self.tunnels.holding > 0 {
@@ -356,7 +365,10 @@ pub fn render_status_bar(
 
     let tunnel_color = if snapshot.tunnels.error > 0 {
         Color::from_rgb8(248, 113, 113)
-    } else if snapshot.tunnels.holding > 0 || snapshot.tunnels.reconnecting > 0 {
+    } else if snapshot.tunnels.holding > 0
+        || snapshot.tunnels.reconnecting > 0
+        || snapshot.tunnels.retrying > 0
+    {
         Color::from_rgb8(251, 191, 36)
     } else if snapshot.tunnels.active > 0 {
         Color::from_rgb8(74, 222, 128)
@@ -371,7 +383,10 @@ pub fn render_status_bar(
             .on_press(Message::StatusBarAction(StatusBarAction::ToggleTunnelsView)),
     );
 
-    if snapshot.tunnels.holding > 0 || snapshot.tunnels.reconnecting > 0 || snapshot.tunnels.error > 0
+    if snapshot.tunnels.holding > 0
+        || snapshot.tunnels.reconnecting > 0
+        || snapshot.tunnels.retrying > 0
+        || snapshot.tunnels.error > 0
     {
         right = right.push(
             button(text("Reconnect Tunnels").size(11))

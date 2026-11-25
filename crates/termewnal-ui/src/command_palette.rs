@@ -664,8 +664,8 @@ fn workspace_command_items() -> Vec<PaletteItem> {
         PaletteItem {
             id: "cmd:new-tunnel".to_string(),
             category: PaletteCategory::Command,
-            title: "New SSH Tunnel (-L / -D)...".to_string(),
-            subtitle: "Define a Local (-L) or Dynamic SOCKS5 (-D) Tunnel (Session or Standalone)"
+            title: "New SSH Tunnel (-L / -R / -D)...".to_string(),
+            subtitle: "Define a Local (-L), Remote (-R), or Dynamic SOCKS5 (-D) Tunnel (Session or Standalone)"
                 .to_string(),
             keywords: vec![
                 "tunnel".to_string(),

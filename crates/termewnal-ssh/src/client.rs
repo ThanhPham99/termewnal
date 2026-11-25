@@ -4,13 +4,14 @@ use std::time::Duration;
 
 use russh::client;
 use russh::keys::PublicKeyOrCertificate;
-use russh::{Channel, Disconnect};
+use russh::{Channel, ChannelOpenFailure, Disconnect};
 use socket2::{SockRef, TcpKeepalive};
 use termewnal_core::{
     DEFAULT_KEEPALIVE_INTERVAL_SECS, Profile, ProfileTarget, SshAuthMethod, vault::SecretStore,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tracing::debug;
 
 use crate::auth::{AgentConnector, SshInteractionHandler, authenticate_session};
@@ -65,6 +66,154 @@ impl SshConnectConfig {
     }
 }
 
+/// Incoming `forwarded-tcpip` channel dispatched from [`SshClientHandler`] to a Remote (`-R`) `Tunnel`.
+pub struct ForwardedTcpIpRequest {
+    pub channel: Channel<client::Msg>,
+    pub connected_address: String,
+    pub connected_port: u32,
+    pub originator_address: String,
+    pub originator_port: u32,
+    pub reply: client::ChannelOpenHandle,
+}
+
+#[derive(Debug)]
+struct RegisteredRemoteForward {
+    id: u64,
+    bind_address: String,
+    port: Option<u32>,
+    tx: mpsc::UnboundedSender<ForwardedTcpIpRequest>,
+}
+
+#[derive(Debug, Default)]
+struct RemoteForwardRegistry {
+    next_id: u64,
+    entries: Vec<RegisteredRemoteForward>,
+}
+
+impl RemoteForwardRegistry {
+    fn register(
+        &mut self,
+        bind_address: String,
+        requested_port: u32,
+        tx: mpsc::UnboundedSender<ForwardedTcpIpRequest>,
+    ) -> u64 {
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let id = self.next_id;
+        self.entries.push(RegisteredRemoteForward {
+            id,
+            bind_address,
+            port: (requested_port > 0).then_some(requested_port),
+            tx,
+        });
+        id
+    }
+
+    fn set_port(&mut self, id: u64, port: u32) {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            entry.port = Some(port);
+        }
+    }
+
+    fn unregister(&mut self, id: u64) {
+        self.entries.retain(|e| e.id != id);
+    }
+
+    fn find_sender(
+        &self,
+        connected_address: &str,
+        connected_port: u32,
+    ) -> Option<mpsc::UnboundedSender<ForwardedTcpIpRequest>> {
+        let conn_norm = normalize_forward_addr(connected_address);
+
+        // 1. Exact port + exact normalized address match.
+        if let Some(entry) = self.entries.iter().find(|e| {
+            e.port == Some(connected_port) && normalize_forward_addr(&e.bind_address) == conn_norm
+        }) {
+            return Some(entry.tx.clone());
+        }
+
+        // 2. Exact port + wildcard/loopback address equivalence.
+        if let Some(entry) = self.entries.iter().find(|e| {
+            e.port == Some(connected_port)
+                && forward_addr_matches(&e.bind_address, connected_address)
+        }) {
+            return Some(entry.tx.clone());
+        }
+
+        // 3. Port-only fallback when server rewrote bind host unexpectedly.
+        let mut by_port = self
+            .entries
+            .iter()
+            .filter(|e| e.port == Some(connected_port));
+        if let (Some(first), None) = (by_port.next(), by_port.next()) {
+            return Some(first.tx.clone());
+        }
+
+        // 4. Pending ephemeral port (`port: None`) match while `tcpip_forward(..., 0)` reply races.
+        if let Some(entry) = self
+            .entries
+            .iter()
+            .find(|e| e.port.is_none() && forward_addr_matches(&e.bind_address, connected_address))
+        {
+            return Some(entry.tx.clone());
+        }
+
+        let mut pending = self.entries.iter().filter(|e| e.port.is_none());
+        if let (Some(first), None) = (pending.next(), pending.next()) {
+            return Some(first.tx.clone());
+        }
+
+        None
+    }
+}
+
+fn normalize_forward_addr(raw: &str) -> String {
+    raw.trim()
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(raw.trim())
+        .to_ascii_lowercase()
+}
+
+fn is_wildcard_addr(norm: &str) -> bool {
+    matches!(norm, "" | "*" | "0.0.0.0" | "::")
+}
+
+fn is_loopback_addr(norm: &str) -> bool {
+    matches!(norm, "localhost" | "127.0.0.1" | "::1")
+}
+
+fn forward_addr_matches(registered: &str, connected: &str) -> bool {
+    let reg = normalize_forward_addr(registered);
+    let conn = normalize_forward_addr(connected);
+    reg == conn
+        || is_wildcard_addr(&reg)
+        || (is_loopback_addr(&reg) && is_loopback_addr(&conn))
+}
+
+/// RAII handle unregistering a Remote (`-R`) `Tunnel` dispatcher from [`SshTransport`].
+pub struct RemoteForwardRegistration {
+    id: u64,
+    registry: Arc<Mutex<RemoteForwardRegistry>>,
+}
+
+impl RemoteForwardRegistration {
+    /// Records the server-allocated remote port once `tcpip_forward` succeeds.
+    pub fn set_port(&self, port: u32) {
+        if let Ok(mut guard) = self.registry.lock() {
+            guard.set_port(self.id, port);
+        }
+    }
+}
+
+impl Drop for RemoteForwardRegistration {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.registry.lock() {
+            guard.unregister(self.id);
+        }
+    }
+}
+
 /// `russh::client::Handler` enforcing strict `known_hosts` TOFU/MITM verification.
 pub struct SshClientHandler {
     host: String,
@@ -72,6 +221,7 @@ pub struct SshClientHandler {
     known_hosts_path: PathBuf,
     interaction: Arc<dyn SshInteractionHandler>,
     banner: Arc<Mutex<Option<String>>>,
+    remote_forwards: Arc<Mutex<RemoteForwardRegistry>>,
 }
 
 impl SshClientHandler {
@@ -82,12 +232,29 @@ impl SshClientHandler {
         known_hosts_path: PathBuf,
         interaction: Arc<dyn SshInteractionHandler>,
     ) -> Self {
+        Self::with_remote_forwards(
+            host,
+            port,
+            known_hosts_path,
+            interaction,
+            Arc::new(Mutex::new(RemoteForwardRegistry::default())),
+        )
+    }
+
+    fn with_remote_forwards(
+        host: impl Into<String>,
+        port: u16,
+        known_hosts_path: PathBuf,
+        interaction: Arc<dyn SshInteractionHandler>,
+        remote_forwards: Arc<Mutex<RemoteForwardRegistry>>,
+    ) -> Self {
         Self {
             host: host.into(),
             port,
             known_hosts_path,
             interaction,
             banner: Arc::new(Mutex::new(None)),
+            remote_forwards,
         }
     }
 }
@@ -158,6 +325,45 @@ impl client::Handler for SshClientHandler {
         }
         Ok(())
     }
+
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        originator_address: &str,
+        originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let sender = self
+            .remote_forwards
+            .lock()
+            .ok()
+            .and_then(|reg| reg.find_sender(connected_address, connected_port));
+
+        let Some(tx) = sender else {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+
+        let req = ForwardedTcpIpRequest {
+            channel,
+            connected_address: connected_address.to_string(),
+            connected_port,
+            originator_address: originator_address.to_string(),
+            originator_port,
+            reply,
+        };
+        if let Err(err) = tx.send(req) {
+            err.0.reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+        }
+        Ok(())
+    }
 }
 
 /// TCP keepalive settings applied to the underlying `TcpStream` via `socket2` before SSH handshake.
@@ -181,6 +387,7 @@ pub struct SshTransport {
     port: u16,
     handle: client::Handle<SshClientHandler>,
     used_interactive_auth: bool,
+    remote_forwards: Arc<Mutex<RemoteForwardRegistry>>,
 }
 
 impl SshTransport {
@@ -249,11 +456,13 @@ impl SshTransport {
             nodelay: config.nodelay,
             ..client::Config::default()
         });
-        let handler = SshClientHandler::new(
+        let remote_forwards = Arc::new(Mutex::new(RemoteForwardRegistry::default()));
+        let handler = SshClientHandler::with_remote_forwards(
             config.host.clone(),
             config.port,
             known_hosts_path,
             Arc::clone(&interaction),
+            Arc::clone(&remote_forwards),
         );
 
         let mut handle = client::connect_stream(russh_cfg, stream, handler).await?;
@@ -284,6 +493,7 @@ impl SshTransport {
             port: config.port,
             handle,
             used_interactive_auth: outcome.used_interactive_auth,
+            remote_forwards,
         })
     }
 
@@ -310,6 +520,30 @@ impl SshTransport {
     /// Borrows the underlying `russh::client::Handle` for supervisor, tunnel, or SFTP operations.
     pub fn handle(&self) -> &client::Handle<SshClientHandler> {
         &self.handle
+    }
+
+    /// Registers a Remote (`-R`) `Tunnel` listener dispatcher for `forwarded-tcpip` channels.
+    ///
+    /// Dropping the returned [`RemoteForwardRegistration`] unregisters the dispatcher automatically.
+    pub fn register_remote_forward(
+        &self,
+        bind_address: impl Into<String>,
+        requested_port: u32,
+    ) -> (
+        RemoteForwardRegistration,
+        mpsc::UnboundedReceiver<ForwardedTcpIpRequest>,
+    ) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let id = self
+            .remote_forwards
+            .lock()
+            .expect("remote forward registry poisoned")
+            .register(bind_address.into(), requested_port, tx);
+        let reg = RemoteForwardRegistration {
+            id,
+            registry: Arc::clone(&self.remote_forwards),
+        };
+        (reg, rx)
     }
 
     /// Opens an additional SSH session channel (used for PTY shell or multiplexed SFTP fallback).

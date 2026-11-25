@@ -554,6 +554,7 @@ fn status_bar_reflects_active_session_and_extensible_transport_tunnel_transfer_h
         active: 2,
         holding: 1,
         reconnecting: 0,
+        retrying: 0,
         error: 0,
     }));
     let _ = state.update(Message::SetTransferSummary(TransferSummaryHook {
