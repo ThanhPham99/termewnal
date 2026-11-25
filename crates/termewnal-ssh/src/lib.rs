@@ -4,6 +4,7 @@ pub mod auth;
 pub mod client;
 pub mod error;
 pub mod known_hosts;
+pub mod proxy_jump;
 pub mod session;
 pub mod sftp;
 pub mod supervisor;
@@ -21,6 +22,7 @@ pub use known_hosts::{
     KnownHostStatus, default_known_hosts_path, fingerprint_sha256, record_known_host,
     record_known_host_path, verify_known_host, verify_known_host_path,
 };
+pub use proxy_jump::{JumpHopSpec, SshTransportChain, connect_transport_chain, resolve_proxy_jump_hops};
 pub use session::SshSession;
 pub use sftp::{
     AcquiredSftpSession, DEFAULT_SFTP_MAX_CONCURRENT_READS, DEFAULT_SFTP_MAX_CONCURRENT_WRITES,

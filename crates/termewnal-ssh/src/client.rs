@@ -7,10 +7,12 @@ use russh::keys::PublicKeyOrCertificate;
 use russh::{Channel, Disconnect};
 use socket2::{SockRef, TcpKeepalive};
 use termewnal_core::{
-    DEFAULT_KEEPALIVE_INTERVAL_SECS, Profile, ProfileTarget, SshAuthMethod, vault::SecretStore,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS, OpenSshHost, Profile, ProfileTarget, SshAuthMethod,
+    vault::SecretStore,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
+use tokio::sync::watch;
 use tracing::debug;
 
 use crate::auth::{AgentConnector, SshInteractionHandler, authenticate_session};
@@ -18,6 +20,7 @@ use crate::error::SshError;
 use crate::known_hosts::{
     KnownHostStatus, default_known_hosts_path, record_known_host_path, verify_known_host_path,
 };
+use crate::proxy_jump::{JumpHopSpec, connect_chain_parts, resolve_proxy_jump_hops};
 
 /// Connection and PTY configuration for establishing an SSH `Transport` and `Session`.
 #[derive(Debug, Clone)]
@@ -27,6 +30,7 @@ pub struct SshConnectConfig {
     pub username: String,
     pub auth: SshAuthMethod,
     pub known_hosts_path: Option<PathBuf>,
+    pub proxy_jump: Vec<JumpHopSpec>,
     pub nodelay: bool,
     pub term_name: String,
     pub cols: u16,
@@ -34,34 +38,87 @@ pub struct SshConnectConfig {
     pub scrollback_lines: usize,
 }
 
+impl Default for SshConnectConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: 22,
+            username: String::new(),
+            auth: SshAuthMethod::Agent,
+            known_hosts_path: None,
+            proxy_jump: Vec::new(),
+            nodelay: true,
+            term_name: "xterm-256color".to_string(),
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 10_000,
+        }
+    }
+}
+
 impl SshConnectConfig {
-    /// Builds an [`SshConnectConfig`] from an SSH [`Profile`].
-    pub fn from_profile(profile: &Profile, cols: u16, rows: u16, scrollback_lines: usize) -> Result<Self, SshError> {
+    /// Builds an [`SshConnectConfig`] from an SSH [`Profile`] resolving literal `ProxyJump` hops.
+    pub fn from_profile(
+        profile: &Profile,
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+    ) -> Result<Self, SshError> {
+        Self::from_profile_with_sources(profile, &[], &[], cols, rows, scrollback_lines)
+    }
+
+    /// Builds an [`SshConnectConfig`] from an SSH [`Profile`], resolving `ProxyJump` aliases
+    /// against Saved [`Profile`]s and `~/.ssh/config` [`OpenSshHost`] entries.
+    pub fn from_profile_with_sources(
+        profile: &Profile,
+        saved_profiles: &[Profile],
+        openssh_hosts: &[OpenSshHost],
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+    ) -> Result<Self, SshError> {
         match &profile.target {
             ProfileTarget::Ssh {
                 host,
                 port,
                 username,
                 auth,
+                proxy_jump,
                 ..
-            } => Ok(Self {
-                host: host.clone(),
-                port: *port,
-                username: username.clone(),
-                auth: auth.clone(),
-                known_hosts_path: None,
-                nodelay: true,
-                term_name: "xterm-256color".to_string(),
-                cols: cols.max(1),
-                rows: rows.max(1),
-                scrollback_lines,
-            }),
+            } => {
+                let resolved_hops = resolve_proxy_jump_hops(
+                    proxy_jump,
+                    saved_profiles,
+                    openssh_hosts,
+                    username,
+                    None,
+                )?;
+                Ok(Self {
+                    host: host.clone(),
+                    port: *port,
+                    username: username.clone(),
+                    auth: auth.clone(),
+                    known_hosts_path: None,
+                    proxy_jump: resolved_hops,
+                    nodelay: true,
+                    term_name: "xterm-256color".to_string(),
+                    cols: cols.max(1),
+                    rows: rows.max(1),
+                    scrollback_lines,
+                })
+            }
             ProfileTarget::LocalShell { .. } => Err(SshError::Connection {
                 host: profile.name.clone(),
                 port: 0,
                 reason: "profile target is a local shell, not SSH".to_string(),
             }),
         }
+    }
+
+    /// Overrides the ordered `ProxyJump` hop list on this configuration.
+    pub fn with_proxy_jump(mut self, proxy_jump: Vec<JumpHopSpec>) -> Self {
+        self.proxy_jump = proxy_jump;
+        self
     }
 }
 
@@ -72,6 +129,7 @@ pub struct SshClientHandler {
     known_hosts_path: PathBuf,
     interaction: Arc<dyn SshInteractionHandler>,
     banner: Arc<Mutex<Option<String>>>,
+    closed_tx: watch::Sender<bool>,
 }
 
 impl SshClientHandler {
@@ -82,13 +140,19 @@ impl SshClientHandler {
         known_hosts_path: PathBuf,
         interaction: Arc<dyn SshInteractionHandler>,
     ) -> Self {
+        let (closed_tx, _) = watch::channel(false);
         Self {
             host: host.into(),
             port,
             known_hosts_path,
             interaction,
             banner: Arc::new(Mutex::new(None)),
+            closed_tx,
         }
+    }
+
+    fn subscribe_closed(&self) -> watch::Receiver<bool> {
+        self.closed_tx.subscribe()
     }
 }
 
@@ -158,6 +222,17 @@ impl client::Handler for SshClientHandler {
         }
         Ok(())
     }
+
+    async fn disconnected(
+        &mut self,
+        reason: client::DisconnectReason<Self::Error>,
+    ) -> Result<(), Self::Error> {
+        let _ = self.closed_tx.send(true);
+        match reason {
+            client::DisconnectReason::ReceivedDisconnect(_) => Ok(()),
+            client::DisconnectReason::Error(err) => Err(err),
+        }
+    }
 }
 
 /// TCP keepalive settings applied to the underlying `TcpStream` via `socket2` before SSH handshake.
@@ -180,12 +255,14 @@ pub struct SshTransport {
     host: String,
     port: u16,
     handle: client::Handle<SshClientHandler>,
+    closed_rx: watch::Receiver<bool>,
     used_interactive_auth: bool,
+    upstream_hops: Vec<Arc<SshTransport>>,
 }
 
 impl SshTransport {
-    /// Opens a TCP connection to `config.host:config.port`, applies TCP keepalives,
-    /// verifies the host key, and authenticates.
+    /// Opens an SSH connection to `config.host:config.port` (direct or via `config.proxy_jump`),
+    /// applies TCP keepalives, verifies host keys, and authenticates.
     pub async fn connect(
         config: &SshConnectConfig,
         vault: Option<&dyn SecretStore>,
@@ -202,9 +279,37 @@ impl SshTransport {
         .await
     }
 
-    /// Opens a TCP connection to `config.host:config.port` with explicit TCP keepalive settings,
-    /// verifies the host key, and authenticates.
+    /// Opens an SSH connection to `config.host:config.port` (direct or via `config.proxy_jump`)
+    /// with explicit TCP keepalive settings, verifies host keys, and authenticates.
     pub async fn connect_with_keepalive(
+        config: &SshConnectConfig,
+        keepalive: Option<TcpKeepaliveSettings>,
+        vault: Option<&dyn SecretStore>,
+        interaction: Arc<dyn SshInteractionHandler>,
+        agent_connector: Arc<dyn AgentConnector>,
+    ) -> Result<Self, SshError> {
+        if config.proxy_jump.is_empty() {
+            return Self::connect_direct_with_keepalive(
+                config,
+                keepalive,
+                vault,
+                interaction,
+                agent_connector,
+            )
+            .await;
+        }
+
+        let (jump_hops, mut target) =
+            connect_chain_parts(config, keepalive, vault, interaction, agent_connector).await?;
+        let any_interactive = jump_hops.iter().any(|h| h.used_interactive_auth());
+        if any_interactive {
+            target.mark_used_interactive_auth();
+        }
+        target.attach_upstream_hops(jump_hops.into_iter().map(Arc::new).collect());
+        Ok(target)
+    }
+
+    pub(crate) async fn connect_direct_with_keepalive(
         config: &SshConnectConfig,
         keepalive: Option<TcpKeepaliveSettings>,
         vault: Option<&dyn SecretStore>,
@@ -255,6 +360,7 @@ impl SshTransport {
             known_hosts_path,
             Arc::clone(&interaction),
         );
+        let closed_rx = handler.subscribe_closed();
 
         let mut handle = client::connect_stream(russh_cfg, stream, handler).await?;
 
@@ -283,8 +389,18 @@ impl SshTransport {
             host: config.host.clone(),
             port: config.port,
             handle,
+            closed_rx,
             used_interactive_auth: outcome.used_interactive_auth,
+            upstream_hops: Vec::new(),
         })
+    }
+
+    pub(crate) fn mark_used_interactive_auth(&mut self) {
+        self.used_interactive_auth = true;
+    }
+
+    pub(crate) fn attach_upstream_hops(&mut self, hops: Vec<Arc<SshTransport>>) {
+        self.upstream_hops = hops;
     }
 
     /// Target SSH hostname.
@@ -302,9 +418,27 @@ impl SshTransport {
         self.used_interactive_auth
     }
 
-    /// Returns `true` if the underlying SSH transport channel has closed.
+    /// Returns `true` if the underlying SSH transport channel (or any attached upstream hop) has closed.
     pub fn is_closed(&self) -> bool {
         self.handle.is_closed()
+            || *self.closed_rx.borrow()
+            || self.upstream_hops.iter().any(|hop| hop.is_closed())
+    }
+
+    /// Resolves once this SSH transport session disconnects or closes.
+    pub async fn wait_closed(&self) {
+        if self.handle.is_closed() || *self.closed_rx.borrow() {
+            return;
+        }
+        let mut rx = self.closed_rx.clone();
+        loop {
+            if *rx.borrow_and_update() || self.handle.is_closed() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
     }
 
     /// Borrows the underlying `russh::client::Handle` for supervisor, tunnel, or SFTP operations.
@@ -317,12 +451,35 @@ impl SshTransport {
         Ok(self.handle.channel_open_session().await?)
     }
 
-    /// Sends an SSH `SSH_MSG_DISCONNECT` cleanly without consuming the shared transport handle.
+    /// Sends an SSH `SSH_MSG_DISCONNECT` cleanly without consuming the shared transport handle,
+    /// tearing down any attached upstream `ProxyJump` hops in reverse order afterwards.
     pub async fn disconnect_shared(&self) -> Result<(), SshError> {
-        self.handle
-            .disconnect(Disconnect::ByApplication, "closed by user", "en")
-            .await?;
-        Ok(())
+        let res = tokio::time::timeout(
+            Duration::from_millis(250),
+            self.handle
+                .disconnect(Disconnect::ByApplication, "closed by user", "en"),
+        )
+        .await;
+        if !self.upstream_hops.is_empty() {
+            let _ = tokio::time::timeout(Duration::from_millis(50), self.wait_closed()).await;
+            for hop in self.upstream_hops.iter().rev() {
+                hop.disconnect_best_effort().await;
+            }
+        }
+        match res {
+            Ok(inner) => Ok(inner?),
+            Err(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn disconnect_best_effort(&self) {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(250),
+            self.handle
+                .disconnect(Disconnect::ByApplication, "closed by user", "en"),
+        )
+        .await;
+        let _ = tokio::time::timeout(Duration::from_millis(50), self.wait_closed()).await;
     }
 
     /// Alias for [`Self::disconnect_shared`] used by supervisor teardown paths.

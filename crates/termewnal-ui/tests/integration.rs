@@ -12,6 +12,8 @@ mod multi_window_restore_and_close_guard;
 mod navigation_chrome;
 #[path = "suite/openssh_and_tabby_ui.rs"]
 mod openssh_and_tabby_ui;
+#[path = "suite/proxy_jump_ui.rs"]
+mod proxy_jump_ui;
 #[path = "suite/sftp_drawer_and_transfers.rs"]
 mod sftp_drawer_and_transfers;
 #[path = "suite/ssh_session_ui.rs"]
