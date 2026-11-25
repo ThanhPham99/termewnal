@@ -18,5 +18,7 @@ mod sftp_drawer_and_transfers;
 mod sftp_resilience_ui;
 #[path = "suite/ssh_session_ui.rs"]
 mod ssh_session_ui;
+#[path = "suite/tunnels_ui.rs"]
+mod tunnels_ui;
 #[path = "suite/workspace_tree.rs"]
 mod workspace_tree;

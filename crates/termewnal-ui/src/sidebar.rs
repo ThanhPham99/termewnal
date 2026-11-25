@@ -645,11 +645,18 @@ fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, i
     let collapsed = state.is_section_collapsed(SidebarSection::ActiveTunnels);
     let prefix = if collapsed { ">" } else { "v" };
     let count = state.active_tunnels().len();
-    let header = button(text(format!("{prefix} ACTIVE TUNNELS ({count})")).size(11))
+    let header_btn = button(text(format!("{prefix} ACTIVE TUNNELS ({count})")).size(11))
         .padding([3, 4])
         .width(Length::Fill)
         .style(button::subtle)
         .on_press(Message::SidebarToggleSection(SidebarSection::ActiveTunnels));
+    let new_btn = button(text("+ Tunnel").size(11))
+        .padding([2, 6])
+        .style(button::secondary)
+        .on_press(Message::OpenTunnelCreateModal);
+    let header = row![header_btn, new_btn]
+        .spacing(4)
+        .align_y(Alignment::Center);
 
     let mut col = column![header].spacing(6);
     if collapsed {
@@ -676,13 +683,70 @@ fn render_tunnels_section(state: &SidebarState) -> Element<'_, Message, Theme, i
         } else {
             "Session"
         };
-        let item = column![
-            text(format!("[{dir}] {} · {}", tunnel.name, tunnel.state.label())).size(12),
+        let is_running = matches!(
+            tunnel.state,
+            TunnelRuntimeState::Starting
+                | TunnelRuntimeState::Active
+                | TunnelRuntimeState::Holding
+                | TunnelRuntimeState::Reconnecting
+        );
+        let state_color = match &tunnel.state {
+            TunnelRuntimeState::Active => Color::from_rgb8(74, 222, 128),
+            TunnelRuntimeState::Holding | TunnelRuntimeState::Reconnecting | TunnelRuntimeState::Starting => {
+                Color::from_rgb8(251, 191, 36)
+            }
+            TunnelRuntimeState::Error(_) => Color::from_rgb8(248, 113, 113),
+            TunnelRuntimeState::Stopped => Color::from_rgb8(148, 163, 184),
+        };
+        let toggle_btn = button(text(if is_running { "Stop" } else { "Start" }).size(10))
+            .padding([2, 6])
+            .style(if is_running {
+                button::secondary
+            } else {
+                button::primary
+            })
+            .on_press(Message::ToggleTunnel(tunnel.id.clone()));
+
+        let mut action_row = row![
+            text(format!("[{dir}] {}", tunnel.name)).size(12),
+            space::horizontal(),
+            text(tunnel.state.label()).size(11).color(state_color),
+            toggle_btn,
+        ]
+        .spacing(4)
+        .align_y(Alignment::Center);
+
+        if matches!(
+            tunnel.state,
+            TunnelRuntimeState::Active
+                | TunnelRuntimeState::Holding
+                | TunnelRuntimeState::Reconnecting
+                | TunnelRuntimeState::Error(_)
+        ) {
+            action_row = action_row.push(
+                button(text("Reconnect").size(10))
+                    .padding([2, 6])
+                    .style(button::subtle)
+                    .on_press(Message::ReconnectTunnel(tunnel.id.clone())),
+            );
+        }
+
+        let mut item = column![
+            action_row,
             text(format!("{} -> {} ({scope})", tunnel.bind_addr, tunnel.target_addr))
                 .size(11)
                 .color(Color::from_rgb8(148, 163, 184)),
         ]
         .spacing(2);
+
+        if let TunnelRuntimeState::Error(err) = &tunnel.state {
+            item = item.push(
+                text(err.as_str())
+                    .size(10)
+                    .color(Color::from_rgb8(248, 113, 113)),
+            );
+        }
+
         col = col.push(container(item).padding([4, 8]).width(Length::Fill));
     }
 

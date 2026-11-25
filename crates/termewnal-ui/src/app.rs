@@ -17,9 +17,10 @@ use termewnal_core::{
     AppConfig, CURRENT_SCHEMA_VERSION, ConfigFileKind, ConfigPaths, ConfigWatchEvent,
     ConfigWatcher, LayoutSplitAxis, LayoutSplitNode, OpenSshHost, Profile, ProfileTarget,
     ProfilesConfig, SecretStore, SessionDescriptor, SshAuthMethod, TabLayout, TerminalConfig,
-    ThemePalette, TomlReloadError, VaultBackend, VaultSession, WindowLayout, WorkspaceLayout,
-    ensure_config_files, import_tabby_config_file_into_profiles, load_layout,
-    load_system_ssh_hosts, resolve_mux_attach_command, save_cloned_openssh_profile, save_layout,
+    ThemePalette, TomlReloadError, TunnelDirection, TunnelRule, VaultBackend, VaultSession,
+    WindowLayout, WorkspaceLayout, ensure_config_files, import_tabby_config_file_into_profiles,
+    load_layout, load_system_ssh_hosts, resolve_mux_attach_command, save_cloned_openssh_profile,
+    save_layout, save_profiles,
 };
 use termewnal_pty::{
     GridSearchMatch, PtyEvent, PtySession, PtySpawnConfig, Scroll, SelectionType, ShellSpec, Side,
@@ -27,9 +28,10 @@ use termewnal_pty::{
 };
 use termewnal_ssh::{
     ConflictResolution, ConnectionSupervisor, DirectoryTransferSummary, OsAgentConnector,
-    ProfileTransportKey, RemoteListing, SftpEndpoint, SftpManager, SshConnectConfig, SshSession,
-    SupervisorConfig, TransferId, TransferNotice, TransferQueue, TransferQueueConfig,
-    TransferQueueSnapshot, TransportStatus, join_remote_path, parent_remote_path,
+    ProfileTransportKey, RejectAllInteractionHandler, RemoteListing, SftpEndpoint, SftpManager,
+    SshConnectConfig, SshSession, StandaloneTransportSpec, SupervisorConfig, TransferId,
+    TransferNotice, TransferQueue, TransferQueueConfig, TransferQueueSnapshot, TransportStatus,
+    TunnelManager, TunnelManagerSnapshot, join_remote_path, parent_remote_path,
 };
 use tokio::sync::mpsc;
 use tracing::{error, warn};
@@ -64,6 +66,10 @@ use crate::terminal_ergonomics::{
     paste_confirm_modal_view, read_clipboard_via_arboard, search_bar_view, search_input_id,
 };
 use crate::terminal_widget::{TerminalViewOptions, TerminalViewport};
+use crate::tunnel_ui::{
+    AdHocTunnelRule, TunnelUiState, apply_known_hosts_override, build_active_tunnel_entries,
+    tunnel_name_input_id,
+};
 use crate::workspace::{
     ClosePaneOutcome, CycleDirection, FocusDirection, PaneId, SplitAxis, SplitId, SplitNode,
     TabId, Workspace, WorkspaceIds, WorkspaceTab,
@@ -681,6 +687,24 @@ pub enum Message {
     CancelTransfer(TransferId),
     RetryTransfer(TransferId),
     ClearFinishedTransfers,
+    OpenTunnelCreateModal,
+    CloseTunnelCreateModal,
+    TunnelFormDirectionChanged(TunnelDirection),
+    TunnelFormNameChanged(String),
+    TunnelFormProfileSelected(Option<String>),
+    TunnelFormBindHostChanged(String),
+    TunnelFormBindPortChanged(String),
+    TunnelFormTargetHostChanged(String),
+    TunnelFormTargetPortChanged(String),
+    TunnelFormStandaloneToggled(bool),
+    TunnelFormHoldGraceChanged(String),
+    SubmitTunnelCreate,
+    TunnelPublicBindConfirm,
+    TunnelPublicBindCancel,
+    ToggleTunnel(String),
+    ReconnectTunnel(String),
+    ReconnectAllTunnels,
+    TunnelManagerUpdated(TunnelManagerSnapshot),
 }
 
 struct WindowState {
@@ -714,6 +738,10 @@ pub struct AppState {
     sftp_manager: SftpManager,
     transfer_queue: TransferQueue,
     sftp_drawer: SftpDrawerState,
+    tunnel_manager: TunnelManager,
+    tunnel_ui: TunnelUiState,
+    synced_standalone_tunnels: usize,
+    known_hosts_override: Option<PathBuf>,
     next_session_id: u64,
     last_error: Option<String>,
     background_work_tracker: Arc<BackgroundWorkTracker>,
@@ -818,6 +846,7 @@ impl AppState {
                 ..TransferQueueConfig::default()
             },
         );
+        let tunnel_manager = TunnelManager::new();
         let download_dir = paths.cache_dir().join("downloads");
         let mut state = Self {
             paths,
@@ -843,6 +872,10 @@ impl AppState {
             sftp_manager,
             transfer_queue,
             sftp_drawer: SftpDrawerState::with_download_dir(download_dir),
+            tunnel_manager,
+            tunnel_ui: TunnelUiState::default(),
+            synced_standalone_tunnels: 0,
+            known_hosts_override: None,
             next_session_id: 1,
             last_error: None,
             background_work_tracker: tracker,
@@ -871,6 +904,7 @@ impl AppState {
             state.push_default_pending_window()?;
         }
         state.reload_system_ssh_config();
+        state.sync_tunnel_telemetry();
         Ok(state)
     }
 
@@ -1220,6 +1254,8 @@ impl AppState {
         slot.rows = rows;
         slot.spec.connect_config.cols = cols;
         slot.spec.connect_config.rows = rows;
+        slot.spec.connect_config =
+            apply_known_hosts_override(slot.spec.connect_config.clone(), self.known_hosts_override.as_ref());
         slot.transport_status = TransportStatus::Connecting;
         slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
 
@@ -1607,6 +1643,10 @@ impl AppState {
                     .set_section_collapsed(SidebarSection::ActiveTunnels, false);
                 Task::none()
             }
+            StatusBarAction::ReconnectTunnels => {
+                self.reconnect_all_tunnels();
+                Task::none()
+            }
             StatusBarAction::ToggleTransferDrawer => self.toggle_sftp_drawer(),
         }
     }
@@ -1624,6 +1664,10 @@ impl AppState {
             PaletteAction::OpenTabbyImporter => {
                 self.command_palette.close();
                 self.update_in_window(window_scope, Message::OpenTabbyImportModal)
+            }
+            PaletteAction::OpenTunnelCreator => {
+                self.command_palette.close();
+                self.update_in_window(window_scope, Message::OpenTunnelCreateModal)
             }
             PaletteAction::ReloadSystemSsh => {
                 self.command_palette.close();
@@ -1691,14 +1735,15 @@ impl AppState {
             }
             PaletteAction::ToggleTunnel(tunnel_id) => {
                 self.command_palette.close();
-                let _ = tunnel_id;
-                Task::none()
+                self.toggle_tunnel(&tunnel_id)
             }
         }
     }
 
     fn remove_session(&mut self, session_id: SessionId) {
         self.ssh_ui.clear_session_prompts(session_id);
+        self.tunnel_manager.stop_session_tunnels(session_id.0);
+        self.tunnel_ui.prune_session(session_id);
         match self.sessions.remove(&session_id) {
             Some(SessionEntry::Local(session)) => session.pty.terminate(),
             Some(SessionEntry::Ssh(slot)) => {
@@ -1711,6 +1756,7 @@ impl AppState {
             }
             Some(SessionEntry::Remote(_)) | None => {}
         }
+        self.sync_tunnel_telemetry();
     }
 
     fn split_target_pane(
@@ -2120,6 +2166,8 @@ impl AppState {
                 self.lifecycle = DaemonLifecycle::Exiting;
                 self.transfer_queue.cancel_all();
                 self.sync_transfer_telemetry();
+                self.tunnel_manager.stop_all();
+                self.sync_tunnel_telemetry();
                 self.background_work_source.stop_all();
                 self.ipc_handle.take();
                 self.retired_final_window = None;
@@ -2492,9 +2540,15 @@ impl AppState {
                             }
                             reloaded
                         }
-                        ConfigFileKind::Profiles => self
-                            .reload_ui
-                            .reload_profiles(&self.paths, &mut self.profiles),
+                        ConfigFileKind::Profiles => {
+                            let reloaded = self
+                                .reload_ui
+                                .reload_profiles(&self.paths, &mut self.profiles);
+                            if matches!(reloaded, Ok(true)) {
+                                self.sync_tunnel_telemetry();
+                            }
+                            reloaded
+                        }
                     };
                     if let Err(err) = res {
                         error!(file = kind.file_name(), error = %err, "TOML hot-reload failed");
@@ -3077,6 +3131,108 @@ impl AppState {
                 self.sync_transfer_telemetry();
                 Task::none()
             }
+            Message::OpenTunnelCreateModal => {
+                self.command_palette.close();
+                let default_session = self
+                    .active_session_id()
+                    .filter(|sid| self.sessions.get(sid).and_then(SessionEntry::as_ssh).is_some());
+                let default_profile = default_session
+                    .and_then(|sid| self.sessions.get(&sid).and_then(SessionEntry::as_ssh))
+                    .and_then(|slot| slot.target.profile_id.clone())
+                    .or_else(|| {
+                        self.profiles
+                            .profiles
+                            .iter()
+                            .find(|p| matches!(p.target, ProfileTarget::Ssh { .. }))
+                            .map(|p| p.id.clone())
+                    });
+                self.tunnel_ui
+                    .create_form_mut()
+                    .open_for(default_profile, default_session);
+                operation::focus(tunnel_name_input_id())
+            }
+            Message::CloseTunnelCreateModal => {
+                self.tunnel_ui.create_form_mut().close();
+                Task::none()
+            }
+            Message::TunnelFormDirectionChanged(dir) => {
+                let form = self.tunnel_ui.create_form_mut();
+                form.direction = dir;
+                form.validation_error = None;
+                if dir == TunnelDirection::Dynamic && form.bind_port == "5432" {
+                    form.bind_port = "1080".to_string();
+                } else if dir == TunnelDirection::Local && form.bind_port == "1080" {
+                    form.bind_port = "5432".to_string();
+                }
+                Task::none()
+            }
+            Message::TunnelFormNameChanged(val) => {
+                let form = self.tunnel_ui.create_form_mut();
+                form.name = val;
+                form.validation_error = None;
+                Task::none()
+            }
+            Message::TunnelFormProfileSelected(pid) => {
+                let form = self.tunnel_ui.create_form_mut();
+                form.profile_id = pid;
+                form.validation_error = None;
+                Task::none()
+            }
+            Message::TunnelFormBindHostChanged(val) => {
+                let form = self.tunnel_ui.create_form_mut();
+                form.bind_host = val;
+                form.validation_error = None;
+                Task::none()
+            }
+            Message::TunnelFormBindPortChanged(val) => {
+                let form = self.tunnel_ui.create_form_mut();
+                form.bind_port = val;
+                form.validation_error = None;
+                Task::none()
+            }
+            Message::TunnelFormTargetHostChanged(val) => {
+                let form = self.tunnel_ui.create_form_mut();
+                form.target_host = val;
+                form.validation_error = None;
+                Task::none()
+            }
+            Message::TunnelFormTargetPortChanged(val) => {
+                let form = self.tunnel_ui.create_form_mut();
+                form.target_port = val;
+                form.validation_error = None;
+                Task::none()
+            }
+            Message::TunnelFormStandaloneToggled(standalone) => {
+                let form = self.tunnel_ui.create_form_mut();
+                form.standalone = standalone;
+                form.validation_error = None;
+                Task::none()
+            }
+            Message::TunnelFormHoldGraceChanged(val) => {
+                let form = self.tunnel_ui.create_form_mut();
+                form.hold_grace_secs = val;
+                form.validation_error = None;
+                Task::none()
+            }
+            Message::SubmitTunnelCreate => self.submit_tunnel_create(),
+            Message::TunnelPublicBindConfirm => self.confirm_public_bind(),
+            Message::TunnelPublicBindCancel => {
+                self.tunnel_ui.cancel_public_bind();
+                Task::none()
+            }
+            Message::ToggleTunnel(tunnel_id) => self.toggle_tunnel(&tunnel_id),
+            Message::ReconnectTunnel(tunnel_id) => {
+                self.reconnect_tunnel(&tunnel_id);
+                Task::none()
+            }
+            Message::ReconnectAllTunnels => {
+                self.reconnect_all_tunnels();
+                Task::none()
+            }
+            Message::TunnelManagerUpdated(_snap) => {
+                self.sync_tunnel_telemetry();
+                Task::none()
+            }
         }
     }
 
@@ -3096,6 +3252,7 @@ impl AppState {
                 self.profiles = outcome.updated_profiles.clone();
                 self.tabby_import.record_outcome(path, &outcome);
                 self.last_error = None;
+                self.sync_tunnel_telemetry();
             }
             Err(err) => {
                 warn!(path = %path.display(), error = %err, "Tabby config.yaml import failed");
@@ -3168,17 +3325,29 @@ impl AppState {
                 slot.transport_status = TransportStatus::Connected { latency_ms: None };
                 slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
                 slot.snapshot = Arc::new(slot.buffer.snapshot());
+                let profile_id = slot.target.profile_id.clone();
+                let supervisor_handle = slot.supervisor.clone();
                 if self.transfer_queue.resume_reconnected(&sftp_key) > 0 {
                     self.sync_transfer_telemetry();
+                }
+                let mut tasks = Vec::new();
+                if let Some(sup) = supervisor_handle {
+                    tasks.push(self.auto_start_session_tunnels(
+                        session_id,
+                        profile_id.as_deref(),
+                        &sup,
+                    ));
+                } else {
+                    self.sync_tunnel_telemetry();
                 }
                 if self.sftp_drawer.is_open()
                     && (self.sftp_drawer.bound_session_id().is_none()
                         || self.sftp_drawer.bound_session_id() == Some(session_id))
                 {
                     let path = self.sftp_drawer.current_path().to_string();
-                    return self.sftp_refresh_task(session_id, path);
+                    tasks.push(self.sftp_refresh_task(session_id, path));
                 }
-                Task::none()
+                Task::batch(tasks)
             }
             SshUiEvent::TransportStatus {
                 status, last_error, ..
@@ -3484,6 +3653,15 @@ impl AppState {
             render_conflict_resolution_modal(&self.sftp_drawer, &palette)
         {
             layers = layers.push(conflict_modal);
+        }
+        if let Some(tunnel_modal) = self
+            .tunnel_ui
+            .view_create_modal(&self.profiles.profiles, &palette)
+        {
+            layers = layers.push(tunnel_modal);
+        }
+        if let Some(bind_warning) = self.tunnel_ui.view_public_bind_warning(&palette) {
+            layers = layers.push(bind_warning);
         }
         if self.command_palette.is_open() {
             let items = self.command_palette_items();
@@ -3942,6 +4120,12 @@ impl AppState {
             },
             transfer_queue_stream,
         );
+        let tunnel_sub = Subscription::run_with(
+            TunnelSubKey {
+                manager: self.tunnel_manager.clone(),
+            },
+            tunnel_manager_stream,
+        );
 
         Subscription::batch(
             [
@@ -3951,6 +4135,7 @@ impl AppState {
                 shortcuts,
                 config_watch,
                 transfer_sub,
+                tunnel_sub,
             ]
             .into_iter()
             .chain(vault_tick)
@@ -4436,6 +4621,21 @@ impl AppState {
         &self.transfer_queue
     }
 
+    /// Returns the shared [`TunnelManager`].
+    pub fn tunnel_manager(&self) -> &TunnelManager {
+        &self.tunnel_manager
+    }
+
+    /// Returns the `Tunnel` creation & public-bind opt-in UI state.
+    pub fn tunnel_ui(&self) -> &TunnelUiState {
+        &self.tunnel_ui
+    }
+
+    /// Overrides the `known_hosts` path used by SSH connections and Standalone `Tunnel`s (for tests).
+    pub fn set_known_hosts_path(&mut self, path: impl Into<PathBuf>) {
+        self.known_hosts_override = Some(path.into());
+    }
+
     fn resolve_sftp_session_id(&self) -> Option<SessionId> {
         if let Some(active_sid) = self.active_session_id()
             && self
@@ -4690,6 +4890,401 @@ impl AppState {
         });
         self.sftp_drawer.set_queue_snapshot(snap);
     }
+
+    fn sync_tunnel_telemetry(&mut self) {
+        let mgr_snap = self.tunnel_manager.snapshot();
+        if mgr_snap.active_standalone_count != self.synced_standalone_tunnels {
+            self.synced_standalone_tunnels = mgr_snap.active_standalone_count;
+            self.background_work_tracker
+                .set_active_standalone_tunnels(mgr_snap.active_standalone_count);
+        }
+
+        let open_ssh: BTreeMap<SessionId, Option<String>> = self
+            .sessions
+            .iter()
+            .filter_map(|(&sid, entry)| {
+                entry
+                    .as_ssh()
+                    .map(|slot| (sid, slot.target.profile_id.clone()))
+            })
+            .collect();
+
+        let entries = build_active_tunnel_entries(
+            &self.profiles.profiles,
+            &open_ssh,
+            &mgr_snap,
+            &self.tunnel_ui,
+        );
+        self.status_bar
+            .set_tunnels(TunnelSummaryHook::from_entries(&entries));
+        self.sidebar.set_active_tunnels(entries);
+    }
+
+    fn find_tunnel_definition(
+        &self,
+        tunnel_id: &str,
+    ) -> Option<(TunnelRule, Option<String>, Option<SessionId>)> {
+        for profile in &self.profiles.profiles {
+            if let Some(rule) = profile.tunnels.iter().find(|r| r.id == tunnel_id) {
+                let sid = self.sessions.iter().find_map(|(&sid, entry)| {
+                    entry
+                        .as_ssh()
+                        .filter(|slot| slot.target.profile_id.as_deref() == Some(profile.id.as_str()))
+                        .map(|_| sid)
+                });
+                return Some((rule.clone(), Some(profile.id.clone()), sid));
+            }
+        }
+        self.tunnel_ui.find_ad_hoc(tunnel_id).map(|entry| {
+            (
+                entry.rule.clone(),
+                entry.profile_id.clone(),
+                entry.session_id,
+            )
+        })
+    }
+
+    fn submit_tunnel_create(&mut self) -> Task<Message> {
+        let rule = match self.tunnel_ui.create_form().build_rule() {
+            Ok(rule) => rule,
+            Err(err) => {
+                self.tunnel_ui.create_form_mut().validation_error = Some(err);
+                return Task::none();
+            }
+        };
+
+        let profile_id = self.tunnel_ui.create_form().profile_id.clone();
+        let session_id = self.tunnel_ui.create_form().session_id.or_else(|| {
+            profile_id.as_deref().and_then(|pid| {
+                self.sessions.iter().find_map(|(&sid, entry)| {
+                    entry
+                        .as_ssh()
+                        .filter(|slot| slot.target.profile_id.as_deref() == Some(pid))
+                        .map(|_| sid)
+                })
+            })
+        });
+
+        let saved_to_profile = if let Some(pid) = profile_id.as_deref()
+            && let Some(profile) = self.profiles.profiles.iter_mut().find(|p| p.id == pid)
+        {
+            profile.tunnels.push(rule.clone());
+            true
+        } else {
+            false
+        };
+
+        if saved_to_profile {
+            if let Err(err) = save_profiles(&self.paths, &self.profiles) {
+                warn!(error = %err, "failed saving tunnel rule to profiles.toml");
+                self.last_error = Some(err.to_string());
+            }
+        } else {
+            self.tunnel_ui.add_ad_hoc(AdHocTunnelRule {
+                rule: rule.clone(),
+                profile_id: profile_id.clone(),
+                session_id,
+            });
+        }
+
+        self.tunnel_ui.create_form_mut().close();
+
+        if rule.requires_public_bind_opt_in() {
+            self.tunnel_ui
+                .prompt_public_bind(rule, profile_id, session_id, true);
+            self.sync_tunnel_telemetry();
+            return Task::none();
+        }
+
+        self.start_tunnel_rule(rule, profile_id, session_id)
+    }
+
+    fn confirm_public_bind(&mut self) -> Task<Message> {
+        let Some(pending) = self.tunnel_ui.confirm_public_bind() else {
+            return Task::none();
+        };
+
+        if let Some(pid) = pending.profile_id.as_deref()
+            && let Some(profile) = self.profiles.profiles.iter_mut().find(|p| p.id == pid)
+            && let Some(rule) = profile
+                .tunnels
+                .iter_mut()
+                .find(|r| r.id == pending.rule.id)
+        {
+            rule.allow_public_bind = true;
+            if let Err(err) = save_profiles(&self.paths, &self.profiles) {
+                warn!(error = %err, "failed persisting allow_public_bind opt-in");
+                self.last_error = Some(err.to_string());
+            }
+        }
+
+        if pending.start_after_confirm {
+            self.start_tunnel_rule(pending.rule, pending.profile_id, pending.session_id)
+        } else {
+            self.sync_tunnel_telemetry();
+            Task::none()
+        }
+    }
+
+    fn toggle_tunnel(&mut self, tunnel_id: &str) -> Task<Message> {
+        let snap = self.tunnel_manager.snapshot();
+        if let Some(existing) = snap.tunnels.iter().find(|t| t.id == tunnel_id)
+            && existing.state.is_running()
+        {
+            self.tunnel_ui.mark_manually_stopped(tunnel_id, true);
+            self.tunnel_ui.set_start_error(tunnel_id, None);
+            self.tunnel_manager.stop_tunnel(tunnel_id);
+            self.sync_tunnel_telemetry();
+            return Task::none();
+        }
+
+        let Some((rule, profile_id, session_id)) = self.find_tunnel_definition(tunnel_id) else {
+            return Task::none();
+        };
+
+        if rule.requires_public_bind_opt_in() {
+            self.tunnel_ui
+                .prompt_public_bind(rule, profile_id, session_id, true);
+            return Task::none();
+        }
+
+        self.start_tunnel_rule(rule, profile_id, session_id)
+    }
+
+    fn reconnect_tunnel(&mut self, tunnel_id: &str) {
+        let snap = self.tunnel_manager.snapshot();
+        if let Some(existing) = snap.tunnels.iter().find(|t| t.id == tunnel_id) {
+            if existing.standalone {
+                if existing.state.is_running() {
+                    let _ = self.tunnel_manager.reconnect_tunnel(tunnel_id);
+                    return;
+                }
+            } else if let Some(sid) = existing.session_id {
+                let _ = self.reconnect_ssh_session(SessionId(sid));
+                return;
+            }
+        }
+        let _ = self.toggle_tunnel(tunnel_id);
+    }
+
+    fn reconnect_all_tunnels(&mut self) {
+        let snap = self.tunnel_manager.snapshot();
+        let mut sessions_to_reconnect = BTreeSet::new();
+        for t in &snap.tunnels {
+            match (&t.state, t.standalone, t.session_id) {
+                (
+                    termewnal_ssh::TunnelState::Starting
+                    | termewnal_ssh::TunnelState::Active
+                    | termewnal_ssh::TunnelState::Holding
+                    | termewnal_ssh::TunnelState::Reconnecting,
+                    true,
+                    _,
+                ) => {
+                    let _ = self.tunnel_manager.reconnect_tunnel(&t.id);
+                }
+                (termewnal_ssh::TunnelState::Error(_), true, _) => {
+                    let _ = self.toggle_tunnel(&t.id);
+                }
+                (
+                    termewnal_ssh::TunnelState::Holding
+                    | termewnal_ssh::TunnelState::Reconnecting
+                    | termewnal_ssh::TunnelState::Error(_),
+                    false,
+                    Some(sid),
+                ) => {
+                    sessions_to_reconnect.insert(SessionId(sid));
+                }
+                _ => {}
+            }
+        }
+        for sid in sessions_to_reconnect {
+            let _ = self.reconnect_ssh_session(sid);
+        }
+    }
+
+    fn auto_start_session_tunnels(
+        &mut self,
+        session_id: SessionId,
+        profile_id: Option<&str>,
+        supervisor: &ConnectionSupervisor,
+    ) -> Task<Message> {
+        let Some(pid) = profile_id else {
+            self.sync_tunnel_telemetry();
+            return Task::none();
+        };
+        let rules: Vec<TunnelRule> = self
+            .profiles
+            .profiles
+            .iter()
+            .find(|p| p.id == pid)
+            .map(|p| p.tunnels.clone())
+            .unwrap_or_default();
+
+        let mut tasks = Vec::new();
+        for rule in rules {
+            if rule.standalone
+                || rule.direction == TunnelDirection::Remote
+                || rule.requires_public_bind_opt_in()
+                || self.tunnel_ui.is_manually_stopped(&rule.id)
+            {
+                continue;
+            }
+            tasks.push(self.spawn_session_tunnel(
+                session_id,
+                Some(pid.to_string()),
+                rule,
+                supervisor.subscribe_ready(),
+            ));
+        }
+        self.sync_tunnel_telemetry();
+        Task::batch(tasks)
+    }
+
+    fn start_tunnel_rule(
+        &mut self,
+        rule: TunnelRule,
+        profile_id: Option<String>,
+        session_id: Option<SessionId>,
+    ) -> Task<Message> {
+        self.tunnel_ui.mark_manually_stopped(&rule.id, false);
+        self.tunnel_ui.set_start_error(&rule.id, None);
+
+        if rule.standalone {
+            let spec = self.resolve_standalone_spec(profile_id.as_deref(), session_id);
+            let Some(target_spec) = spec else {
+                self.tunnel_ui.set_start_error(
+                    &rule.id,
+                    Some("No SSH Profile or active SSH Session target for standalone tunnel".to_string()),
+                );
+                self.sync_tunnel_telemetry();
+                return Task::none();
+            };
+            let connect_config = apply_known_hosts_override(
+                target_spec.connect_config,
+                self.known_hosts_override.as_ref(),
+            );
+            let standalone_spec = StandaloneTransportSpec::new(
+                connect_config,
+                target_spec.supervisor_config,
+                Some(Arc::clone(&self.vault) as Arc<dyn SecretStore>),
+                Arc::new(RejectAllInteractionHandler),
+                target_spec.agent_connector,
+            );
+
+            let manager = self.tunnel_manager.clone();
+            let fut = async move {
+                if let Err(err) = manager
+                    .start_standalone_tunnel(profile_id.clone(), rule.clone(), standalone_spec)
+                    .await
+                {
+                    manager.record_start_error(None, profile_id, &rule, err.to_string());
+                }
+            };
+            return spawn_or_task(fut, self.tunnel_manager.clone());
+        }
+
+        let target_slot = session_id
+            .and_then(|sid| self.sessions.get(&sid).and_then(SessionEntry::as_ssh))
+            .or_else(|| {
+                profile_id.as_deref().and_then(|pid| {
+                    self.sessions.values().find_map(|entry| {
+                        entry
+                            .as_ssh()
+                            .filter(|slot| slot.target.profile_id.as_deref() == Some(pid))
+                    })
+                })
+            });
+
+        let Some(slot) = target_slot else {
+            self.tunnel_ui.set_start_error(
+                &rule.id,
+                Some("Open an SSH Session before starting this session-bound tunnel".to_string()),
+            );
+            self.sync_tunnel_telemetry();
+            return Task::none();
+        };
+
+        let Some(sup) = slot.supervisor.clone() else {
+            self.tunnel_ui.set_start_error(
+                &rule.id,
+                Some("Connect the SSH Session before starting this session-bound tunnel".to_string()),
+            );
+            self.sync_tunnel_telemetry();
+            return Task::none();
+        };
+
+        let sid = slot.id;
+        let task = self.spawn_session_tunnel(sid, profile_id, rule, sup.subscribe_ready());
+        self.sync_tunnel_telemetry();
+        task
+    }
+
+    fn spawn_session_tunnel(
+        &self,
+        session_id: SessionId,
+        profile_id: Option<String>,
+        rule: TunnelRule,
+        ready_rx: tokio::sync::watch::Receiver<termewnal_ssh::TransportReadySnapshot>,
+    ) -> Task<Message> {
+        let manager = self.tunnel_manager.clone();
+        let fut = async move {
+            if let Err(err) = manager
+                .start_session_tunnel(session_id.0, profile_id.clone(), rule.clone(), ready_rx)
+                .await
+            {
+                manager.record_start_error(Some(session_id.0), profile_id, &rule, err.to_string());
+            }
+        };
+        spawn_or_task(fut, self.tunnel_manager.clone())
+    }
+
+    fn resolve_standalone_spec(
+        &self,
+        profile_id: Option<&str>,
+        session_id: Option<SessionId>,
+    ) -> Option<SshTargetSpec> {
+        if let Some(pid) = profile_id
+            && let Some(profile) = self.profiles.profiles.iter().find(|p| p.id == pid)
+            && let Ok(spec) = SshTargetSpec::from_profile_with_config(
+                profile,
+                &self.config,
+                80,
+                24,
+                self.config.terminal.scrollback_lines,
+            )
+        {
+            return Some(spec);
+        }
+        if let Some(sid) = session_id
+            && let Some(slot) = self.sessions.get(&sid).and_then(SessionEntry::as_ssh)
+        {
+            return Some(slot.spec.clone());
+        }
+        if let Some(active_sid) = self.active_session_id()
+            && let Some(slot) = self.sessions.get(&active_sid).and_then(SessionEntry::as_ssh)
+        {
+            return Some(slot.spec.clone());
+        }
+        None
+    }
+}
+
+fn spawn_or_task<F>(fut: F, manager: TunnelManager) -> Task<Message>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(fut);
+        Task::none()
+    } else {
+        Task::perform(
+            async move {
+                fut.await;
+                manager.snapshot()
+            },
+            Message::TunnelManagerUpdated,
+        )
+    }
 }
 
 fn window_shortcut_event(
@@ -4851,6 +5446,32 @@ fn transfer_queue_stream(
         while rx.changed().await.is_ok() {
             let snap = rx.borrow_and_update().clone();
             if output.send(Message::TransferQueueUpdated(snap)).await.is_err() {
+                break;
+            }
+        }
+    }))
+}
+
+#[derive(Clone)]
+struct TunnelSubKey {
+    manager: TunnelManager,
+}
+
+impl Hash for TunnelSubKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.manager.instance_id().hash(state);
+    }
+}
+
+fn tunnel_manager_stream(
+    key: &TunnelSubKey,
+) -> std::pin::Pin<Box<dyn Stream<Item = Message> + Send>> {
+    let manager = key.manager.clone();
+    Box::pin(iced::stream::channel(32, async move |mut output| {
+        let mut rx = manager.subscribe();
+        while rx.changed().await.is_ok() {
+            let snap = rx.borrow_and_update().clone();
+            if output.send(Message::TunnelManagerUpdated(snap)).await.is_err() {
                 break;
             }
         }

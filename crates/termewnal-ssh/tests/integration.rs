@@ -10,3 +10,5 @@ mod sftp_resilience_and_conflicts;
 mod ssh_auth_and_session;
 #[path = "suite/stub.rs"]
 mod stub;
+#[path = "suite/tunnels.rs"]
+mod tunnels;

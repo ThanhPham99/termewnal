@@ -74,6 +74,20 @@ pub enum SshError {
     #[error("SSH channel error: {0}")]
     Channel(String),
 
+    /// `Tunnel` listener attempted to bind a non-loopback address without explicit opt-in.
+    #[error(
+        "refusing to bind tunnel '{tunnel_name}' on public address {bind_host}:{bind_port} without explicit opt-in"
+    )]
+    TunnelPublicBindDenied {
+        tunnel_name: String,
+        bind_host: String,
+        bind_port: u16,
+    },
+
+    /// Invalid `Tunnel` rule configuration (e.g. missing target host/port).
+    #[error("invalid tunnel configuration for '{tunnel_name}': {reason}")]
+    TunnelConfig { tunnel_name: String, reason: String },
+
     /// SFTP protocol or remote filesystem operation error.
     #[error("SFTP error: {0}")]
     Sftp(String),

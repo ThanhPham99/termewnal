@@ -9,6 +9,7 @@ pub mod session;
 pub mod sftp;
 pub mod supervisor;
 pub mod transfer;
+pub mod tunnel;
 
 pub use auth::{
     AgentConnector, AuthOutcome, BoxFuture, BoxedAgentClient, HostKeyDecision, HostKeyPrompt,
@@ -43,6 +44,10 @@ pub use transfer::{
     TransferConflict, TransferDirection, TransferExecutorHook, TransferId, TransferNotice,
     TransferQueue, TransferQueueConfig, TransferQueueSnapshot, TransferSnapshot, TransferStatus,
     UploadPlanOptions, UploadTargetPlan, disambiguate_filename, part_path_for,
+};
+pub use tunnel::{
+    DEFAULT_TUNNEL_HOLD_GRACE, StandaloneTransportSpec, TunnelManager, TunnelManagerSnapshot,
+    TunnelSnapshot, TunnelState,
 };
 
 /// Connection lifecycle state of an SSH `Transport`.
