@@ -38,11 +38,11 @@ fn restored_ssh_sessions_respect_auto_connect_on_startup_and_trigger_on_enter_or
     );
     let _ = state.update(Message::RestoreSshProfile(profile_manual.clone()));
     let manual_sid = state.active_session_id().unwrap();
+    assert!(state.session(manual_sid).is_none());
     assert_eq!(
-        state.session(manual_sid).unwrap().transport_status(),
+        state.ssh_session(manual_sid).unwrap().transport_status(),
         &TransportStatus::Disconnected
     );
-    assert!(state.session(manual_sid).unwrap().is_ssh());
     drop(state.view(win));
 
     // Typing ordinary character while Disconnected does not start connecting.
@@ -51,7 +51,7 @@ fn restored_ssh_sessions_respect_auto_connect_on_startup_and_trigger_on_enter_or
         bytes: b"a".to_vec(),
     });
     assert_eq!(
-        state.session(manual_sid).unwrap().transport_status(),
+        state.ssh_session(manual_sid).unwrap().transport_status(),
         &TransportStatus::Disconnected
     );
 
@@ -61,7 +61,7 @@ fn restored_ssh_sessions_respect_auto_connect_on_startup_and_trigger_on_enter_or
         bytes: b"\r".to_vec(),
     });
     assert_eq!(
-        state.session(manual_sid).unwrap().transport_status(),
+        state.ssh_session(manual_sid).unwrap().transport_status(),
         &TransportStatus::Connecting
     );
 
@@ -69,12 +69,12 @@ fn restored_ssh_sessions_respect_auto_connect_on_startup_and_trigger_on_enter_or
     let _ = state.update(Message::RestoreSshProfile(profile_manual));
     let click_sid = state.active_session_id().unwrap();
     assert_eq!(
-        state.session(click_sid).unwrap().transport_status(),
+        state.ssh_session(click_sid).unwrap().transport_status(),
         &TransportStatus::Disconnected
     );
     let _ = state.update(Message::ConnectSshSession(click_sid));
     assert_eq!(
-        state.session(click_sid).unwrap().transport_status(),
+        state.ssh_session(click_sid).unwrap().transport_status(),
         &TransportStatus::Connecting
     );
 
@@ -90,7 +90,7 @@ fn restored_ssh_sessions_respect_auto_connect_on_startup_and_trigger_on_enter_or
     let _ = state.update(Message::RestoreSshProfile(profile_auto));
     let auto_sid = state.active_session_id().unwrap();
     assert_eq!(
-        state.session(auto_sid).unwrap().transport_status(),
+        state.ssh_session(auto_sid).unwrap().transport_status(),
         &TransportStatus::Connecting
     );
 }
@@ -104,7 +104,7 @@ fn tofu_prompt_accept_and_reject_resolve_host_key_decisions_and_clear_modal() {
     let profile = Profile::ssh("TOFU Host", "db.internal", 22, "admin", SshAuthMethod::Agent);
     let _ = state.update(Message::OpenSshProfile(profile));
     let sid = state.active_session_id().unwrap();
-    let gen_id = state.session(sid).unwrap().ssh_generation().unwrap();
+    let gen_id = state.ssh_session(sid).unwrap().ssh_generation();
 
     // First prompt -> Reject.
     let (tx1, mut rx1) = oneshot::channel();
@@ -169,7 +169,7 @@ fn mitm_alert_blocks_session_displays_fingerprints_and_can_be_dismissed() {
     let profile = Profile::ssh("Prod", "prod.example.com", 22, "root", SshAuthMethod::Agent);
     let _ = state.update(Message::OpenSshProfile(profile));
     let sid = state.active_session_id().unwrap();
-    let gen_id = state.session(sid).unwrap().ssh_generation().unwrap();
+    let gen_id = state.ssh_session(sid).unwrap().ssh_generation();
 
     let alert = MitmAlert {
         session_id: sid,
@@ -189,7 +189,7 @@ fn mitm_alert_blocks_session_displays_fingerprints_and_can_be_dismissed() {
     });
 
     assert_eq!(
-        state.session(sid).unwrap().transport_status(),
+        state.ssh_session(sid).unwrap().transport_status(),
         &TransportStatus::Disconnected
     );
     assert_eq!(state.ssh_ui().mitm_alert(sid), Some(&alert));
@@ -215,7 +215,7 @@ fn interactive_2fa_prompt_updates_drafts_submits_answers_and_supports_cancel() {
     );
     let _ = state.update(Message::OpenSshProfile(profile));
     let sid = state.active_session_id().unwrap();
-    let gen_id = state.session(sid).unwrap().ssh_generation().unwrap();
+    let gen_id = state.ssh_session(sid).unwrap().ssh_generation();
 
     let (tx1, mut rx1) = oneshot::channel();
     let _ = state.update(Message::SshEvent {
@@ -438,8 +438,8 @@ async fn end_to_end_app_state_drives_tofu_vault_auth_terminal_io_resize_and_mitm
     .with_known_hosts_path(&known_hosts);
 
     let (sid, _task) = state.open_ssh_session(spec.clone(), true);
-    let gen_id = state.session(sid).unwrap().ssh_generation().unwrap();
-    let buffer = Arc::clone(state.session(sid).unwrap().buffer());
+    let gen_id = state.ssh_session(sid).unwrap().ssh_generation();
+    let buffer = Arc::clone(state.ssh_session(sid).unwrap().buffer());
 
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
     tokio::spawn(drive_ssh_connect(
@@ -482,7 +482,7 @@ async fn end_to_end_app_state_drives_tofu_vault_auth_terminal_io_resize_and_mitm
         event: conn_ev,
     });
     assert_eq!(
-        state.session(sid).unwrap().transport_status(),
+        state.ssh_session(sid).unwrap().transport_status(),
         &TransportStatus::Connected { latency_ms: None }
     );
     assert!(known_hosts.exists());
@@ -524,7 +524,7 @@ async fn end_to_end_app_state_drives_tofu_vault_auth_terminal_io_resize_and_mitm
     });
     assert!(
         state
-            .session(sid)
+            .ssh_session(sid)
             .unwrap()
             .snapshot()
             .visible_text()
@@ -532,7 +532,7 @@ async fn end_to_end_app_state_drives_tofu_vault_auth_terminal_io_resize_and_mitm
     );
     let _ = state.update(Message::DisconnectSshSession(sid));
     assert_eq!(
-        state.session(sid).unwrap().transport_status(),
+        state.ssh_session(sid).unwrap().transport_status(),
         &TransportStatus::Disconnected
     );
 
@@ -545,8 +545,8 @@ async fn end_to_end_app_state_drives_tofu_vault_auth_terminal_io_resize_and_mitm
     record_known_host_path("127.0.0.1", addr.port(), &wrong_key, &known_hosts).unwrap();
 
     let (mitm_sid, _task2) = state.open_ssh_session(spec.clone(), true);
-    let mitm_gen = state.session(mitm_sid).unwrap().ssh_generation().unwrap();
-    let mitm_buf = Arc::clone(state.session(mitm_sid).unwrap().buffer());
+    let mitm_gen = state.ssh_session(mitm_sid).unwrap().ssh_generation();
+    let mitm_buf = Arc::clone(state.ssh_session(mitm_sid).unwrap().buffer());
     let (ev_tx2, mut ev_rx2) = mpsc::unbounded_channel();
     tokio::spawn(drive_ssh_connect(
         mitm_sid,
@@ -567,7 +567,7 @@ async fn end_to_end_app_state_drives_tofu_vault_auth_terminal_io_resize_and_mitm
     });
     assert!(state.ssh_ui().mitm_alert(mitm_sid).is_some());
     assert_eq!(
-        state.session(mitm_sid).unwrap().transport_status(),
+        state.ssh_session(mitm_sid).unwrap().transport_status(),
         &TransportStatus::Disconnected
     );
 }

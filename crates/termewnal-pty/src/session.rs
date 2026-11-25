@@ -4,7 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::Side;
+use alacritty_terminal::selection::SelectionType;
 use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::vte::ansi::{Color as TermColor, CursorShape};
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize, native_pty_system};
@@ -12,6 +14,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::buffer::TerminalBuffer;
+use crate::ergonomics::GridSearchMatch;
 use crate::error::PtyError;
 use crate::shell::{ShellSpec, detect_default_shell};
 
@@ -22,6 +25,7 @@ pub struct PtySpawnConfig {
     pub cols: u16,
     pub rows: u16,
     pub scrollback_lines: usize,
+    pub cursor_shape: CursorShape,
     pub working_dir: Option<PathBuf>,
 }
 
@@ -32,6 +36,7 @@ impl Default for PtySpawnConfig {
             cols: 80,
             rows: 24,
             scrollback_lines: 10_000,
+            cursor_shape: CursorShape::Block,
             working_dir: None,
         }
     }
@@ -105,6 +110,26 @@ pub struct CursorSnapshot {
     pub shape: CursorShape,
 }
 
+/// Canonical inclusive grid span for selection highlighting inside [`TerminalSnapshot`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridRange {
+    pub start_line: i32,
+    pub start_col: usize,
+    pub end_line: i32,
+    pub end_col: usize,
+    pub is_block: bool,
+}
+
+impl GridRange {
+    /// Returns `true` when grid coordinates `(line, col)` fall within this span.
+    pub fn contains(&self, line: i32, col: usize) -> bool {
+        self.start_line <= line
+            && self.end_line >= line
+            && (self.start_col <= col || (self.start_line != line && !self.is_block))
+            && (self.end_col >= col || (self.end_line != line && !self.is_block))
+    }
+}
+
 /// Immutable snapshot of the visible terminal grid and cursor for rendering and testing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalSnapshot {
@@ -112,9 +137,44 @@ pub struct TerminalSnapshot {
     pub rows: u16,
     pub cells: Vec<TerminalCell>,
     pub cursor: Option<CursorSnapshot>,
+    pub display_offset: usize,
+    pub history_size: usize,
+    pub top_line: i32,
+    pub selection: Option<GridRange>,
+    pub bracketed_paste: bool,
+    pub mouse_mode: bool,
 }
 
 impl TerminalSnapshot {
+    /// Converts viewport `(col, row)` into canonical grid `(line, col)` coordinates.
+    pub fn viewport_to_grid(&self, col: usize, row: usize) -> (i32, usize) {
+        (self.top_line + row as i32, col)
+    }
+
+    /// Converts canonical grid `(line, col)` to visible viewport `(col, row)` if on screen.
+    pub fn grid_to_viewport(&self, line: i32, col: usize) -> Option<(usize, usize)> {
+        let rel = line - self.top_line;
+        if rel >= 0 && (rel as usize) < self.rows as usize && col < self.cols as usize {
+            Some((col, rel as usize))
+        } else {
+            None
+        }
+    }
+
+    /// Returns `true` when the cell at viewport `(col, row)` is inside the active selection.
+    pub fn is_cell_selected(&self, col: usize, row: usize) -> bool {
+        let Some(sel) = self.selection else {
+            return false;
+        };
+        let (line, _) = self.viewport_to_grid(col, row);
+        if sel.contains(line, col) {
+            return true;
+        }
+        self.cell(col, row)
+            .is_some_and(|cell| cell.flags.contains(CellFlags::WIDE_CHAR))
+            && sel.contains(line, col + 1)
+    }
+
     /// Returns the cell at `(col, row)` if within visible viewport bounds.
     pub fn cell(&self, col: usize, row: usize) -> Option<&TerminalCell> {
         if col >= self.cols as usize || row >= self.rows as usize {
@@ -170,7 +230,7 @@ impl Write for SharedPtyWriter {
     }
 }
 
-/// Active local shell PTY backed by `portable-pty` and an `alacritty_terminal::Term` state machine.
+/// Active local shell PTY backed by `portable-pty` and a shared [`TerminalBuffer`].
 pub struct PtySession {
     shell: ShellSpec,
     master: Mutex<Box<dyn MasterPty + Send>>,
@@ -224,10 +284,11 @@ impl PtySession {
 
         let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> =
             Arc::new(Mutex::new(Some(raw_writer)));
-        let buffer = Arc::new(TerminalBuffer::new(
+        let buffer = Arc::new(TerminalBuffer::new_with_cursor_shape(
             dims.cols,
             dims.rows,
             config.scrollback_lines,
+            config.cursor_shape,
         ));
         buffer.set_write_sink(Some(Box::new(SharedPtyWriter(Arc::clone(&writer)))));
 
@@ -301,6 +362,76 @@ impl PtySession {
     /// Captures an immutable snapshot of the current visible grid and cursor.
     pub fn snapshot(&self) -> TerminalSnapshot {
         self.buffer.snapshot()
+    }
+
+    /// Scrolls the viewport display offset within retained scrollback history and returns the new offset.
+    pub fn scroll_display(&self, scroll: Scroll) -> usize {
+        self.buffer.scroll_display(scroll)
+    }
+
+    /// Resets the viewport scroll offset back to the live terminal bottom (`0`).
+    pub fn scroll_to_bottom(&self) -> usize {
+        self.buffer.scroll_to_bottom()
+    }
+
+    /// Returns the current number of lines scrolled above the live bottom.
+    pub fn display_offset(&self) -> usize {
+        self.buffer.display_offset()
+    }
+
+    /// Returns the number of scrollback lines currently stored in history.
+    pub fn history_size(&self) -> usize {
+        self.buffer.history_size()
+    }
+
+    /// Applies updated scrollback capacity and default cursor shape to the running terminal.
+    pub fn apply_options(&self, scrollback_lines: usize, cursor_shape: CursorShape) {
+        self.buffer.apply_options(scrollback_lines, cursor_shape);
+    }
+
+    /// Returns `true` when the active terminal application has enabled bracketed paste mode.
+    pub fn is_bracketed_paste(&self) -> bool {
+        self.buffer.is_bracketed_paste()
+    }
+
+    /// Returns `true` when the active terminal application captures mouse events.
+    pub fn is_mouse_mode(&self) -> bool {
+        self.buffer.is_mouse_mode()
+    }
+
+    /// Searches scrollback history and visible screen for `query`, returning ordered matches.
+    pub fn search_scrollback(&self, query: &str) -> Vec<GridSearchMatch> {
+        self.buffer.search_scrollback(query)
+    }
+
+    /// Scrolls the viewport if needed so `target` becomes visible, returning the new offset.
+    pub fn scroll_to_match(&self, target: GridSearchMatch) -> usize {
+        self.buffer.scroll_to_match(target)
+    }
+
+    /// Starts a terminal grid selection at viewport `(col, row)`.
+    pub fn start_selection(&self, col: usize, row: usize, side: Side, ty: SelectionType) {
+        self.buffer.start_selection(col, row, side, ty);
+    }
+
+    /// Extends the active terminal selection to viewport `(col, row)`.
+    pub fn update_selection(&self, col: usize, row: usize, side: Side) {
+        self.buffer.update_selection(col, row, side);
+    }
+
+    /// Finalizes the active selection, clearing degenerate click-only selections and returning text.
+    pub fn finish_selection(&self) -> Option<String> {
+        self.buffer.finish_selection()
+    }
+
+    /// Extracts the currently selected text without modifying selection state.
+    pub fn selection_text(&self) -> Option<String> {
+        self.buffer.selection_text()
+    }
+
+    /// Clears any active selection in the terminal grid.
+    pub fn clear_selection(&self) {
+        self.buffer.clear_selection();
     }
 
     /// Blocks up to `timeout` until `predicate(&snapshot)` evaluates to `true`.

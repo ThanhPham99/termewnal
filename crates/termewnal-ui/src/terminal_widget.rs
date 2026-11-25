@@ -1,5 +1,9 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::ops::Range;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
+use iced::advanced::clipboard::Kind as ClipboardKind;
 use iced::advanced::input_method::{self, InputMethod};
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::renderer::{self, Quad};
@@ -11,18 +15,194 @@ use iced::{
     Background, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Shadow,
     Size, Theme, mouse, window,
 };
+use termewnal_core::{BuiltinTheme, CursorStyle, TerminalConfig, ThemePalette};
 use termewnal_pty::{
-    CellFlags, CursorShape, NamedColor, Rgb, TermColor, TerminalCell, TerminalSnapshot,
+    CellFlags, CursorShape, DetectedUrl, GridSearchMatch, NamedColor, Rgb, SelectionType, Side,
+    TermColor, TerminalCell, TerminalSnapshot, url_at_cell,
 };
 
 use crate::app::{Message, SessionId};
+use crate::terminal_ergonomics::rgb_to_iced;
 
-/// Custom `iced::advanced::Widget` rendering a terminal grid and capturing keyboard/IME input.
+/// Outcome of applying an [`input_method::Event`] to [`ImeComposition`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImeUpdate {
+    Redraw,
+    Commit(String),
+}
+
+/// Active Vietnamese/CJK IME pre-edit composition buffer for a terminal viewport.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImeComposition {
+    pub content: String,
+    pub selection: Option<Range<usize>>,
+}
+
+impl ImeComposition {
+    /// Updates pre-edit state from an Iced `input_method::Event` and returns the next action.
+    pub fn apply_event(&mut self, event: &input_method::Event) -> ImeUpdate {
+        match event {
+            input_method::Event::Opened => ImeUpdate::Redraw,
+            input_method::Event::Closed => {
+                self.clear();
+                ImeUpdate::Redraw
+            }
+            input_method::Event::Preedit(text, selection) => {
+                self.content = text.clone();
+                self.selection = selection.clone();
+                ImeUpdate::Redraw
+            }
+            input_method::Event::Commit(text) => {
+                self.clear();
+                ImeUpdate::Commit(text.clone())
+            }
+        }
+    }
+
+    /// Clears any active pre-edit string and selection range.
+    pub fn clear(&mut self) {
+        self.content.clear();
+        self.selection = None;
+    }
+
+    /// Converts the active pre-edit text into an Iced `Preedit` descriptor when non-empty.
+    pub fn to_iced_preedit(&self, font_size: f32) -> Option<input_method::Preedit<&str>> {
+        if self.content.is_empty() {
+            return None;
+        }
+        Some(input_method::Preedit {
+            content: self.content.as_str(),
+            selection: self.selection.clone(),
+            text_size: Some(Pixels(font_size)),
+        })
+    }
+}
+
+/// Computes the pixel anchor rectangle for the OS IME candidate popup at the active cursor cell.
+pub fn ime_cursor_anchor_rect(
+    snapshot: &TerminalSnapshot,
+    bounds: Rectangle,
+    cell_size: Size,
+) -> Rectangle {
+    let (col, row) = snapshot
+        .cursor
+        .map(|c| (c.col as f32, c.row as f32))
+        .unwrap_or_else(|| (0.0, snapshot.rows.saturating_sub(1) as f32));
+
+    let x = (bounds.x + col * cell_size.width).min((bounds.x + bounds.width - cell_size.width).max(bounds.x));
+    let y = (bounds.y + row * cell_size.height).min((bounds.y + bounds.height - cell_size.height).max(bounds.y));
+    Rectangle::new(Point::new(x, y), cell_size)
+}
+
+/// Rendering and behavioral configuration passed to [`TerminalViewport`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct TerminalViewOptions {
+    pub palette: TerminalPalette,
+    pub font_family: String,
+    pub font_size: f32,
+    pub font_ligatures: bool,
+    pub cursor_style: CursorStyle,
+    pub copy_on_select: bool,
+    pub ime_enabled: bool,
+}
+
+impl TerminalViewOptions {
+    /// Builds [`TerminalViewOptions`] from persisted [`TerminalConfig`].
+    pub fn from_config(cfg: &TerminalConfig, ime_enabled: bool) -> Self {
+        Self {
+            palette: TerminalPalette::from_config(cfg),
+            font_family: cfg.font_family.clone(),
+            font_size: cfg.font_size,
+            font_ligatures: cfg.font_ligatures,
+            cursor_style: cfg.cursor_style,
+            copy_on_select: cfg.copy_on_select,
+            ime_enabled,
+        }
+    }
+}
+
+/// Resolved terminal color palette derived from [`ThemePalette`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TerminalPalette {
+    pub theme: BuiltinTheme,
+    pub foreground: Color,
+    pub background: Color,
+    pub cursor: Color,
+    pub selection_bg: Color,
+    pub match_bg: Color,
+    pub match_fg: Color,
+    pub active_match_bg: Color,
+    pub active_match_fg: Color,
+    pub ui_surface: Color,
+    pub ui_accent: Color,
+    pub ansi: [Color; 16],
+}
+
+impl TerminalPalette {
+    /// Builds a [`TerminalPalette`] from [`TerminalConfig::theme`].
+    pub fn from_config(cfg: &TerminalConfig) -> Self {
+        Self::from_core(&ThemePalette::for_name(&cfg.theme))
+    }
+
+    /// Converts a core [`ThemePalette`] to Iced colors.
+    pub fn from_core(core: &ThemePalette) -> Self {
+        Self {
+            theme: core.theme,
+            foreground: rgb_to_iced(core.foreground),
+            background: rgb_to_iced(core.background),
+            cursor: rgb_to_iced(core.cursor),
+            selection_bg: rgb_to_iced(core.selection_bg),
+            match_bg: rgb_to_iced(core.match_bg),
+            match_fg: rgb_to_iced(core.match_fg),
+            active_match_bg: rgb_to_iced(core.active_match_bg),
+            active_match_fg: rgb_to_iced(core.active_match_fg),
+            ui_surface: rgb_to_iced(core.ui_surface),
+            ui_accent: rgb_to_iced(core.ui_accent),
+            ansi: core.ansi.map(rgb_to_iced),
+        }
+    }
+
+    fn resolve(&self, color: TermColor) -> Color {
+        match color {
+            TermColor::Spec(Rgb { r, g, b }) => rgb(r, g, b),
+            TermColor::Named(named) => match named {
+                NamedColor::Foreground | NamedColor::BrightForeground => self.foreground,
+                NamedColor::Background => self.background,
+                NamedColor::Cursor => self.cursor,
+                NamedColor::Black => self.ansi[0],
+                NamedColor::Red => self.ansi[1],
+                NamedColor::Green => self.ansi[2],
+                NamedColor::Yellow => self.ansi[3],
+                NamedColor::Blue => self.ansi[4],
+                NamedColor::Magenta => self.ansi[5],
+                NamedColor::Cyan => self.ansi[6],
+                NamedColor::White => self.ansi[7],
+                NamedColor::BrightBlack | NamedColor::DimBlack => self.ansi[8],
+                NamedColor::BrightRed | NamedColor::DimRed => self.ansi[9],
+                NamedColor::BrightGreen | NamedColor::DimGreen => self.ansi[10],
+                NamedColor::BrightYellow | NamedColor::DimYellow => self.ansi[11],
+                NamedColor::BrightBlue | NamedColor::DimBlue => self.ansi[12],
+                NamedColor::BrightMagenta | NamedColor::DimMagenta => self.ansi[13],
+                NamedColor::BrightCyan | NamedColor::DimCyan => self.ansi[14],
+                NamedColor::BrightWhite | NamedColor::DimWhite => self.ansi[15],
+                NamedColor::DimForeground => Color {
+                    a: 0.7,
+                    ..self.foreground
+                },
+            },
+            TermColor::Indexed(idx) => indexed_color(idx, &self.ansi),
+        }
+    }
+}
+
+/// Custom `iced::advanced::Widget` rendering a terminal grid and capturing keyboard/IME/mouse/drop input.
 pub struct TerminalViewport {
     session_id: SessionId,
     snapshot: Arc<TerminalSnapshot>,
+    options: TerminalViewOptions,
     font: Font,
-    font_size: f32,
+    search_matches: Arc<[GridSearchMatch]>,
+    active_search_match: Option<usize>,
     explicit_focus: Option<bool>,
 }
 
@@ -31,30 +211,58 @@ impl TerminalViewport {
     pub fn new(
         session_id: SessionId,
         snapshot: Arc<TerminalSnapshot>,
-        font_size: f32,
+        options: TerminalViewOptions,
+        search_matches: Arc<[GridSearchMatch]>,
+        active_search_match: Option<usize>,
     ) -> Element<'static, Message, Theme, iced::Renderer> {
-        Element::new(Self {
+        Self::build(
             session_id,
             snapshot,
-            font: Font::MONOSPACE,
-            font_size: font_size.max(6.0),
-            explicit_focus: None,
-        })
+            options,
+            search_matches,
+            active_search_match,
+            None,
+        )
     }
 
     /// Creates a [`TerminalViewport`] element whose focus state is explicitly controlled by a parent pane.
     pub fn with_focus(
         session_id: SessionId,
         snapshot: Arc<TerminalSnapshot>,
-        font_size: f32,
+        options: TerminalViewOptions,
+        search_matches: Arc<[GridSearchMatch]>,
+        active_search_match: Option<usize>,
         focused: bool,
     ) -> Element<'static, Message, Theme, iced::Renderer> {
+        Self::build(
+            session_id,
+            snapshot,
+            options,
+            search_matches,
+            active_search_match,
+            Some(focused),
+        )
+    }
+
+    fn build(
+        session_id: SessionId,
+        snapshot: Arc<TerminalSnapshot>,
+        mut options: TerminalViewOptions,
+        search_matches: Arc<[GridSearchMatch]>,
+        active_search_match: Option<usize>,
+        explicit_focus: Option<bool>,
+    ) -> Element<'static, Message, Theme, iced::Renderer> {
+        let font = resolve_font(&options.font_family);
+        options.font_size = options.font_size.max(6.0);
+
         Element::new(Self {
             session_id,
             snapshot,
-            font: Font::MONOSPACE,
-            font_size: font_size.max(6.0),
-            explicit_focus: Some(focused),
+            options,
+            font,
+            search_matches,
+            active_search_match,
+            explicit_focus,
         })
     }
 }
@@ -62,14 +270,26 @@ impl TerminalViewport {
 #[derive(Debug, Clone)]
 struct ViewportState {
     focused: bool,
+    modifiers: Modifiers,
     last_requested_size: Option<(u16, u16)>,
+    ime: ImeComposition,
+    cursor_cell: Option<(usize, usize)>,
+    hovered_url: Option<DetectedUrl>,
+    dragging_selection: bool,
+    last_click: Option<(Instant, usize, usize, u8)>,
 }
 
 impl Default for ViewportState {
     fn default() -> Self {
         Self {
             focused: true,
+            modifiers: Modifiers::empty(),
             last_requested_size: None,
+            ime: ImeComposition::default(),
+            cursor_cell: None,
+            hovered_url: None,
+            dragging_selection: false,
+            last_click: None,
         }
     }
 }
@@ -103,14 +323,14 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _renderer: &iced::Renderer,
-        _clipboard: &mut dyn Clipboard,
+        clipboard: &mut dyn Clipboard,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
         let state = tree.state.downcast_mut::<ViewportState>();
         let is_focused = self.explicit_focus.unwrap_or(state.focused);
         let bounds = layout.bounds();
-        let cell_size = measure_cell_size(self.font, self.font_size);
+        let cell_size = measure_cell_size(self.font, self.options.font_size);
 
         match event {
             Event::Window(
@@ -133,25 +353,151 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 }
 
                 if matches!(event, Event::Window(window::Event::RedrawRequested(_))) {
-                    if is_focused {
-                        let cursor_rect = cursor_pixel_rect(&self.snapshot, bounds, cell_size);
-                        shell.request_input_method::<&str>(&InputMethod::Enabled {
+                    if self.options.ime_enabled && is_focused {
+                        let cursor_rect = ime_cursor_anchor_rect(&self.snapshot, bounds, cell_size);
+                        let preedit = state.ime.to_iced_preedit(self.options.font_size);
+                        shell.request_input_method(&InputMethod::Enabled {
                             cursor: cursor_rect,
                             purpose: input_method::Purpose::Terminal,
-                            preedit: None,
+                            preedit,
                         });
-                    } else if self.explicit_focus.is_none() {
+                    } else if self.options.ime_enabled && self.explicit_focus.is_none() && !is_focused {
                         shell.request_input_method::<&str>(&InputMethod::Disabled);
                     }
                 }
             }
+            Event::Window(window::Event::FileDropped(path)) => {
+                let over_pane = cursor.is_over(bounds)
+                    || (matches!(cursor, mouse::Cursor::Unavailable) && is_focused);
+                if over_pane {
+                    shell.publish(Message::FileDropped {
+                        session_id: self.session_id,
+                        path: path.clone(),
+                        shift_held: state.modifiers.shift(),
+                    });
+                    shell.capture_event();
+                }
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                let prev_hover = state.hovered_url.clone();
+                if bounds.contains(*position) {
+                    let (col, row, side) = point_to_cell(*position, bounds, cell_size, &self.snapshot);
+                    state.cursor_cell = Some((col, row));
+                    state.hovered_url = if state.modifiers.control() {
+                        url_at_cell(&self.snapshot, col, row)
+                    } else {
+                        None
+                    };
+                    if state.dragging_selection {
+                        shell.publish(Message::SelectionUpdate {
+                            session_id: self.session_id,
+                            col,
+                            row,
+                            side,
+                        });
+                    }
+                } else {
+                    state.cursor_cell = None;
+                    state.hovered_url = None;
+                }
+                if state.hovered_url != prev_hover {
+                    shell.request_redraw();
+                }
+            }
+            Event::Mouse(mouse::Event::CursorLeft) => {
+                state.cursor_cell = None;
+                if state.hovered_url.take().is_some() {
+                    shell.request_redraw();
+                }
+            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                let clicked_inside = cursor.is_over(bounds);
                 if self.explicit_focus.is_none() {
                     let was_focused = state.focused;
-                    state.focused = cursor.is_over(bounds);
+                    state.focused = clicked_inside;
                     if state.focused != was_focused {
                         shell.request_redraw();
                     }
+                }
+                if !clicked_inside {
+                    state.ime.clear();
+                    state.dragging_selection = false;
+                    return;
+                }
+
+                shell.publish(Message::TerminalFocused);
+                if let Some(pos) = cursor.position_in(bounds) {
+                    let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);
+                    let (col, row, side) = point_to_cell(abs, bounds, cell_size, &self.snapshot);
+                    if state.modifiers.control()
+                        && let Some(detected) = url_at_cell(&self.snapshot, col, row)
+                    {
+                        shell.publish(Message::OpenUrl(detected.url));
+                        shell.capture_event();
+                        return;
+                    }
+
+                    let click_count = next_click_count(&mut state.last_click, col, row);
+                    let selection_type = match click_count {
+                        2 => SelectionType::Semantic,
+                        3 => SelectionType::Lines,
+                        _ => SelectionType::Simple,
+                    };
+                    state.dragging_selection = true;
+                    shell.publish(Message::SelectionStart {
+                        session_id: self.session_id,
+                        col,
+                        row,
+                        side,
+                        selection_type,
+                    });
+                    shell.capture_event();
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.dragging_selection {
+                    state.dragging_selection = false;
+                    shell.publish(Message::SelectionFinish {
+                        session_id: self.session_id,
+                    });
+                    shell.capture_event();
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
+                if cursor.is_over(bounds) && !self.snapshot.mouse_mode {
+                    publish_clipboard_paste(self.session_id, clipboard, shell);
+                    shell.capture_event();
+                }
+            }
+            Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
+                if cursor.is_over(bounds) && !self.snapshot.mouse_mode {
+                    let delta_lines = match delta {
+                        mouse::ScrollDelta::Lines { y, .. } => (*y * 3.0).round() as i32,
+                        mouse::ScrollDelta::Pixels { y, .. } => {
+                            (*y / cell_size.height.max(1.0)).round() as i32
+                        }
+                    };
+                    if delta_lines != 0 {
+                        shell.publish(Message::ScrollViewport {
+                            session_id: self.session_id,
+                            delta_lines,
+                        });
+                        shell.capture_event();
+                    }
+                }
+            }
+            Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
+                state.modifiers = *modifiers;
+                let prev = state.hovered_url.clone();
+                state.hovered_url = if modifiers.control()
+                    && let Some((col, row)) = state.cursor_cell
+                {
+                    url_at_cell(&self.snapshot, col, row)
+                } else {
+                    None
+                };
+                if state.hovered_url != prev {
+                    shell.request_redraw();
                 }
             }
             Event::Keyboard(keyboard::Event::KeyPressed {
@@ -161,7 +507,74 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 text,
                 ..
             }) => {
-                if is_focused {
+                state.modifiers = *modifiers;
+                if self.options.ime_enabled && is_focused {
+                    if modifiers.control()
+                        && !modifiers.shift()
+                        && !modifiers.alt()
+                        && !modifiers.logo()
+                        && is_ascii_letter(key, modified_key, 'f')
+                    {
+                        shell.publish(Message::OpenSearch);
+                        shell.capture_event();
+                        return;
+                    }
+
+                    if modifiers.control()
+                        && modifiers.shift()
+                        && !modifiers.alt()
+                        && !modifiers.logo()
+                    {
+                        if is_ascii_letter(key, modified_key, 'c') {
+                            shell.publish(Message::CopySelection {
+                                session_id: self.session_id,
+                            });
+                            shell.capture_event();
+                            return;
+                        }
+                        if is_ascii_letter(key, modified_key, 'v') {
+                            publish_clipboard_paste(self.session_id, clipboard, shell);
+                            shell.capture_event();
+                            return;
+                        }
+                    }
+
+                    if modifiers.shift()
+                        && !modifiers.control()
+                        && !modifiers.alt()
+                        && let Key::Named(named) = key
+                    {
+                        match named {
+                            Named::PageUp => {
+                                shell.publish(Message::ScrollViewport {
+                                    session_id: self.session_id,
+                                    delta_lines: self.snapshot.rows as i32,
+                                });
+                                shell.capture_event();
+                                return;
+                            }
+                            Named::PageDown => {
+                                shell.publish(Message::ScrollViewport {
+                                    session_id: self.session_id,
+                                    delta_lines: -(self.snapshot.rows as i32),
+                                });
+                                shell.capture_event();
+                                return;
+                            }
+                            Named::Home => {
+                                shell.publish(Message::ScrollToTop(self.session_id));
+                                shell.capture_event();
+                                return;
+                            }
+                            Named::End => {
+                                shell.publish(Message::ScrollToBottom(self.session_id));
+                                shell.capture_event();
+                                return;
+                            }
+                            _ => {}
+                        }
+                    }
+
                     let bytes =
                         key_event_to_bytes(key, modified_key, *modifiers, text.as_deref());
                     if !bytes.is_empty() {
@@ -173,37 +586,51 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                     }
                 }
             }
-            Event::InputMethod(ev) => match ev {
-                input_method::Event::Opened | input_method::Event::Closed => {
-                    shell.request_redraw();
+            Event::InputMethod(ev) => {
+                if !self.options.ime_enabled || !is_focused {
+                    if matches!(ev, input_method::Event::Closed) {
+                        state.ime.clear();
+                    }
+                    return;
                 }
-                input_method::Event::Preedit(_, _) => {
-                    shell.request_redraw();
-                }
-                input_method::Event::Commit(committed) => {
-                    if is_focused && !committed.is_empty() {
-                        shell.publish(Message::TerminalInput {
-                            session_id: self.session_id,
-                            bytes: committed.as_bytes().to_vec(),
-                        });
-                        shell.capture_event();
+                match state.ime.apply_event(ev) {
+                    ImeUpdate::Redraw => {
+                        shell.request_redraw();
+                        if matches!(ev, input_method::Event::Preedit(_, _)) {
+                            shell.capture_event();
+                        }
+                    }
+                    ImeUpdate::Commit(committed) => {
+                        if !committed.is_empty() {
+                            shell.publish(Message::ImeCommitted {
+                                session_id: self.session_id,
+                                text: committed,
+                            });
+                            shell.capture_event();
+                        }
+                        shell.request_redraw();
                     }
                 }
-            },
+            }
             _ => {}
         }
     }
 
     fn mouse_interaction(
         &self,
-        _tree: &Tree,
+        tree: &Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
+        let state = tree.state.downcast_ref::<ViewportState>();
         if cursor.is_over(layout.bounds()) {
-            mouse::Interaction::Text
+            if state.hovered_url.is_some() {
+                mouse::Interaction::Pointer
+            } else {
+                mouse::Interaction::Text
+            }
         } else {
             mouse::Interaction::None
         }
@@ -213,7 +640,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         &self,
         tree: &Tree,
         renderer: &mut iced::Renderer,
-        theme: &Theme,
+        _theme: &Theme,
         _style: &renderer::Style,
         layout: Layout<'_>,
         _cursor: mouse::Cursor,
@@ -229,8 +656,13 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             return;
         };
 
-        let cell_size = measure_cell_size(self.font, self.font_size);
-        let palette = TerminalPalette::from_theme(theme);
+        let cell_size = measure_cell_size(self.font, self.options.font_size);
+        let palette = &self.options.palette;
+        let shaping = if self.options.font_ligatures {
+            Shaping::Advanced
+        } else {
+            Shaping::Auto
+        };
 
         // Paint full viewport background first.
         renderer.fill_quad(
@@ -255,6 +687,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 continue;
             }
 
+            let grid_line = self.snapshot.top_line + row as i32;
             let mut col = 0;
             while col < cols {
                 let Some(cell) = self.snapshot.cell(col, row) else {
@@ -266,7 +699,8 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                     continue;
                 }
 
-                let (fg, bg) = resolve_cell_colors(cell, &palette);
+                let (fg, bg) =
+                    self.resolve_cell_appearance(cell, palette, grid_line, col, row, cols);
 
                 let cell_width_cells = if cell.flags.contains(CellFlags::WIDE_CHAR) {
                     2.0
@@ -295,6 +729,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                     run.push(cell.c);
                     let run_start_col = col;
                     let run_fg = fg;
+                    let first_ascii = cell.c.is_ascii();
 
                     if !cell.flags.contains(CellFlags::WIDE_CHAR) {
                         while col + 1 < cols {
@@ -308,7 +743,17 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                             {
                                 break;
                             }
-                            let (next_fg, next_bg) = resolve_cell_colors(next, &palette);
+                            if !self.options.font_ligatures && (next.c.is_ascii() != first_ascii) {
+                                break;
+                            }
+                            let (next_fg, next_bg) = self.resolve_cell_appearance(
+                                next,
+                                palette,
+                                grid_line,
+                                col + 1,
+                                row,
+                                cols,
+                            );
                             if next_fg != run_fg || next_bg != bg {
                                 break;
                             }
@@ -322,12 +767,12 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                         Text {
                             content: run,
                             bounds: Size::new(bounds.width, cell_size.height),
-                            size: Pixels(self.font_size),
+                            size: Pixels(self.options.font_size),
                             line_height: LineHeight::Absolute(Pixels(cell_size.height)),
                             font: self.font,
                             align_x: text::Alignment::Left,
                             align_y: iced::alignment::Vertical::Top,
-                            shaping: Shaping::Advanced,
+                            shaping,
                             wrapping: Wrapping::None,
                         },
                         Point::new(run_x, y),
@@ -340,10 +785,28 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             }
         }
 
+        // Underline hovered URL on Ctrl+Hover.
+        if let Some(hovered) = &state.hovered_url {
+            for span in &hovered.spans {
+                let y = bounds.y + (span.row as f32 + 1.0) * cell_size.height - 2.0;
+                let x = bounds.x + (span.start_col as f32) * cell_size.width;
+                let width = ((span.end_col - span.start_col + 1) as f32) * cell_size.width;
+                renderer.fill_quad(
+                    Quad {
+                        bounds: Rectangle::new(Point::new(x, y), Size::new(width, 2.0)),
+                        border: Border::default(),
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    Background::Color(palette.ui_accent),
+                );
+            }
+        }
+
         if let Some(cursor_snap) = self.snapshot.cursor
             && cursor_snap.shape != CursorShape::Hidden
         {
-            let cursor_rect = cursor_pixel_rect(&self.snapshot, bounds, cell_size);
+            let cursor_rect = ime_cursor_anchor_rect(&self.snapshot, bounds, cell_size);
             let cursor_color = Color {
                 a: if is_focused { 0.75 } else { 0.35 },
                 ..palette.cursor
@@ -394,6 +857,211 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             };
             renderer.fill_quad(quad, fill);
         }
+
+        // Render active Vietnamese/CJK IME pre-edit overlay inline at the cursor cell.
+        if is_focused && !state.ime.content.is_empty() {
+            draw_ime_preedit(
+                renderer,
+                &state.ime.content,
+                self.font,
+                self.options.font_size,
+                cell_size,
+                bounds,
+                clip_bounds,
+                &self.snapshot,
+                palette,
+            );
+        }
+    }
+}
+
+impl TerminalViewport {
+    fn resolve_cell_appearance(
+        &self,
+        cell: &TerminalCell,
+        palette: &TerminalPalette,
+        grid_line: i32,
+        col: usize,
+        row: usize,
+        cols: usize,
+    ) -> (Color, Color) {
+        let (mut fg, mut bg) = resolve_cell_colors(cell, palette);
+
+        if let Some((idx, _)) = self
+            .search_matches
+            .iter()
+            .enumerate()
+            .find(|(_, m)| m.contains(grid_line, col, cols))
+        {
+            if Some(idx) == self.active_search_match {
+                fg = palette.active_match_fg;
+                bg = palette.active_match_bg;
+            } else {
+                fg = palette.match_fg;
+                bg = palette.match_bg;
+            }
+        } else if self.snapshot.is_cell_selected(col, row) {
+            bg = palette.selection_bg;
+        }
+
+        (fg, bg)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_ime_preedit(
+    renderer: &mut iced::Renderer,
+    content: &str,
+    font: Font,
+    font_size: f32,
+    cell_size: Size,
+    bounds: Rectangle,
+    clip_bounds: Rectangle,
+    snapshot: &TerminalSnapshot,
+    palette: &TerminalPalette,
+) {
+    use iced::advanced::renderer::Renderer as _;
+    use iced::advanced::text::Renderer as _;
+
+    type P = <iced::Renderer as text::Renderer>::Paragraph;
+    let probe = P::with_text(Text {
+        content,
+        bounds: Size::INFINITE,
+        size: Pixels(font_size),
+        line_height: LineHeight::Absolute(Pixels(cell_size.height)),
+        font,
+        align_x: text::Alignment::Left,
+        align_y: iced::alignment::Vertical::Top,
+        shaping: Shaping::Advanced,
+        wrapping: Wrapping::None,
+    });
+    let width = probe.min_bounds().width.max(cell_size.width) + 4.0;
+    let anchor = ime_cursor_anchor_rect(snapshot, bounds, cell_size);
+    let max_x = (bounds.x + bounds.width - width).max(bounds.x);
+    let x = anchor.x.min(max_x);
+    let y = anchor.y;
+
+    let box_bounds = Rectangle::new(Point::new(x, y), Size::new(width, cell_size.height));
+    renderer.fill_quad(
+        Quad {
+            bounds: box_bounds,
+            border: Border::default(),
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        Background::Color(palette.ui_surface),
+    );
+    renderer.fill_quad(
+        Quad {
+            bounds: Rectangle::new(
+                Point::new(x, y + cell_size.height - 2.0),
+                Size::new(width, 2.0),
+            ),
+            border: Border::default(),
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        Background::Color(palette.ui_accent),
+    );
+    renderer.fill_text(
+        Text {
+            content: content.to_string(),
+            bounds: Size::new(width, cell_size.height),
+            size: Pixels(font_size),
+            line_height: LineHeight::Absolute(Pixels(cell_size.height)),
+            font,
+            align_x: text::Alignment::Left,
+            align_y: iced::alignment::Vertical::Top,
+            shaping: Shaping::Advanced,
+            wrapping: Wrapping::None,
+        },
+        Point::new(x + 2.0, y),
+        palette.foreground,
+        clip_bounds,
+    );
+}
+
+fn publish_clipboard_paste(
+    session_id: SessionId,
+    clipboard: &dyn Clipboard,
+    shell: &mut Shell<'_, Message>,
+) {
+    if let Some(text) = clipboard.read(ClipboardKind::Standard) {
+        shell.publish(Message::PasteText { session_id, text });
+    } else {
+        shell.publish(Message::PasteFromClipboard { session_id });
+    }
+}
+
+fn point_to_cell(
+    point: Point,
+    bounds: Rectangle,
+    cell_size: Size,
+    snapshot: &TerminalSnapshot,
+) -> (usize, usize, Side) {
+    let local_x = (point.x - bounds.x).max(0.0);
+    let local_y = (point.y - bounds.y).max(0.0);
+    let max_col = snapshot.cols.saturating_sub(1) as usize;
+    let max_row = snapshot.rows.saturating_sub(1) as usize;
+    let col = ((local_x / cell_size.width.max(1.0)).floor() as usize).min(max_col);
+    let row = ((local_y / cell_size.height.max(1.0)).floor() as usize).min(max_row);
+    let cell_offset_x = local_x - (col as f32) * cell_size.width;
+    let side = if cell_offset_x < cell_size.width * 0.5 {
+        Side::Left
+    } else {
+        Side::Right
+    };
+    (col, row, side)
+}
+
+fn next_click_count(
+    last_click: &mut Option<(Instant, usize, usize, u8)>,
+    col: usize,
+    row: usize,
+) -> u8 {
+    let now = Instant::now();
+    let count = match *last_click {
+        Some((prev_time, prev_col, prev_row, prev_count))
+            if prev_col == col
+                && prev_row == row
+                && now.duration_since(prev_time).as_millis() <= 400 =>
+        {
+            if prev_count >= 3 { 1 } else { prev_count + 1 }
+        }
+        _ => 1,
+    };
+    *last_click = Some((now, col, row, count));
+    count
+}
+
+fn is_ascii_letter(key: &Key, modified_key: &Key, letter: char) -> bool {
+    matches!(
+        (key.as_ref(), modified_key.as_ref()),
+        (Key::Character(s), _) | (_, Key::Character(s))
+            if s.chars().next().is_some_and(|c| c.to_ascii_lowercase() == letter)
+    )
+}
+
+fn resolve_font(font_family: &str) -> Font {
+    let trimmed = font_family.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("monospace") {
+        return Font::MONOSPACE;
+    }
+
+    static INTERNER: OnceLock<Mutex<HashMap<String, &'static str>>> = OnceLock::new();
+    let map = INTERNER.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("font interner mutex poisoned");
+    let static_name = if let Some(&existing) = guard.get(trimmed) {
+        existing
+    } else {
+        let leaked: &'static str = Box::leak(trimmed.to_string().into_boxed_str());
+        guard.insert(trimmed.to_string(), leaked);
+        leaked
+    };
+
+    Font {
+        family: iced::font::Family::Name(static_name),
+        ..Font::MONOSPACE
     }
 }
 
@@ -426,20 +1094,6 @@ fn measure_cell_size(font: Font, font_size: f32) -> Size {
     let width = (bounds.width / 10.0).max(4.0);
     let height = bounds.height.max(font_size * 1.2);
     Size::new(width, height)
-}
-
-fn cursor_pixel_rect(snapshot: &TerminalSnapshot, bounds: Rectangle, cell_size: Size) -> Rectangle {
-    let (col, row) = snapshot
-        .cursor
-        .map(|c| (c.col as f32, c.row as f32))
-        .unwrap_or((0.0, 0.0));
-    Rectangle::new(
-        Point::new(
-            bounds.x + col * cell_size.width,
-            bounds.y + row * cell_size.height,
-        ),
-        cell_size,
-    )
 }
 
 /// Translates an Iced keyboard press event into terminal PTY byte sequences.
@@ -599,97 +1253,6 @@ fn ss3_or_csi(code: u8, mod_param: Option<u8>) -> Vec<u8> {
     match mod_param {
         Some(m) => format!("\x1b[1;{m}{}", code as char).into_bytes(),
         None => vec![0x1b, b'O', code],
-    }
-}
-
-struct TerminalPalette {
-    foreground: Color,
-    background: Color,
-    cursor: Color,
-    ansi: [Color; 16],
-}
-
-impl TerminalPalette {
-    fn from_theme(theme: &Theme) -> Self {
-        let p = theme.palette();
-        let is_light = (p.background.r + p.background.g + p.background.b) > 1.5;
-        let ansi = if is_light {
-            [
-                rgb(0x2e, 0x34, 0x40),
-                rgb(0xbf, 0x3f, 0x4a),
-                rgb(0x3a, 0x8f, 0x4b),
-                rgb(0xb0, 0x76, 0x19),
-                rgb(0x2b, 0x6c, 0xb0),
-                rgb(0x91, 0x41, 0xac),
-                rgb(0x23, 0x83, 0x91),
-                rgb(0xc8, 0xcd, 0xd4),
-                rgb(0x5c, 0x63, 0x70),
-                rgb(0xd9, 0x48, 0x54),
-                rgb(0x46, 0xa8, 0x59),
-                rgb(0xcb, 0x8a, 0x22),
-                rgb(0x38, 0x82, 0xcf),
-                rgb(0xaa, 0x52, 0xc7),
-                rgb(0x2c, 0x9c, 0xac),
-                rgb(0xe5, 0xe9, 0xf0),
-            ]
-        } else {
-            [
-                rgb(0x1e, 0x22, 0x2a),
-                rgb(0xe0, 0x6c, 0x75),
-                rgb(0x98, 0xc3, 0x79),
-                rgb(0xe5, 0xc0, 0x7b),
-                rgb(0x61, 0xaf, 0xef),
-                rgb(0xc6, 0x78, 0xdd),
-                rgb(0x56, 0xb6, 0xc2),
-                rgb(0xab, 0xb2, 0xbf),
-                rgb(0x5c, 0x63, 0x70),
-                rgb(0xef, 0x7b, 0x83),
-                rgb(0xa9, 0xd4, 0x89),
-                rgb(0xf2, 0xcc, 0x86),
-                rgb(0x73, 0xbf, 0xf7),
-                rgb(0xd4, 0x87, 0xeb),
-                rgb(0x66, 0xc7, 0xd4),
-                rgb(0xff, 0xff, 0xff),
-            ]
-        };
-        Self {
-            foreground: p.text,
-            background: p.background,
-            cursor: p.primary,
-            ansi,
-        }
-    }
-
-    fn resolve(&self, color: TermColor) -> Color {
-        match color {
-            TermColor::Spec(Rgb { r, g, b }) => rgb(r, g, b),
-            TermColor::Named(named) => match named {
-                NamedColor::Foreground | NamedColor::BrightForeground => self.foreground,
-                NamedColor::Background => self.background,
-                NamedColor::Cursor => self.cursor,
-                NamedColor::Black => self.ansi[0],
-                NamedColor::Red => self.ansi[1],
-                NamedColor::Green => self.ansi[2],
-                NamedColor::Yellow => self.ansi[3],
-                NamedColor::Blue => self.ansi[4],
-                NamedColor::Magenta => self.ansi[5],
-                NamedColor::Cyan => self.ansi[6],
-                NamedColor::White => self.ansi[7],
-                NamedColor::BrightBlack | NamedColor::DimBlack => self.ansi[8],
-                NamedColor::BrightRed | NamedColor::DimRed => self.ansi[9],
-                NamedColor::BrightGreen | NamedColor::DimGreen => self.ansi[10],
-                NamedColor::BrightYellow | NamedColor::DimYellow => self.ansi[11],
-                NamedColor::BrightBlue | NamedColor::DimBlue => self.ansi[12],
-                NamedColor::BrightMagenta | NamedColor::DimMagenta => self.ansi[13],
-                NamedColor::BrightCyan | NamedColor::DimCyan => self.ansi[14],
-                NamedColor::BrightWhite | NamedColor::DimWhite => self.ansi[15],
-                NamedColor::DimForeground => Color {
-                    a: 0.7,
-                    ..self.foreground
-                },
-            },
-            TermColor::Indexed(idx) => indexed_color(idx, &self.ansi),
-        }
     }
 }
 

@@ -3,11 +3,19 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
-use alacritty_terminal::term::{Config as TermConfig, Term};
-use alacritty_terminal::vte::ansi::{Color as TermColor, Processor, StdSyncHandler};
+use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::index::{Column, Point as GridPoint, Side};
+use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::{Config as TermConfig, Term, TermMode, viewport_to_point};
+use alacritty_terminal::vte::ansi::{
+    Color as TermColor, CursorShape, CursorStyle as VteCursorStyle, Processor, StdSyncHandler,
+};
 use tokio::sync::{Notify, mpsc};
 
-use crate::session::{CursorSnapshot, PtyEvent, TermDimensions, TerminalCell, TerminalSnapshot};
+use crate::ergonomics::{GridSearchMatch, search_term_matches};
+use crate::session::{
+    CursorSnapshot, GridRange, PtyEvent, TermDimensions, TerminalCell, TerminalSnapshot,
+};
 
 type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
 
@@ -45,7 +53,7 @@ impl EventListener for BufferEventProxy {
 /// Thread-safe `alacritty_terminal::Term` state machine shared by local PTY and SSH `Session`s.
 ///
 /// Feeds raw VTE/ANSI byte streams into the terminal grid, emits [`PtyEvent`] notifications,
-/// supports terminal query responses via an optional write sink, and produces immutable
+/// supports scrollback search, text selection, terminal query responses, and produces immutable
 /// [`TerminalSnapshot`] values for rendering and testing.
 pub struct TerminalBuffer {
     term: Mutex<Term<BufferEventProxy>>,
@@ -59,8 +67,19 @@ pub struct TerminalBuffer {
 }
 
 impl TerminalBuffer {
-    /// Creates a new [`TerminalBuffer`] sized to `(cols, rows)` with `scrollback_lines` history.
+    /// Creates a new [`TerminalBuffer`] sized to `(cols, rows)` with `scrollback_lines` history
+    /// and a default block cursor.
     pub fn new(cols: u16, rows: u16, scrollback_lines: usize) -> Self {
+        Self::new_with_cursor_shape(cols, rows, scrollback_lines, CursorShape::Block)
+    }
+
+    /// Creates a new [`TerminalBuffer`] with an explicit initial [`CursorShape`].
+    pub fn new_with_cursor_shape(
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        cursor_shape: CursorShape,
+    ) -> Self {
         let dims = TermDimensions::new(cols, rows);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let write_sink: SharedWriter = Arc::new(Mutex::new(None));
@@ -70,6 +89,10 @@ impl TerminalBuffer {
         };
         let term_config = TermConfig {
             scrolling_history: scrollback_lines,
+            default_cursor_style: VteCursorStyle {
+                shape: cursor_shape,
+                blinking: false,
+            },
             ..TermConfig::default()
         };
 
@@ -162,6 +185,118 @@ impl TerminalBuffer {
         snapshot_from_term(&term, dims)
     }
 
+    /// Scrolls the viewport display offset within retained scrollback history and returns the new offset.
+    pub fn scroll_display(&self, scroll: Scroll) -> usize {
+        let mut term = self.term.lock().expect("term mutex poisoned");
+        term.scroll_display(scroll);
+        term.grid().display_offset()
+    }
+
+    /// Resets the viewport scroll offset back to the live terminal bottom (`0`).
+    pub fn scroll_to_bottom(&self) -> usize {
+        self.scroll_display(Scroll::Bottom)
+    }
+
+    /// Returns the current number of lines scrolled above the live bottom.
+    pub fn display_offset(&self) -> usize {
+        let term = self.term.lock().expect("term mutex poisoned");
+        term.grid().display_offset()
+    }
+
+    /// Returns the number of scrollback lines currently stored in history.
+    pub fn history_size(&self) -> usize {
+        let term = self.term.lock().expect("term mutex poisoned");
+        term.grid().history_size()
+    }
+
+    /// Applies updated scrollback capacity and default cursor shape to the running terminal.
+    pub fn apply_options(&self, scrollback_lines: usize, cursor_shape: CursorShape) {
+        let mut term = self.term.lock().expect("term mutex poisoned");
+        term.set_options(TermConfig {
+            scrolling_history: scrollback_lines,
+            default_cursor_style: VteCursorStyle {
+                shape: cursor_shape,
+                blinking: false,
+            },
+            ..TermConfig::default()
+        });
+    }
+
+    /// Returns `true` when the active terminal application has enabled bracketed paste mode.
+    pub fn is_bracketed_paste(&self) -> bool {
+        let term = self.term.lock().expect("term mutex poisoned");
+        term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// Returns `true` when the active terminal application captures mouse events.
+    pub fn is_mouse_mode(&self) -> bool {
+        let term = self.term.lock().expect("term mutex poisoned");
+        term.mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    /// Searches scrollback history and visible screen for `query`, returning ordered matches.
+    pub fn search_scrollback(&self, query: &str) -> Vec<GridSearchMatch> {
+        let term = self.term.lock().expect("term mutex poisoned");
+        search_term_matches(&term, query)
+    }
+
+    /// Scrolls the viewport if needed so `target` becomes visible, returning the new offset.
+    pub fn scroll_to_match(&self, target: GridSearchMatch) -> usize {
+        let mut term = self.term.lock().expect("term mutex poisoned");
+        let display_offset = term.grid().display_offset();
+        let screen_lines = term.screen_lines() as i32;
+        let history_size = term.grid().history_size() as i32;
+        let vis_top = -(display_offset as i32);
+        let vis_bottom = vis_top + screen_lines - 1;
+
+        if target.start.line >= vis_top && target.start.line <= vis_bottom {
+            return display_offset;
+        }
+
+        let target_offset = ((screen_lines / 2) - target.start.line).clamp(0, history_size) as usize;
+        let delta = target_offset as i32 - display_offset as i32;
+        term.scroll_display(Scroll::Delta(delta));
+        term.grid().display_offset()
+    }
+
+    /// Starts a terminal grid selection at viewport `(col, row)`.
+    pub fn start_selection(&self, col: usize, row: usize, side: Side, ty: SelectionType) {
+        let mut term = self.term.lock().expect("term mutex poisoned");
+        let point = clamp_viewport_point(&term, col, row);
+        term.selection = Some(Selection::new(ty, point, side));
+    }
+
+    /// Extends the active terminal selection to viewport `(col, row)`.
+    pub fn update_selection(&self, col: usize, row: usize, side: Side) {
+        let mut term = self.term.lock().expect("term mutex poisoned");
+        let point = clamp_viewport_point(&term, col, row);
+        if let Some(sel) = term.selection.as_mut() {
+            sel.update(point, side);
+        }
+    }
+
+    /// Finalizes the active selection, clearing degenerate click-only selections and returning text.
+    pub fn finish_selection(&self) -> Option<String> {
+        let mut term = self.term.lock().expect("term mutex poisoned");
+        if term.selection.as_ref().is_some_and(Selection::is_empty) {
+            term.selection = None;
+            return None;
+        }
+        term.selection_to_string().filter(|text| !text.is_empty())
+    }
+
+    /// Extracts the currently selected text without modifying selection state.
+    pub fn selection_text(&self) -> Option<String> {
+        let term = self.term.lock().expect("term mutex poisoned");
+        term.selection_to_string().filter(|text| !text.is_empty())
+    }
+
+    /// Clears any active selection in the terminal grid.
+    pub fn clear_selection(&self) {
+        let mut term = self.term.lock().expect("term mutex poisoned");
+        term.selection = None;
+    }
+
     /// Blocks up to `timeout` until `predicate(&snapshot)` evaluates to `true`.
     pub fn wait_for_output<F>(&self, timeout: Duration, mut predicate: F) -> bool
     where
@@ -219,15 +354,37 @@ impl TerminalBuffer {
     }
 }
 
+fn clamp_viewport_point<L: EventListener>(
+    term: &Term<L>,
+    col: usize,
+    row: usize,
+) -> GridPoint {
+    let max_col = term.columns().saturating_sub(1);
+    let max_row = term.screen_lines().saturating_sub(1);
+    let viewport_pt = GridPoint::new(row.min(max_row), Column(col.min(max_col)));
+    viewport_to_point(term.grid().display_offset(), viewport_pt)
+}
+
 /// Captures an immutable [`TerminalSnapshot`] from any `alacritty_terminal::Term`.
 pub fn snapshot_from_term<L: EventListener>(term: &Term<L>, dims: TermDimensions) -> TerminalSnapshot {
     let content = term.renderable_content();
+    let display_offset = content.display_offset;
+    let history_size = term.grid().history_size();
+    let mode = *term.mode();
+    let selection = content.selection.map(|sel| GridRange {
+        start_line: sel.start.line.0,
+        start_col: sel.start.column.0,
+        end_line: sel.end.line.0,
+        end_col: sel.end.column.0,
+        is_block: sel.is_block,
+    });
+
     let cols = dims.cols as usize;
     let rows = dims.rows as usize;
     let mut cells = vec![TerminalCell::default(); cols * rows];
 
     for indexed in content.display_iter {
-        let row = indexed.point.line.0 + content.display_offset as i32;
+        let row = indexed.point.line.0 + display_offset as i32;
         let col = indexed.point.column.0;
         if row >= 0 && (row as usize) < rows && col < cols {
             let fg = resolve_override(indexed.cell.fg, content.colors);
@@ -241,7 +398,7 @@ pub fn snapshot_from_term<L: EventListener>(term: &Term<L>, dims: TermDimensions
         }
     }
 
-    let cursor_row = content.cursor.point.line.0 + content.display_offset as i32;
+    let cursor_row = content.cursor.point.line.0 + display_offset as i32;
     let cursor_col = content.cursor.point.column.0;
     let cursor = if cursor_row >= 0 && (cursor_row as usize) < rows && cursor_col < cols {
         Some(CursorSnapshot {
@@ -258,6 +415,12 @@ pub fn snapshot_from_term<L: EventListener>(term: &Term<L>, dims: TermDimensions
         rows: dims.rows,
         cells,
         cursor,
+        display_offset,
+        history_size,
+        top_line: -(display_offset as i32),
+        selection,
+        bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+        mouse_mode: mode.intersects(TermMode::MOUSE_MODE),
     }
 }
 
