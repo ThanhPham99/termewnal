@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use iced::futures::{SinkExt, Stream};
 use iced::keyboard::{Key, Modifiers, key::Named};
@@ -9,13 +11,18 @@ use iced::{
     Alignment, Background, Border, Color, Element, Length, Size, Subscription, Task, Theme,
     window,
 };
-use termewnal_core::{AppConfig, ConfigPaths, ProfilesConfig, ensure_config_files};
+use termewnal_core::{
+    AppConfig, ConfigFileKind, ConfigPaths, ConfigWatchEvent, ConfigWatcher, ProfilesConfig,
+    TomlReloadError, VaultBackend, VaultSession, ensure_config_files,
+};
 use termewnal_pty::{
     PtyEvent, PtySession, PtySpawnConfig, ShellSpec, TerminalSnapshot, detect_default_shell,
 };
 use termewnal_ssh::TransportStatus;
 use tracing::error;
+use zeroize::Zeroize;
 
+use crate::config_reload_ui::ConfigReloadUiState;
 use crate::split_view::{PaneFrame, ShortcutInterceptor, SplitView};
 use crate::terminal_widget::TerminalViewport;
 use crate::workspace::{
@@ -88,6 +95,14 @@ pub enum Message {
         session_id: SessionId,
         event: PtyEvent,
     },
+    ConfigFilesChanged(Vec<ConfigFileKind>),
+    RestoreConfigBackup(ConfigFileKind),
+    DismissReloadToast(ConfigFileKind),
+    VaultUnlockInputChanged(String),
+    VaultUnlockSubmitted(String),
+    VaultInitializeSubmitted(String),
+    VaultLock,
+    VaultAutoLockTick,
     NewTab,
     SelectTab(TabId),
     CycleTab(CycleDirection),
@@ -125,6 +140,8 @@ pub struct AppState {
     paths: ConfigPaths,
     config: AppConfig,
     profiles: ProfilesConfig,
+    vault: Arc<VaultSession>,
+    reload_ui: ConfigReloadUiState,
     windows: BTreeSet<window::Id>,
     sessions: BTreeMap<SessionId, LocalSession>,
     workspace: Workspace,
@@ -158,11 +175,33 @@ impl AppState {
     pub fn boot_with_paths(paths: ConfigPaths) -> Result<Self, String> {
         let (config, profiles) =
             ensure_config_files(&paths).map_err(|err| format!("failed to load config: {err}"))?;
+        let vault = Arc::new(VaultSession::for_paths(&paths, &config.vault));
+        Self::boot_with_loaded(paths, config, profiles, vault)
+    }
 
+    /// Initializes configuration files under `paths` using an injected [`VaultSession`] (for tests).
+    pub fn boot_with_paths_and_vault(
+        paths: ConfigPaths,
+        vault: Arc<VaultSession>,
+    ) -> Result<Self, String> {
+        let (config, profiles) =
+            ensure_config_files(&paths).map_err(|err| format!("failed to load config: {err}"))?;
+        vault.apply_config(&config.vault);
+        Self::boot_with_loaded(paths, config, profiles, vault)
+    }
+
+    fn boot_with_loaded(
+        paths: ConfigPaths,
+        config: AppConfig,
+        profiles: ProfilesConfig,
+        vault: Arc<VaultSession>,
+    ) -> Result<Self, String> {
         let mut state = Self {
             paths,
             config,
             profiles,
+            vault,
+            reload_ui: ConfigReloadUiState::default(),
             windows: BTreeSet::new(),
             sessions: BTreeMap::new(),
             workspace: Workspace::new(),
@@ -318,6 +357,72 @@ impl AppState {
                 }
                 Task::none()
             }
+            Message::ConfigFilesChanged(kinds) => {
+                let mut seen = BTreeSet::new();
+                for kind in kinds {
+                    if !seen.insert(kind) {
+                        continue;
+                    }
+                    let res = match kind {
+                        ConfigFileKind::AppConfig => self.reload_ui.reload_config(
+                            &self.paths,
+                            &mut self.config,
+                            &self.vault,
+                        ),
+                        ConfigFileKind::Profiles => self
+                            .reload_ui
+                            .reload_profiles(&self.paths, &mut self.profiles),
+                    };
+                    if let Err(err) = res {
+                        error!(file = kind.file_name(), error = %err, "TOML hot-reload failed");
+                        self.last_error = Some(err.to_string());
+                    }
+                }
+                Task::none()
+            }
+            Message::RestoreConfigBackup(kind) => {
+                match self.reload_ui.restore_backup(
+                    &self.paths,
+                    kind,
+                    &mut self.config,
+                    &mut self.profiles,
+                    &self.vault,
+                ) {
+                    Ok(()) => {
+                        self.last_error = None;
+                    }
+                    Err(err) => {
+                        error!(file = kind.file_name(), error = %err, "failed to restore .bak.1");
+                        self.last_error = Some(err);
+                    }
+                }
+                Task::none()
+            }
+            Message::DismissReloadToast(kind) => {
+                self.reload_ui.dismiss_error(kind);
+                Task::none()
+            }
+            Message::VaultUnlockInputChanged(password) => {
+                self.reload_ui.set_vault_password_draft(password);
+                Task::none()
+            }
+            Message::VaultUnlockSubmitted(password) => {
+                self.apply_vault_password_op(password, VaultSession::unlock);
+                Task::none()
+            }
+            Message::VaultInitializeSubmitted(password) => {
+                self.apply_vault_password_op(password, VaultSession::initialize_encrypted);
+                Task::none()
+            }
+            Message::VaultLock => {
+                self.vault.lock();
+                self.reload_ui.clear_vault_prompt();
+                Task::none()
+            }
+            Message::VaultAutoLockTick => {
+                self.vault.tick_idle();
+                Task::none()
+            }
             Message::NewTab => {
                 match self.spawn_default_local_session() {
                     Ok(session_id) => {
@@ -435,12 +540,20 @@ impl AppState {
         }
     }
 
-    /// Renders the workspace tab strip, optional Broadcast Input banner, and active split panes.
+    /// Renders the workspace tab strip, optional Broadcast Input / reload / Vault banners, and
+    /// active split panes.
     pub fn view(&self, _window_id: window::Id) -> Element<'_, Message, Theme, iced::Renderer> {
         let mut root = column![self.render_tab_strip()].width(Length::Fill).height(Length::Fill);
 
         if let Some(banner_text) = self.broadcast_banner_text() {
             root = root.push(render_broadcast_banner(banner_text));
+        }
+
+        if let Some(toasts) = self.reload_ui.view_reload_toasts() {
+            root = root.push(toasts);
+        }
+        if let Some(vault_bar) = self.reload_ui.view_vault_banner(&self.vault) {
+            root = root.push(vault_bar);
         }
 
         let body = match self.workspace.active_tab() {
@@ -736,10 +849,18 @@ impl AppState {
         theme_from_name(&self.config.terminal.theme)
     }
 
-    /// Subscribes to window lifecycle events and live PTY output streams.
+    /// Subscribes to window lifecycle events, live PTY output streams, config hot-reload, and
+    /// Vault auto-lock ticks.
     pub fn subscription(&self) -> Subscription<Message> {
         let close_requests = window::close_requests().map(Message::CloseRequested);
         let closed = window::close_events().map(Message::WindowClosed);
+        let config_watch = Subscription::run_with(
+            ConfigWatchSubKey {
+                config_dir: self.paths.config_dir().to_path_buf(),
+                paths: self.paths.clone(),
+            },
+            config_watch_stream,
+        );
 
         let pty_subs = self.sessions.values().map(|session| {
             Subscription::run_with(
@@ -751,9 +872,14 @@ impl AppState {
             )
         });
 
+        let vault_tick = (self.vault.backend() == VaultBackend::EncryptedFile
+            && self.vault.is_unlocked())
+        .then(|| iced::time::every(Duration::from_secs(15)).map(|_| Message::VaultAutoLockTick));
+
         Subscription::batch(
-            [close_requests, closed]
+            [close_requests, closed, config_watch]
                 .into_iter()
+                .chain(vault_tick)
                 .chain(pty_subs),
         )
     }
@@ -771,6 +897,35 @@ impl AppState {
     /// Returns the active [`ProfilesConfig`].
     pub fn profiles(&self) -> &ProfilesConfig {
         &self.profiles
+    }
+
+    /// Returns the process-level [`VaultSession`].
+    pub fn vault(&self) -> &Arc<VaultSession> {
+        &self.vault
+    }
+
+    /// Returns active hot-reload parse-error toasts keyed by file kind.
+    pub fn reload_errors(&self) -> &BTreeMap<ConfigFileKind, TomlReloadError> {
+        self.reload_ui.errors()
+    }
+
+    fn apply_vault_password_op(
+        &mut self,
+        mut password: String,
+        op: impl FnOnce(&VaultSession, &str) -> Result<(), termewnal_core::VaultError>,
+    ) {
+        match op(&self.vault, &password) {
+            Ok(()) => {
+                self.reload_ui.clear_vault_prompt();
+                self.last_error = None;
+            }
+            Err(err) => {
+                let msg = err.to_string();
+                self.reload_ui.set_vault_error(Some(msg.clone()));
+                self.last_error = Some(msg);
+            }
+        }
+        password.zeroize();
     }
 
     /// Returns the workspace tab and split-pane layout state.
@@ -829,6 +984,46 @@ impl AppState {
     pub fn last_error(&self) -> Option<&str> {
         self.last_error.as_deref()
     }
+}
+
+#[derive(Clone)]
+struct ConfigWatchSubKey {
+    config_dir: PathBuf,
+    paths: ConfigPaths,
+}
+
+impl Hash for ConfigWatchSubKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.config_dir.hash(state);
+    }
+}
+
+fn config_watch_stream(
+    key: &ConfigWatchSubKey,
+) -> std::pin::Pin<Box<dyn Stream<Item = Message> + Send>> {
+    let paths = key.paths.clone();
+    Box::pin(iced::stream::channel(16, async move |mut output| {
+        let Ok((watcher, mut rx)) = ConfigWatcher::start(paths) else {
+            return;
+        };
+        let _watcher = watcher;
+        while let Some(event) = rx.recv().await {
+            let msg = match event {
+                ConfigWatchEvent::Changed(kinds) => Message::ConfigFilesChanged(kinds),
+                ConfigWatchEvent::Rescan => Message::ConfigFilesChanged(vec![
+                    ConfigFileKind::AppConfig,
+                    ConfigFileKind::Profiles,
+                ]),
+                ConfigWatchEvent::Error(err) => {
+                    error!(error = %err, "config directory watcher error");
+                    continue;
+                }
+            };
+            if output.send(msg).await.is_err() {
+                break;
+            }
+        }
+    }))
 }
 
 #[derive(Clone)]

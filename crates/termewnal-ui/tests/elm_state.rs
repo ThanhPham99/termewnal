@@ -1,9 +1,16 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::{Theme, window};
 use tempfile::TempDir;
-use termewnal_core::ConfigPaths;
+use termewnal_core::{
+    AppConfig, ConfigFileKind, ConfigPaths, VaultBackend, VaultConfig, load_config, save_config,
+    vault::{
+        EncryptedVault, InMemorySecretStore, ManualVaultClock, SecretStore, VaultError,
+        VaultSession,
+    },
+};
 use termewnal_pty::PtyEvent;
 use termewnal_ui::{
     AppState, CycleDirection, FocusDirection, Message, SplitAxis, SplitNode, TabId,
@@ -164,6 +171,193 @@ fn key_event_to_bytes_encodes_ascii_utf8_ctrl_and_navigation_keys() {
         ),
         b"\x1bx"
     );
+}
+
+#[test]
+fn update_hot_reloads_valid_config_and_profiles_without_interrupting_running_session() {
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut state = AppState::boot_with_paths(paths.clone()).expect("boot AppState");
+    let win = window::Id::unique();
+    let session_id = state.active_session_id().expect("active Session");
+
+    let _ = state.update(Message::TerminalInput {
+        session_id,
+        bytes: b"echo HOT_RELOAD_BEFORE\r".to_vec(),
+    });
+    let pty = state.session(session_id).unwrap().pty().clone();
+    assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
+        s.visible_text().contains("HOT_RELOAD_BEFORE")
+    }));
+
+    let next_cfg_toml = r#"
+schema_version = 1
+
+[terminal]
+theme = "Nord"
+font_size = 18.0
+scrollback_lines = 22000
+
+[vault]
+backend = "encrypted_file"
+auto_lock_minutes = 15
+"#;
+    std::fs::write(paths.config_file(), next_cfg_toml).expect("write external config.toml");
+
+    let next_profiles_toml = r#"
+schema_version = 1
+
+[[profiles]]
+id = "p-1"
+name = "Prod SSH"
+
+[profiles.target]
+kind = "local_shell"
+"#;
+    std::fs::write(paths.profiles_file(), next_profiles_toml)
+        .expect("write external profiles.toml");
+
+    let _ = state.update(Message::ConfigFilesChanged(vec![
+        ConfigFileKind::AppConfig,
+        ConfigFileKind::Profiles,
+    ]));
+
+    assert_eq!(state.config().terminal.theme, "Nord");
+    assert_eq!(state.config().terminal.font_size, 18.0);
+    assert_eq!(state.theme(win), Theme::Nord);
+    assert_eq!(state.profiles().profiles.len(), 1);
+    assert_eq!(state.profiles().profiles[0].name, "Prod SSH");
+    assert_eq!(state.vault().backend(), VaultBackend::EncryptedFile);
+    assert_eq!(state.vault().auto_lock_minutes(), 15);
+    assert!(state.reload_errors().is_empty());
+
+    // Existing terminal Session remains alive and interactive across reload.
+    assert_eq!(state.active_session_id(), Some(session_id));
+    assert_eq!(state.session(session_id).unwrap().exited(), None);
+    let _ = state.update(Message::TerminalInput {
+        session_id,
+        bytes: b"echo HOT_RELOAD_AFTER\r".to_vec(),
+    });
+    assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
+        s.visible_text().contains("HOT_RELOAD_AFTER")
+    }));
+}
+
+#[test]
+fn update_retains_active_config_on_malformed_toml_surfaces_toast_and_restores_bak1() {
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut state = AppState::boot_with_paths(paths.clone()).expect("boot AppState");
+    let win = window::Id::unique();
+
+    // Save v2 so `.bak.1` holds v1 (`Dark`, `10_000` scrollback).
+    let mut cfg_v2 = state.config().clone();
+    cfg_v2.terminal.theme = "Dracula".to_string();
+    cfg_v2.terminal.scrollback_lines = 15_000;
+    save_config(&paths, &cfg_v2).expect("save config v2");
+    let _ = state.update(Message::ConfigFilesChanged(vec![ConfigFileKind::AppConfig]));
+    assert_eq!(state.theme(win), Theme::Dracula);
+
+    let broken = "schema_version = 1\n[terminal]\nfont_size = \"oops\"\n";
+    std::fs::write(paths.config_file(), broken).expect("write malformed config.toml");
+
+    let _ = state.update(Message::ConfigFilesChanged(vec![ConfigFileKind::AppConfig]));
+
+    assert_eq!(state.config().terminal.theme, "Dracula");
+    assert_eq!(state.theme(win), Theme::Dracula);
+    assert_eq!(state.config().terminal.scrollback_lines, 15_000);
+    assert_eq!(
+        std::fs::read_to_string(paths.config_file()).unwrap(),
+        broken,
+        "broken TOML edit must not be overwritten"
+    );
+
+    let toast_err = state
+        .reload_errors()
+        .get(&ConfigFileKind::AppConfig)
+        .expect("reload toast error should be surfaced");
+    assert_eq!(toast_err.line, Some(3));
+    assert!(toast_err.backup_available);
+    drop(state.view(win));
+
+    let _ = state.update(Message::RestoreConfigBackup(ConfigFileKind::AppConfig));
+    assert!(state.reload_errors().is_empty());
+    assert_eq!(state.config().terminal.theme, "Dark");
+    assert_eq!(state.theme(win), Theme::Dark);
+    assert_eq!(state.config().terminal.scrollback_lines, 10_000);
+    assert_eq!(load_config(&paths).unwrap().terminal.scrollback_lines, 10_000);
+}
+
+#[test]
+fn update_vault_unlock_manual_lock_and_idle_auto_lock_tick_manage_session_secrets() {
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+
+    let mut cfg = AppConfig::default();
+    cfg.vault = VaultConfig {
+        backend: VaultBackend::EncryptedFile,
+        auto_lock_minutes: 30,
+    };
+    save_config(&paths, &cfg).expect("save config with EncryptedFile vault");
+
+    let clock = Arc::new(ManualVaultClock::new());
+    let encrypted = EncryptedVault::with_clock(
+        paths.vault_file(),
+        Some(Duration::from_secs(30 * 60)),
+        clock.clone(),
+    );
+    let vault = Arc::new(VaultSession::new(
+        cfg.vault.clone(),
+        Arc::new(InMemorySecretStore::new()),
+        encrypted,
+    ));
+
+    let mut state = AppState::boot_with_paths_and_vault(paths, vault.clone())
+        .expect("boot AppState with custom VaultSession");
+    assert!(state.vault().requires_unlock());
+    drop(state.view(window::Id::unique()));
+
+    let _ = state.update(Message::VaultInitializeSubmitted(
+        "vault-pass-42".to_string(),
+    ));
+    assert!(!state.vault().requires_unlock());
+    assert!(state.vault().is_unlocked());
+
+    state
+        .vault()
+        .set_secret("ssh/key", "passphrase")
+        .expect("store secret in unlocked session");
+
+    let _ = state.update(Message::VaultLock);
+    assert!(state.vault().requires_unlock());
+    assert!(matches!(
+        state.vault().get_secret("ssh/key"),
+        Err(VaultError::Locked)
+    ));
+
+    let _ = state.update(Message::VaultUnlockSubmitted("wrong-pass".to_string()));
+    assert!(state.vault().requires_unlock());
+    assert!(state.last_error().is_some());
+
+    let _ = state.update(Message::VaultUnlockSubmitted("vault-pass-42".to_string()));
+    assert!(!state.vault().requires_unlock());
+    assert_eq!(
+        state
+            .vault()
+            .get_secret("ssh/key")
+            .unwrap()
+            .as_deref()
+            .map(String::as_str),
+        Some("passphrase")
+    );
+
+    clock.advance_idle(Duration::from_secs(30 * 60));
+    let _ = state.update(Message::VaultAutoLockTick);
+    assert!(state.vault().requires_unlock());
+    assert!(matches!(
+        state.vault().get_secret("ssh/key"),
+        Err(VaultError::Locked)
+    ));
 }
 
 #[test]
