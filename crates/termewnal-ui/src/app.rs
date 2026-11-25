@@ -14,9 +14,9 @@ use iced::{
     clipboard, event, window,
 };
 use termewnal_core::{
-    AppConfig, ConfigFileKind, ConfigPaths, ConfigWatchEvent, ConfigWatcher, ProfilesConfig,
-    TerminalConfig, ThemePalette, TomlReloadError, VaultBackend, VaultSession,
-    ensure_config_files,
+    AppConfig, ConfigFileKind, ConfigPaths, ConfigWatchEvent, ConfigWatcher, Profile,
+    ProfileTarget, ProfilesConfig, SshAuthMethod, TerminalConfig, ThemePalette, TomlReloadError,
+    VaultBackend, VaultSession, ensure_config_files,
 };
 use termewnal_pty::{
     GridSearchMatch, PtyEvent, PtySession, PtySpawnConfig, Scroll, SelectionType, ShellSpec, Side,
@@ -26,8 +26,19 @@ use termewnal_ssh::TransportStatus;
 use tracing::error;
 use zeroize::Zeroize;
 
+use crate::command_palette::{
+    CommandPaletteMode, CommandPaletteState, PaletteAction, PaletteItem, PaletteSessionEntry,
+    QuickConnectTarget, command_palette_input_id, quick_connect_input_id, render_command_palette,
+};
 use crate::config_reload_ui::ConfigReloadUiState;
-use crate::split_view::{PaneFrame, ShortcutInterceptor, SplitView};
+use crate::sidebar::{
+    ActiveTunnelEntry, SidebarSection, SidebarState, SystemSshProfile, render_sidebar,
+};
+use crate::split_view::{CapturedEventGate, PaneFrame, ShortcutInterceptor, SplitView};
+use crate::status_bar::{
+    SessionKindLabel, SessionStatusHook, StatusBarAction, StatusBarSnapshot, StatusBarState,
+    TransferSummaryHook, TunnelSummaryHook, render_status_bar,
+};
 use crate::terminal_ergonomics::{
     FileDropAction, PendingPaste, SearchBarState, classify_file_drop, cursor_style_to_shape,
     format_paste_bytes, iced_theme_from_name, is_multiline_paste, open_url_with_system,
@@ -46,9 +57,83 @@ pub type UrlOpener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SessionId(pub u64);
 
+/// Placement target when launching a saved `Profile` or Quick Connect `Session`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LaunchDisposition {
+    #[default]
+    NewTab,
+    Split(SplitAxis),
+}
+
+/// Target metadata for an SSH `Session` slot ready for Ticket 07 `russh` `Primary Transport` wiring.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshSessionTarget {
+    pub profile_id: Option<String>,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    pub auth: SshAuthMethod,
+    pub proxy_jump: Vec<String>,
+    pub auto_connect_on_startup: bool,
+    pub tmux_reattach: Option<String>,
+}
+
+impl SshSessionTarget {
+    /// Returns the formatted `user@host:port` destination string.
+    pub fn display_addr(&self) -> String {
+        format!("{}@{}:{}", self.username, self.host, self.port)
+    }
+}
+
+/// Runtime slot representing an SSH `Session` before/during `russh` `Primary Transport` attachment.
+#[derive(Debug, Clone)]
+pub struct SshSessionSlot {
+    id: SessionId,
+    title: String,
+    target: SshSessionTarget,
+    transport_status: TransportStatus,
+    status_message: String,
+    cols: u16,
+    rows: u16,
+}
+
+impl SshSessionSlot {
+    /// Returns this SSH `Session`'s identifier.
+    pub fn id(&self) -> SessionId {
+        self.id
+    }
+
+    /// Returns the display title of this SSH `Session`.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Returns the SSH target configuration associated with this slot.
+    pub fn target(&self) -> &SshSessionTarget {
+        &self.target
+    }
+
+    /// Returns the current SSH `TransportStatus`.
+    pub fn transport_status(&self) -> &TransportStatus {
+        &self.transport_status
+    }
+
+    /// Returns the descriptive status message shown inside this slot.
+    pub fn status_message(&self) -> &str {
+        &self.status_message
+    }
+
+    /// Returns the tracked `(cols, rows)` terminal grid dimensions for this SSH slot.
+    pub fn dimensions(&self) -> (u16, u16) {
+        (self.cols, self.rows)
+    }
+}
+
 /// Runtime state of an active local shell `Session`.
 pub struct LocalSession {
     id: SessionId,
+    profile_id: Option<String>,
     title: String,
     pty: Arc<PtySession>,
     snapshot: Arc<TerminalSnapshot>,
@@ -60,6 +145,11 @@ impl LocalSession {
     /// Returns this `Session`'s identifier.
     pub fn id(&self) -> SessionId {
         self.id
+    }
+
+    /// Returns the originating saved `Profile` identifier, if launched from a `Profile`.
+    pub fn profile_id(&self) -> Option<&str> {
+        self.profile_id.as_deref()
     }
 
     /// Returns the display title of this `Session`.
@@ -85,6 +175,41 @@ impl LocalSession {
     /// Returns `Some(exit_code)` once the underlying shell process has exited.
     pub fn exited(&self) -> Option<Option<i32>> {
         self.exited
+    }
+}
+
+enum SessionRecord {
+    Local(LocalSession),
+    Ssh(SshSessionSlot),
+}
+
+impl SessionRecord {
+    fn title(&self) -> &str {
+        match self {
+            Self::Local(s) => &s.title,
+            Self::Ssh(s) => &s.title,
+        }
+    }
+
+    fn exited(&self) -> Option<Option<i32>> {
+        match self {
+            Self::Local(s) => s.exited,
+            Self::Ssh(_) => None,
+        }
+    }
+
+    fn as_local(&self) -> Option<&LocalSession> {
+        match self {
+            Self::Local(s) => Some(s),
+            Self::Ssh(_) => None,
+        }
+    }
+
+    fn as_local_mut(&mut self) -> Option<&mut LocalSession> {
+        match self {
+            Self::Local(s) => Some(s),
+            Self::Ssh(_) => None,
+        }
     }
 }
 
@@ -197,6 +322,44 @@ pub enum Message {
     TogglePaneZoom,
     ToggleBroadcastInput,
     SetBroadcastInput(bool),
+    ToggleSidebar,
+    SetSidebarOpen(bool),
+    SidebarFilterChanged(String),
+    SidebarToggleTagFilter(String),
+    SidebarToggleGroup(String),
+    SidebarToggleSection(SidebarSection),
+    SetSystemSshProfiles(Vec<SystemSshProfile>),
+    SetActiveTunnels(Vec<ActiveTunnelEntry>),
+    LaunchProfile {
+        profile_id: String,
+        disposition: LaunchDisposition,
+    },
+    LaunchSystemSsh {
+        alias: String,
+        disposition: LaunchDisposition,
+    },
+    SetSessionTransportStatus {
+        session_id: SessionId,
+        status: TransportStatus,
+    },
+    ConnectSshSession(SessionId),
+    DisconnectSshSession(SessionId),
+    OpenCommandPalette,
+    OpenQuickConnectPalette,
+    CloseCommandPalette,
+    ToggleCommandPalette,
+    CommandPaletteQueryChanged(String),
+    CommandPaletteSelectNext,
+    CommandPaletteSelectPrevious,
+    CommandPaletteConfirm,
+    CommandPaletteExecuteItem(PaletteAction),
+    CommandPaletteEnterQuickConnect,
+    CommandPaletteExitQuickConnect,
+    CommandPaletteQuickConnectInputChanged(String),
+    QuickConnect(QuickConnectTarget),
+    SetTunnelSummary(TunnelSummaryHook),
+    SetTransferSummary(TransferSummaryHook),
+    StatusBarAction(StatusBarAction),
 }
 
 /// Top-level Elm application state for Termewnal.
@@ -207,8 +370,11 @@ pub struct AppState {
     vault: Arc<VaultSession>,
     reload_ui: ConfigReloadUiState,
     windows: BTreeSet<window::Id>,
-    sessions: BTreeMap<SessionId, LocalSession>,
+    sessions: BTreeMap<SessionId, SessionRecord>,
     workspace: Workspace,
+    sidebar: SidebarState,
+    command_palette: CommandPaletteState,
+    status_bar: StatusBarState,
     next_session_id: u64,
     last_error: Option<String>,
     search: SearchBarState,
@@ -273,6 +439,9 @@ impl AppState {
             windows: BTreeSet::new(),
             sessions: BTreeMap::new(),
             workspace: Workspace::new(),
+            sidebar: SidebarState::new(),
+            command_palette: CommandPaletteState::new(),
+            status_bar: StatusBarState::new(),
             next_session_id: 1,
             last_error: None,
             search: SearchBarState::default(),
@@ -293,22 +462,46 @@ impl AppState {
     }
 
     fn spawn_default_local_session(&mut self) -> Result<SessionId, String> {
-        let shell = self
-            .config
-            .terminal
-            .shell
-            .as_ref()
-            .filter(|s| !s.trim().is_empty())
-            .map(|s| ShellSpec::custom(s, Vec::new()))
+        let shell = self.resolve_shell_spec(None, &[]);
+        self.spawn_local_session(shell, None, None, None)
+    }
+
+    fn resolve_shell_spec(&self, profile_shell: Option<&str>, args: &[String]) -> ShellSpec {
+        let mut spec = profile_shell
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| ShellSpec::custom(s, args.to_vec()))
+            .or_else(|| {
+                self.config
+                    .terminal
+                    .shell
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(|s| ShellSpec::custom(s, args.to_vec()))
+            })
             .unwrap_or_else(detect_default_shell);
 
+        if spec.args.is_empty() && !args.is_empty() {
+            spec.args = args.to_vec();
+        }
+        spec
+    }
+
+    fn spawn_local_session(
+        &mut self,
+        shell: ShellSpec,
+        working_dir: Option<PathBuf>,
+        title_override: Option<String>,
+        profile_id: Option<String>,
+    ) -> Result<SessionId, String> {
         let spawn_cfg = PtySpawnConfig {
             shell: shell.clone(),
             cols: 80,
             rows: 24,
             scrollback_lines: self.config.terminal.scrollback_lines,
             cursor_shape: cursor_style_to_shape(self.config.terminal.cursor_style),
-            working_dir: None,
+            working_dir,
         };
 
         let pty = Arc::new(
@@ -318,21 +511,290 @@ impl AppState {
         let id = SessionId(self.next_session_id);
         self.next_session_id += 1;
 
+        let title = title_override
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty())
+            .unwrap_or(shell.display_name);
+
         let session = LocalSession {
             id,
-            title: shell.display_name,
+            profile_id,
+            title,
             pty,
             snapshot,
             transport_status: TransportStatus::Disconnected,
             exited: None,
         };
 
-        self.sessions.insert(id, session);
+        self.sessions.insert(id, SessionRecord::Local(session));
         Ok(id)
     }
 
+    fn insert_ssh_session_slot(
+        &mut self,
+        target: SshSessionTarget,
+        status: TransportStatus,
+    ) -> SessionId {
+        let id = SessionId(self.next_session_id);
+        self.next_session_id += 1;
+        let title = if target.name.trim().is_empty() {
+            target.display_addr()
+        } else {
+            target.name.clone()
+        };
+        let status_message = format_ssh_slot_message(&target, &status);
+        let slot = SshSessionSlot {
+            id,
+            title,
+            target,
+            transport_status: status,
+            status_message,
+            cols: 80,
+            rows: 24,
+        };
+        self.sessions.insert(id, SessionRecord::Ssh(slot));
+        id
+    }
+
+    fn open_session_with_disposition(
+        &mut self,
+        session_id: SessionId,
+        tab_title: Option<String>,
+        disposition: LaunchDisposition,
+    ) {
+        match disposition {
+            LaunchDisposition::NewTab => {
+                self.workspace.create_tab(session_id, tab_title);
+            }
+            LaunchDisposition::Split(axis) => {
+                if let Some((tab_id, target_pane)) = self
+                    .workspace
+                    .active_tab()
+                    .map(|tab| (tab.id, tab.focused_pane))
+                {
+                    if self
+                        .workspace
+                        .split_pane(tab_id, target_pane, axis, session_id)
+                        .is_none()
+                    {
+                        self.remove_session(session_id);
+                    }
+                } else {
+                    self.workspace.create_tab(session_id, tab_title);
+                }
+            }
+        }
+    }
+
+    fn launch_profile_entry(&mut self, profile: &Profile, disposition: LaunchDisposition) {
+        match &profile.target {
+            ProfileTarget::LocalShell {
+                shell,
+                working_dir,
+                args,
+            } => {
+                let spec = self.resolve_shell_spec(shell.as_deref(), args);
+                let title = (!profile.name.trim().is_empty()).then(|| profile.name.clone());
+                match self.spawn_local_session(
+                    spec,
+                    working_dir.clone(),
+                    title.clone(),
+                    Some(profile.id.clone()),
+                ) {
+                    Ok(sid) => self.open_session_with_disposition(sid, title, disposition),
+                    Err(err) => {
+                        error!(profile_id = %profile.id, error = %err, "failed to launch local Profile");
+                        self.last_error = Some(err);
+                    }
+                }
+            }
+            ProfileTarget::Ssh {
+                host,
+                port,
+                username,
+                auth,
+                proxy_jump,
+                auto_connect_on_startup,
+                tmux_reattach,
+            } => {
+                let target = SshSessionTarget {
+                    profile_id: Some(profile.id.clone()),
+                    name: profile.name.clone(),
+                    host: host.clone(),
+                    port: *port,
+                    username: username.clone(),
+                    auth: auth.clone(),
+                    proxy_jump: proxy_jump.clone(),
+                    auto_connect_on_startup: *auto_connect_on_startup,
+                    tmux_reattach: tmux_reattach.clone(),
+                };
+                let sid = self.insert_ssh_session_slot(target, TransportStatus::Connecting);
+                let tab_title = (!profile.name.trim().is_empty()).then(|| profile.name.clone());
+                self.open_session_with_disposition(sid, tab_title, disposition);
+            }
+        }
+    }
+
+    fn launch_quick_connect(&mut self, target: QuickConnectTarget) {
+        let label = target.display_addr();
+        let ssh_target = SshSessionTarget {
+            profile_id: None,
+            name: label.clone(),
+            host: target.host,
+            port: target.port,
+            username: target.username,
+            auth: SshAuthMethod::Agent,
+            proxy_jump: Vec::new(),
+            auto_connect_on_startup: false,
+            tmux_reattach: None,
+        };
+        let sid = self.insert_ssh_session_slot(ssh_target, TransportStatus::Connecting);
+        self.open_session_with_disposition(sid, Some(label), LaunchDisposition::NewTab);
+    }
+
+    fn launch_system_ssh_entry(&mut self, alias: &str, disposition: LaunchDisposition) {
+        let Some(host) = self
+            .sidebar
+            .system_ssh_profiles()
+            .iter()
+            .find(|h| h.alias == alias)
+            .cloned()
+        else {
+            return;
+        };
+        let target = SshSessionTarget {
+            profile_id: None,
+            name: host.alias.clone(),
+            host: host.host_name.unwrap_or_else(|| host.alias.clone()),
+            port: host.port,
+            username: host.user.unwrap_or_else(default_os_username),
+            auth: SshAuthMethod::Agent,
+            proxy_jump: host.proxy_jump,
+            auto_connect_on_startup: false,
+            tmux_reattach: None,
+        };
+        let sid = self.insert_ssh_session_slot(target, TransportStatus::Connecting);
+        self.open_session_with_disposition(sid, Some(host.alias), disposition);
+    }
+
+    fn handle_command_palette_confirm(&mut self) -> Task<Message> {
+        match self.command_palette.mode() {
+            CommandPaletteMode::QuickConnect => {
+                if let Some(target) =
+                    QuickConnectTarget::parse(self.command_palette.quick_connect_input())
+                {
+                    self.last_error = None;
+                    self.command_palette.close();
+                    self.launch_quick_connect(target);
+                } else {
+                    self.last_error =
+                        Some("Invalid Quick Connect target (expected user@host[:port])".to_string());
+                }
+                Task::none()
+            }
+            CommandPaletteMode::Search => {
+                let items = self.command_palette_items();
+                if items.is_empty() {
+                    return Task::none();
+                }
+                let idx = self.command_palette.selected_index().min(items.len() - 1);
+                let action = items[idx].action.clone();
+                self.execute_palette_action(action)
+            }
+        }
+    }
+
+    fn handle_status_bar_action(&mut self, action: StatusBarAction) -> Task<Message> {
+        match action {
+            StatusBarAction::ToggleSidebar => {
+                self.sidebar.toggle();
+                Task::none()
+            }
+            StatusBarAction::OpenCommandPalette => self.update(Message::OpenCommandPalette),
+            StatusBarAction::ReconnectSession(session_id) => {
+                self.update_ssh_slot_status(session_id, TransportStatus::Connecting);
+                Task::none()
+            }
+            StatusBarAction::CancelReconnect(session_id) => {
+                self.update_ssh_slot_status(session_id, TransportStatus::Disconnected);
+                Task::none()
+            }
+            StatusBarAction::ToggleTunnelsView => {
+                self.sidebar.set_open(true);
+                self.sidebar
+                    .set_section_collapsed(SidebarSection::ActiveTunnels, false);
+                Task::none()
+            }
+            StatusBarAction::ToggleTransferDrawer => {
+                self.status_bar.toggle_transfer_drawer();
+                Task::none()
+            }
+        }
+    }
+
+    fn execute_palette_action(&mut self, action: PaletteAction) -> Task<Message> {
+        match action {
+            PaletteAction::OpenQuickConnectPrompt => {
+                self.command_palette.enter_quick_connect("");
+                operation::focus(quick_connect_input_id())
+            }
+            PaletteAction::NewTab => {
+                self.command_palette.close();
+                self.update(Message::NewTab)
+            }
+            PaletteAction::SplitPane(axis) => {
+                self.command_palette.close();
+                self.update(Message::SplitFocusedPane(axis))
+            }
+            PaletteAction::TogglePaneZoom => {
+                self.command_palette.close();
+                self.update(Message::TogglePaneZoom)
+            }
+            PaletteAction::ToggleBroadcastInput => {
+                self.command_palette.close();
+                self.update(Message::ToggleBroadcastInput)
+            }
+            PaletteAction::ToggleSidebar => {
+                self.command_palette.close();
+                self.update(Message::ToggleSidebar)
+            }
+            PaletteAction::CloseFocusedPane => {
+                self.command_palette.close();
+                self.update(Message::CloseFocusedPane)
+            }
+            PaletteAction::QuickConnect(target) => {
+                self.command_palette.close();
+                self.launch_quick_connect(target);
+                Task::none()
+            }
+            PaletteAction::SwitchSession(session_id) => {
+                self.command_palette.close();
+                self.update(Message::FocusSession(session_id))
+            }
+            PaletteAction::LaunchProfile {
+                profile_id,
+                disposition,
+            } => {
+                self.command_palette.close();
+                self.update(Message::LaunchProfile {
+                    profile_id,
+                    disposition,
+                })
+            }
+            PaletteAction::LaunchSystemSsh { alias, disposition } => {
+                self.command_palette.close();
+                self.update(Message::LaunchSystemSsh { alias, disposition })
+            }
+            PaletteAction::ToggleTunnel(tunnel_id) => {
+                self.command_palette.close();
+                let _ = tunnel_id;
+                Task::none()
+            }
+        }
+    }
+
     fn remove_session(&mut self, session_id: SessionId) {
-        if let Some(session) = self.sessions.remove(&session_id) {
+        if let Some(SessionRecord::Local(session)) = self.sessions.remove(&session_id) {
             session.pty.terminate();
         }
     }
@@ -390,19 +852,26 @@ impl AppState {
                 cols,
                 rows,
             } => {
-                if let Some(session) = self.sessions.get_mut(&session_id) {
-                    if let Err(err) = session.pty.resize(cols, rows) {
-                        error!(session = session_id.0, error = %err, "failed to resize PTY");
-                        self.last_error = Some(err.to_string());
-                    } else {
-                        session.snapshot = Arc::new(session.pty.snapshot());
+                match self.sessions.get_mut(&session_id) {
+                    Some(SessionRecord::Local(session)) => {
+                        if let Err(err) = session.pty.resize(cols, rows) {
+                            error!(session = session_id.0, error = %err, "failed to resize PTY");
+                            self.last_error = Some(err.to_string());
+                        } else {
+                            session.snapshot = Arc::new(session.pty.snapshot());
+                        }
                     }
+                    Some(SessionRecord::Ssh(slot)) => {
+                        slot.cols = cols.max(1);
+                        slot.rows = rows.max(1);
+                    }
+                    None => {}
                 }
                 Task::none()
             }
             Message::PtyEvent { session_id, event } => {
                 let is_active_session = Some(session_id) == self.active_session_id();
-                if let Some(session) = self.sessions.get_mut(&session_id) {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
                     match event {
                         PtyEvent::Output => {
                             session.snapshot = Arc::new(session.pty.snapshot());
@@ -437,6 +906,7 @@ impl AppState {
                 let active_pty = self
                     .active_session_id()
                     .and_then(|id| self.sessions.get(&id))
+                    .and_then(SessionRecord::as_local)
                     .map(|s| s.pty.as_ref());
                 let target = self.search.open(active_pty);
                 self.focus_search_match(target);
@@ -450,6 +920,7 @@ impl AppState {
                 let active_pty = self
                     .active_session_id()
                     .and_then(|id| self.sessions.get(&id))
+                    .and_then(SessionRecord::as_local)
                     .map(|s| s.pty.as_ref());
                 let target = self.search.set_query(query, active_pty);
                 self.focus_search_match(target);
@@ -466,6 +937,10 @@ impl AppState {
                 Task::none()
             }
             Message::EscapePressed => {
+                if self.command_palette.is_open() {
+                    self.command_palette.close();
+                    return Task::none();
+                }
                 if self.pending_paste.take().is_some() {
                     return Task::none();
                 }
@@ -482,21 +957,21 @@ impl AppState {
                 session_id,
                 delta_lines,
             } => {
-                if let Some(session) = self.sessions.get_mut(&session_id) {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
                     session.pty.scroll_display(Scroll::Delta(delta_lines));
                     session.snapshot = Arc::new(session.pty.snapshot());
                 }
                 Task::none()
             }
             Message::ScrollToTop(session_id) => {
-                if let Some(session) = self.sessions.get_mut(&session_id) {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
                     session.pty.scroll_display(Scroll::Top);
                     session.snapshot = Arc::new(session.pty.snapshot());
                 }
                 Task::none()
             }
             Message::ScrollToBottom(session_id) => {
-                if let Some(session) = self.sessions.get_mut(&session_id) {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
                     session.pty.scroll_to_bottom();
                     session.snapshot = Arc::new(session.pty.snapshot());
                 }
@@ -509,7 +984,7 @@ impl AppState {
                 side,
                 selection_type,
             } => {
-                if let Some(session) = self.sessions.get_mut(&session_id) {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
                     session
                         .pty
                         .start_selection(col, row, side, selection_type);
@@ -523,14 +998,16 @@ impl AppState {
                 row,
                 side,
             } => {
-                if let Some(session) = self.sessions.get_mut(&session_id) {
+                if let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) {
                     session.pty.update_selection(col, row, side);
                     session.snapshot = Arc::new(session.pty.snapshot());
                 }
                 Task::none()
             }
             Message::SelectionFinish { session_id } => {
-                let copied = if let Some(session) = self.sessions.get_mut(&session_id) {
+                let copied = if let Some(SessionRecord::Local(session)) =
+                    self.sessions.get_mut(&session_id)
+                {
                     let selected = session.pty.finish_selection();
                     session.snapshot = Arc::new(session.pty.snapshot());
                     if self.config.terminal.copy_on_select {
@@ -552,6 +1029,7 @@ impl AppState {
                 let copied = self
                     .sessions
                     .get(&session_id)
+                    .and_then(SessionRecord::as_local)
                     .and_then(|session| session.pty.selection_text());
                 if let Some(text) = copied {
                     self.copy_text_to_clipboard(text)
@@ -803,20 +1281,153 @@ impl AppState {
                 }
                 Task::none()
             }
+            Message::ToggleSidebar => {
+                self.sidebar.toggle();
+                Task::none()
+            }
+            Message::SetSidebarOpen(open) => {
+                self.sidebar.set_open(open);
+                Task::none()
+            }
+            Message::SidebarFilterChanged(query) => {
+                self.sidebar.set_filter_query(query);
+                Task::none()
+            }
+            Message::SidebarToggleTagFilter(tag) => {
+                self.sidebar.toggle_tag_filter(&tag);
+                Task::none()
+            }
+            Message::SidebarToggleGroup(group_name) => {
+                self.sidebar.toggle_group_collapsed(&group_name);
+                Task::none()
+            }
+            Message::SidebarToggleSection(section) => {
+                self.sidebar.toggle_section(section);
+                Task::none()
+            }
+            Message::SetSystemSshProfiles(entries) => {
+                self.sidebar.set_system_ssh_profiles(entries);
+                Task::none()
+            }
+            Message::SetActiveTunnels(entries) => {
+                self.status_bar
+                    .set_tunnels(TunnelSummaryHook::from_entries(&entries));
+                self.sidebar.set_active_tunnels(entries);
+                Task::none()
+            }
+            Message::LaunchProfile {
+                profile_id,
+                disposition,
+            } => {
+                self.command_palette.close();
+                if let Some(profile) = self
+                    .profiles
+                    .profiles
+                    .iter()
+                    .find(|p| p.id == profile_id)
+                    .cloned()
+                {
+                    self.launch_profile_entry(&profile, disposition);
+                } else {
+                    self.last_error = Some(format!("unknown profile id: {profile_id}"));
+                }
+                Task::none()
+            }
+            Message::LaunchSystemSsh { alias, disposition } => {
+                self.command_palette.close();
+                self.launch_system_ssh_entry(&alias, disposition);
+                Task::none()
+            }
+            Message::SetSessionTransportStatus { session_id, status } => {
+                self.update_ssh_slot_status(session_id, status);
+                Task::none()
+            }
+            Message::ConnectSshSession(session_id) => {
+                self.update_ssh_slot_status(session_id, TransportStatus::Connecting);
+                Task::none()
+            }
+            Message::DisconnectSshSession(session_id) => {
+                self.update_ssh_slot_status(session_id, TransportStatus::Disconnected);
+                Task::none()
+            }
+            Message::OpenCommandPalette => {
+                self.command_palette.open();
+                operation::focus(command_palette_input_id())
+            }
+            Message::OpenQuickConnectPalette => {
+                self.command_palette.open_quick_connect();
+                operation::focus(quick_connect_input_id())
+            }
+            Message::CloseCommandPalette => {
+                self.command_palette.close();
+                Task::none()
+            }
+            Message::ToggleCommandPalette => {
+                if self.command_palette.toggle() {
+                    operation::focus(command_palette_input_id())
+                } else {
+                    Task::none()
+                }
+            }
+            Message::CommandPaletteQueryChanged(query) => {
+                self.command_palette.set_query(query);
+                Task::none()
+            }
+            Message::CommandPaletteSelectNext => {
+                let count = self.command_palette_items().len();
+                self.command_palette.select_next(count);
+                Task::none()
+            }
+            Message::CommandPaletteSelectPrevious => {
+                let count = self.command_palette_items().len();
+                self.command_palette.select_previous(count);
+                Task::none()
+            }
+            Message::CommandPaletteEnterQuickConnect => {
+                self.command_palette.enter_quick_connect("");
+                operation::focus(quick_connect_input_id())
+            }
+            Message::CommandPaletteExitQuickConnect => {
+                self.command_palette.exit_quick_connect();
+                operation::focus(command_palette_input_id())
+            }
+            Message::CommandPaletteQuickConnectInputChanged(input) => {
+                self.command_palette.set_quick_connect_input(input);
+                Task::none()
+            }
+            Message::CommandPaletteConfirm => self.handle_command_palette_confirm(),
+            Message::CommandPaletteExecuteItem(action) => self.execute_palette_action(action),
+            Message::QuickConnect(target) => {
+                self.command_palette.close();
+                self.launch_quick_connect(target);
+                Task::none()
+            }
+            Message::SetTunnelSummary(summary) => {
+                self.status_bar.set_tunnels(summary);
+                Task::none()
+            }
+            Message::SetTransferSummary(summary) => {
+                self.status_bar.set_transfers(summary);
+                Task::none()
+            }
+            Message::StatusBarAction(action) => self.handle_status_bar_action(action),
         }
     }
 
     fn sync_terminal_options_to_sessions(&mut self) {
         let shape = cursor_style_to_shape(self.config.terminal.cursor_style);
         let scrollback = self.config.terminal.scrollback_lines;
-        for session in self.sessions.values_mut() {
-            session.pty.apply_options(scrollback, shape);
-            session.snapshot = Arc::new(session.pty.snapshot());
+        for record in self.sessions.values_mut() {
+            if let Some(session) = record.as_local_mut() {
+                session.pty.apply_options(scrollback, shape);
+                session.snapshot = Arc::new(session.pty.snapshot());
+            }
         }
         if self.search.open && !self.search.query.is_empty() {
             let active_pty = self
                 .active_session_id()
                 .and_then(|id| self.sessions.get(&id))
+                .and_then(SessionRecord::as_local)
                 .map(|s| s.pty.as_ref());
             self.search.refresh_matches(active_pty, false);
         }
@@ -824,7 +1435,7 @@ impl AppState {
 
     fn focus_search_match(&mut self, target: Option<GridSearchMatch>) {
         if let Some(matched) = target
-            && let Some(session) = self
+            && let Some(SessionRecord::Local(session)) = self
                 .active_session_id()
                 .and_then(|id| self.sessions.get_mut(&id))
         {
@@ -842,7 +1453,7 @@ impl AppState {
     }
 
     fn dispatch_paste_to_session(&mut self, session_id: SessionId, text: &str) {
-        let Some(session) = self.sessions.get(&session_id) else {
+        let Some(SessionRecord::Local(session)) = self.sessions.get(&session_id) else {
             return;
         };
         let bytes = format_paste_bytes(text, session.pty.is_bracketed_paste());
@@ -860,6 +1471,7 @@ impl AppState {
                 && self
                     .sessions
                     .get(&target_id)
+                    .and_then(SessionRecord::as_local)
                     .is_some_and(|session| session.exited.is_some())
             {
                 continue;
@@ -872,7 +1484,7 @@ impl AppState {
         if bytes.is_empty() {
             return;
         }
-        let Some(session) = self.sessions.get_mut(&session_id) else {
+        let Some(SessionRecord::Local(session)) = self.sessions.get_mut(&session_id) else {
             return;
         };
         if let Err(err) = session.pty.write_bytes(bytes) {
@@ -884,51 +1496,75 @@ impl AppState {
         }
     }
 
-    /// Renders the workspace tab strip, optional Broadcast Input / reload / Vault banners, and
-    /// active split panes.
+    /// Renders the workspace tab strip, collapsible Left Sidebar, status/reload/Vault banners,
+    /// active split panes, Status Bar, Search/Paste overlays, and Command Palette modal.
     pub fn view(&self, _window_id: window::Id) -> Element<'_, Message, Theme, iced::Renderer> {
-        let mut root = column![self.render_tab_strip()].width(Length::Fill).height(Length::Fill);
+        let mut main_pane_col = column![self.render_tab_strip()]
+            .width(Length::Fill)
+            .height(Length::Fill);
 
         if let Some(banner_text) = self.broadcast_banner_text() {
-            root = root.push(render_broadcast_banner(banner_text));
+            main_pane_col = main_pane_col.push(render_broadcast_banner(banner_text));
         }
 
         if let Some(toasts) = self.reload_ui.view_reload_toasts() {
-            root = root.push(toasts);
+            main_pane_col = main_pane_col.push(toasts);
         }
         if let Some(vault_bar) = self.reload_ui.view_vault_banner(&self.vault) {
-            root = root.push(vault_bar);
+            main_pane_col = main_pane_col.push(vault_bar);
         }
 
         let body = match self.workspace.active_tab() {
             Some(tab) => self.render_tab_body(tab),
             None => self.render_empty_workspace(),
         };
-        root = root.push(body);
+        main_pane_col = main_pane_col.push(body);
 
-        let workspace_layer = ShortcutInterceptor::new(root.into(), self.active_tab_id());
-        let palette = ThemePalette::for_name(&self.config.terminal.theme);
-        match (self.search.open, &self.pending_paste) {
-            (false, None) => workspace_layer,
-            (true, None) => stack![workspace_layer, search_bar_view(&self.search, &palette)]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-            (false, Some(pending)) => {
-                stack![workspace_layer, paste_confirm_modal_view(pending, &palette)]
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into()
-            }
-            (true, Some(pending)) => stack![
-                workspace_layer,
-                search_bar_view(&self.search, &palette),
-                paste_confirm_modal_view(pending, &palette)
+        let workspace_row: Element<'_, Message, Theme, iced::Renderer> = if self.sidebar.is_open() {
+            row![
+                render_sidebar(&self.sidebar, &self.profiles.profiles),
+                CapturedEventGate::new(main_pane_col.into()),
             ]
             .width(Length::Fill)
             .height(Length::Fill)
-            .into(),
+            .into()
+        } else {
+            main_pane_col.into()
+        };
+
+        let status_snapshot = self.status_bar_snapshot();
+        let base_layout: Element<'_, Message, Theme, iced::Renderer> = column![
+            workspace_row,
+            render_status_bar(&status_snapshot),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into();
+
+        let palette = ThemePalette::for_name(&self.config.terminal.theme);
+        let mut layers = stack![base_layout]
+            .width(Length::Fill)
+            .height(Length::Fill);
+        if self.search.open {
+            layers = layers.push(search_bar_view(&self.search, &palette));
         }
+        if let Some(pending) = &self.pending_paste {
+            layers = layers.push(paste_confirm_modal_view(pending, &palette));
+        }
+        if self.command_palette.is_open() {
+            let items = self.command_palette_items();
+            layers = layers.push(render_command_palette(
+                &self.command_palette,
+                items,
+                self.last_error(),
+            ));
+        }
+
+        ShortcutInterceptor::with_palette(
+            layers.into(),
+            self.active_tab_id(),
+            self.command_palette.is_open(),
+        )
     }
 
     fn render_tab_strip(&self) -> Element<'_, Message, Theme, iced::Renderer> {
@@ -992,6 +1628,10 @@ impl AppState {
         let active_broadcast = self.is_broadcast_banner_visible();
 
         let mut actions = row![
+            button(text("Palette").size(12))
+                .padding([4, 8])
+                .style(button::subtle)
+                .on_press(Message::ToggleCommandPalette),
             button(text("+ Tab").size(12))
                 .padding([4, 8])
                 .style(button::secondary)
@@ -1042,7 +1682,16 @@ impl AppState {
             ))
             .width(Length::Fill);
 
-        let bar = row![tabs_scroll, actions]
+        let sidebar_btn = button(text("Profiles").size(12))
+            .padding([4, 8])
+            .style(if self.sidebar.is_open() {
+                button::primary
+            } else {
+                button::subtle
+            })
+            .on_press(Message::ToggleSidebar);
+
+        let bar = row![sidebar_btn, tabs_scroll, actions]
             .spacing(8)
             .padding([6, 8])
             .align_y(Alignment::Center);
@@ -1128,8 +1777,10 @@ impl AppState {
         broadcast: bool,
         show_border: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
-        let ime_enabled =
-            self.pending_paste.is_none() && !(self.search.open && self.search.input_focused);
+        let terminal_focused = focused && !self.command_palette.is_open();
+        let ime_enabled = !self.command_palette.is_open()
+            && self.pending_paste.is_none()
+            && !(self.search.open && self.search.input_focused);
         let options = TerminalViewOptions::from_config(&self.config.terminal, ime_enabled);
         let is_active_session = Some(session_id) == self.active_session_id();
         let (matches, active_match): (Arc<[GridSearchMatch]>, Option<usize>) = if is_active_session
@@ -1143,21 +1794,22 @@ impl AppState {
         };
 
         let content = match self.sessions.get(&session_id) {
-            Some(session) => TerminalViewport::with_focus(
+            Some(SessionRecord::Local(session)) => TerminalViewport::with_focus(
                 session.id,
                 Arc::clone(&session.snapshot),
                 options,
                 matches,
                 active_match,
-                focused,
+                terminal_focused,
             ),
+            Some(SessionRecord::Ssh(slot)) => render_ssh_session_slot(slot),
             None => container("Missing terminal session")
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .into(),
         };
 
-        PaneFrame::new(pane_id, focused, broadcast, show_border, content)
+        PaneFrame::new(pane_id, terminal_focused, broadcast, show_border, content)
     }
 
     fn render_empty_workspace(&self) -> Element<'_, Message, Theme, iced::Renderer> {
@@ -1187,7 +1839,7 @@ impl AppState {
             .or_else(|| {
                 tab.focused_session_id()
                     .and_then(|sid| self.sessions.get(&sid))
-                    .map(|s| s.title.as_str())
+                    .map(SessionRecord::title)
             })
             .unwrap_or("Shell");
 
@@ -1208,11 +1860,12 @@ impl AppState {
 
     /// Computes the window title for `window_id`.
     pub fn title(&self, _window_id: window::Id) -> String {
-        if let Some(session) = self.active_session_id().and_then(|id| self.sessions.get(&id)) {
-            let mut title = match session.exited {
-                Some(Some(code)) => format!("Termewnal — {} [exited: {code}]", session.title),
-                Some(None) => format!("Termewnal — {} [exited]", session.title),
-                None => format!("Termewnal — {}", session.title),
+        if let Some(record) = self.active_session_id().and_then(|id| self.sessions.get(&id)) {
+            let session_title = record.title();
+            let mut title = match record.exited() {
+                Some(Some(code)) => format!("Termewnal — {session_title} [exited: {code}]"),
+                Some(None) => format!("Termewnal — {session_title} [exited]"),
+                None => format!("Termewnal — {session_title}"),
             };
             if self.active_tab_zoomed_pane().is_some() {
                 title.push_str(" [ZOOM]");
@@ -1245,14 +1898,15 @@ impl AppState {
             config_watch_stream,
         );
 
-        let pty_subs = self.sessions.values().map(|session| {
-            Subscription::run_with(
+        let pty_subs = self.sessions.values().filter_map(|record| match record {
+            SessionRecord::Local(session) => Some(Subscription::run_with(
                 PtySubKey {
                     session_id: session.id,
                     pty: Arc::clone(&session.pty),
                 },
                 pty_event_stream,
-            )
+            )),
+            SessionRecord::Ssh(_) => None,
         });
 
         let vault_tick = (self.vault.backend() == VaultBackend::EncryptedFile
@@ -1316,6 +1970,100 @@ impl AppState {
         &self.workspace
     }
 
+    /// Returns the collapsible Left Sidebar state.
+    pub fn sidebar(&self) -> &SidebarState {
+        &self.sidebar
+    }
+
+    /// Returns the Command Palette modal state.
+    pub fn command_palette(&self) -> &CommandPaletteState {
+        &self.command_palette
+    }
+
+    /// Computes an inspectable [`StatusBarSnapshot`] from the active `Session`, `Tunnel`, and `Transfer` state.
+    pub fn status_bar_snapshot(&self) -> StatusBarSnapshot {
+        let active_tab = self.workspace.active_tab();
+        let zoomed = active_tab.is_some_and(|tab| tab.zoomed_pane.is_some());
+        let broadcast = active_tab.is_some_and(|tab| tab.broadcast_input);
+        let active_session = active_tab
+            .and_then(|tab| tab.focused_session_id())
+            .and_then(|sid| self.sessions.get(&sid))
+            .map(|record| match record {
+                SessionRecord::Local(s) => {
+                    let (cols, rows) = (s.snapshot.cols, s.snapshot.rows);
+                    SessionStatusHook {
+                        session_id: s.id,
+                        kind: SessionKindLabel::Local,
+                        title: s.title.clone(),
+                        target: s.pty.shell().display_name.clone(),
+                        cols,
+                        rows,
+                        exited: s.exited,
+                        transport_status: s.transport_status.clone(),
+                        zoomed,
+                        broadcast,
+                    }
+                }
+                SessionRecord::Ssh(slot) => SessionStatusHook {
+                    session_id: slot.id,
+                    kind: SessionKindLabel::Ssh,
+                    title: slot.title.clone(),
+                    target: slot.target.display_addr(),
+                    cols: slot.cols,
+                    rows: slot.rows,
+                    exited: None,
+                    transport_status: slot.transport_status.clone(),
+                    zoomed,
+                    broadcast,
+                },
+            });
+
+        StatusBarSnapshot {
+            active_session,
+            tunnels: self.status_bar.tunnels().clone(),
+            transfers: self.status_bar.transfers().clone(),
+            sidebar_open: self.sidebar.is_open(),
+            transfer_drawer_open: self.status_bar.transfers().drawer_open,
+            last_error: self.last_error.clone(),
+        }
+    }
+
+    /// Builds and fuzzy-filters the Command Palette entries for the current `AppState`.
+    pub fn command_palette_items(&self) -> Vec<PaletteItem> {
+        let active_sid = self.active_session_id();
+        let mut sessions = Vec::new();
+        for tab in self.workspace.tabs() {
+            for sid in tab.root.session_ids() {
+                if let Some(record) = self.sessions.get(&sid) {
+                    let target_label = match record {
+                        SessionRecord::Local(s) => {
+                            format!("Local · {}", s.pty.shell().display_name)
+                        }
+                        SessionRecord::Ssh(slot) => {
+                            format!(
+                                "SSH · {} ({})",
+                                slot.target.display_addr(),
+                                slot.transport_status.label()
+                            )
+                        }
+                    };
+                    sessions.push(PaletteSessionEntry {
+                        session_id: sid,
+                        title: record.title().to_string(),
+                        target_label,
+                        is_active: active_sid == Some(sid),
+                    });
+                }
+            }
+        }
+        self.command_palette.filtered_items(
+            &self.profiles.profiles,
+            &sessions,
+            self.sidebar.system_ssh_profiles(),
+            self.sidebar.active_tunnels(),
+        )
+    }
+
     /// Returns the currently active `TabId`, if any tab is open.
     pub fn active_tab_id(&self) -> Option<TabId> {
         self.workspace.active_tab_id()
@@ -1353,9 +2101,27 @@ impl AppState {
         ))
     }
 
-    /// Returns an immutable reference to a runtime `Session` by `id`.
+    /// Returns an immutable reference to a runtime local shell `Session` by `id`.
     pub fn session(&self, id: SessionId) -> Option<&LocalSession> {
-        self.sessions.get(&id)
+        match self.sessions.get(&id) {
+            Some(SessionRecord::Local(session)) => Some(session),
+            _ => None,
+        }
+    }
+
+    /// Returns an immutable reference to an SSH `Session` slot by `id`.
+    pub fn ssh_session(&self, id: SessionId) -> Option<&SshSessionSlot> {
+        match self.sessions.get(&id) {
+            Some(SessionRecord::Ssh(slot)) => Some(slot),
+            _ => None,
+        }
+    }
+
+    fn update_ssh_slot_status(&mut self, session_id: SessionId, status: TransportStatus) {
+        if let Some(SessionRecord::Ssh(slot)) = self.sessions.get_mut(&session_id) {
+            slot.status_message = format_ssh_slot_message(&slot.target, &status);
+            slot.transport_status = status;
+        }
     }
 
     /// Returns the set of currently open GUI window IDs.
@@ -1522,6 +2288,7 @@ pub fn shortcut_for_key_event(
             | Key::Character("_") => Some(Message::SplitFocusedPane(SplitAxis::Horizontal)),
             Key::Character("z") | Key::Character("Z") => Some(Message::TogglePaneZoom),
             Key::Character("b") | Key::Character("B") => Some(Message::ToggleBroadcastInput),
+            Key::Character("p") | Key::Character("P") => Some(Message::ToggleCommandPalette),
             Key::Character("]") | Key::Character("}") => {
                 Some(Message::CycleFocus(CycleDirection::Next))
             }
@@ -1542,10 +2309,12 @@ pub fn shortcut_for_key_event(
     }
 
     if modifiers.control() && !modifiers.shift() && !modifiers.alt() {
-        if let Key::Named(Named::Tab) = key {
-            return Some(Message::CycleTab(CycleDirection::Next));
-        }
-        return None;
+        return match key.as_ref() {
+            Key::Named(Named::Tab) => Some(Message::CycleTab(CycleDirection::Next)),
+            Key::Character("b") | Key::Character("B") => Some(Message::ToggleSidebar),
+            Key::Character("k") | Key::Character("K") => Some(Message::ToggleCommandPalette),
+            _ => None,
+        };
     }
 
     if modifiers.control() && modifiers.alt() && !modifiers.shift() {
@@ -1559,6 +2328,37 @@ pub fn shortcut_for_key_event(
     }
 
     None
+}
+
+/// Maps key events to workspace or Command Palette modal navigation [`Message`]s.
+pub fn shortcut_for_key_event_with_palette(
+    key: &Key,
+    modifiers: Modifiers,
+    active_tab: Option<TabId>,
+    palette_open: bool,
+) -> Option<Message> {
+    if palette_open {
+        if let Some(msg) = shortcut_for_key_event(key, modifiers, active_tab)
+            && matches!(
+                msg,
+                Message::ToggleCommandPalette | Message::ToggleSidebar
+            )
+        {
+            return Some(msg);
+        }
+        if modifiers.is_empty() {
+            return match key {
+                Key::Named(Named::Escape) => Some(Message::CloseCommandPalette),
+                Key::Named(Named::ArrowDown) => Some(Message::CommandPaletteSelectNext),
+                Key::Named(Named::ArrowUp) => Some(Message::CommandPaletteSelectPrevious),
+                Key::Named(Named::Enter) => Some(Message::CommandPaletteConfirm),
+                _ => None,
+            };
+        }
+        return None;
+    }
+
+    shortcut_for_key_event(key, modifiers, active_tab)
 }
 
 fn render_broadcast_banner(banner_text: String) -> Element<'static, Message, Theme, iced::Renderer> {
@@ -1586,5 +2386,86 @@ fn render_broadcast_banner(banner_text: String) -> Element<'static, Message, The
             text_color: Some(Color::WHITE),
             ..Default::default()
         })
+        .into()
+}
+
+pub(crate) fn default_os_username() -> String {
+    std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "root".to_string())
+}
+
+fn format_ssh_slot_message(target: &SshSessionTarget, status: &TransportStatus) -> String {
+    let addr = target.display_addr();
+    match status {
+        TransportStatus::Disconnected => format!("Disconnected ({addr})"),
+        TransportStatus::Connecting => {
+            format!("SSH transport ready for Ticket 07 wiring ({addr})")
+        }
+        TransportStatus::Connected { latency_ms: Some(ms) } => {
+            format!("Connected to {addr} ({ms} ms)")
+        }
+        TransportStatus::Connected { latency_ms: None } => format!("Connected to {addr}"),
+        TransportStatus::Degraded { missed_probes } => {
+            format!("Transport degraded ({missed_probes} missed keepalive probes)")
+        }
+        TransportStatus::Reconnecting {
+            attempt,
+            next_retry_secs,
+        } => format!("Reconnecting attempt #{attempt} in {next_retry_secs}s..."),
+    }
+}
+
+fn render_ssh_session_slot(
+    slot: &SshSessionSlot,
+) -> Element<'static, Message, Theme, iced::Renderer> {
+    let addr = slot.target.display_addr();
+    let mut details = column![
+        text(format!("SSH Session: {}", slot.title)).size(16),
+        text(format!("Target: {addr}")).size(13),
+        text(format!("Transport: {}", slot.transport_status.label())).size(13),
+        text(slot.status_message.clone())
+            .size(12)
+            .color(Color::from_rgb8(148, 163, 184)),
+    ]
+    .spacing(6);
+
+    if !slot.target.proxy_jump.is_empty() {
+        details = details.push(
+            text(format!("ProxyJump: {}", slot.target.proxy_jump.join(" -> ")))
+                .size(12)
+                .color(Color::from_rgb8(148, 163, 184)),
+        );
+    }
+    if let Some(tmux) = &slot.target.tmux_reattach {
+        details = details.push(
+            text(format!("Multiplexer attach: {tmux}"))
+                .size(12)
+                .color(Color::from_rgb8(148, 163, 184)),
+        );
+    }
+
+    let action_btn = match slot.transport_status {
+        TransportStatus::Disconnected => button(text("Connect").size(12))
+            .padding([6, 12])
+            .style(button::primary)
+            .on_press(Message::ConnectSshSession(slot.id)),
+        _ => button(text("Disconnect").size(12))
+            .padding([6, 12])
+            .style(button::secondary)
+            .on_press(Message::DisconnectSshSession(slot.id)),
+    };
+
+    details = details.push(action_btn);
+
+    container(details)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .padding(20)
         .into()
 }

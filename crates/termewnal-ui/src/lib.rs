@@ -1,14 +1,32 @@
 //! Termewnal desktop UI application state and terminal viewport widget.
 
 pub mod app;
+pub mod command_palette;
 pub mod config_reload_ui;
+pub mod sidebar;
 pub mod split_view;
+pub mod status_bar;
 pub mod terminal_ergonomics;
 pub mod terminal_widget;
 pub mod workspace;
 
-pub use app::{AppState, LocalSession, Message, SessionId, shortcut_for_key_event};
+pub use app::{
+    AppState, LaunchDisposition, LocalSession, Message, SessionId, SshSessionSlot,
+    SshSessionTarget, shortcut_for_key_event, shortcut_for_key_event_with_palette,
+};
+pub use command_palette::{
+    CommandPaletteMode, CommandPaletteState, PaletteAction, PaletteCategory, PaletteItem,
+    PaletteSessionEntry, QuickConnectTarget, fuzzy_score,
+};
 pub use config_reload_ui::ConfigReloadUiState;
+pub use sidebar::{
+    ActiveTunnelEntry, ProfileGroupView, SidebarSection, SidebarState, SystemSshProfile,
+    TunnelRuntimeState, UNGROUPED_LABEL,
+};
+pub use status_bar::{
+    SessionKindLabel, SessionStatusHook, StatusBarAction, StatusBarSnapshot, StatusBarState,
+    TransferSummaryHook, TunnelSummaryHook,
+};
 pub use terminal_ergonomics::{
     FileDropAction, PendingPaste, SearchBarState, classify_file_drop, format_paste_bytes,
     is_multiline_paste,
