@@ -8,3 +8,5 @@ mod sftp_and_transfers;
 mod ssh_auth_and_session;
 #[path = "suite/stub.rs"]
 mod stub;
+#[path = "suite/tunnels.rs"]
+mod tunnels;

@@ -909,6 +909,8 @@ fn convert_tunnels(ports: &[TabbyRawForwardedPort]) -> Vec<TunnelRule> {
             target_host,
             target_port,
             standalone: entry.standalone.unwrap_or(false),
+            allow_public_bind: false,
+            hold_grace_secs: None,
         });
     }
     rules
