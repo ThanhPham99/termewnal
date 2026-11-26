@@ -60,6 +60,9 @@ fn ctrl_shift_e_and_status_bar_toggle_and_resize_sftp_drawer() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
         AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+    let _ = state.update(Message::OpenSettingsModal);
+    let _ = state.update(Message::SettingsMinimizeToTrayToggled(false));
+    let _ = state.update(Message::SettingsSave);
     let win = window::Id::unique();
     let _ = state.update(Message::WindowOpened(win));
 
@@ -199,6 +202,9 @@ fn transfer_queue_ui_updates_pause_resume_cancel_retry_status_bar_and_close_guar
 
     let mut state =
         AppState::boot_with_paths(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+    let _ = state.update(Message::OpenSettingsModal);
+    let _ = state.update(Message::SettingsMinimizeToTrayToggled(false));
+    let _ = state.update(Message::SettingsSave);
     let win = window::Id::unique();
     let _ = state.update(Message::WindowOpened(win));
 

@@ -364,6 +364,9 @@ async fn creating_and_toggling_standalone_socks5_tunnel_updates_sidebar_status_b
 
     let mut state = super::common::boot_test_app_with_vault(paths.clone(), vault).unwrap();
     state.set_known_hosts_path(known_hosts);
+    let _ = state.update(Message::OpenSettingsModal);
+    let _ = state.update(Message::SettingsMinimizeToTrayToggled(false));
+    let _ = state.update(Message::SettingsSave);
     let win = window::Id::unique();
     let _ = state.update(Message::WindowOpened(win));
 
@@ -721,6 +724,9 @@ async fn creating_standalone_remote_tunnel_allows_remote_zero_bind_forwards_and_
 
     let mut state = super::common::boot_test_app_with_vault(paths.clone(), vault).unwrap();
     state.set_known_hosts_path(known_hosts);
+    let _ = state.update(Message::OpenSettingsModal);
+    let _ = state.update(Message::SettingsMinimizeToTrayToggled(false));
+    let _ = state.update(Message::SettingsSave);
     let win = window::Id::unique();
     let _ = state.update(Message::WindowOpened(win));
 

@@ -13,11 +13,18 @@ use termewnal_ui::{
     BackgroundWorkStatus, CloseGuardState, DaemonLifecycle, Message, SplitAxis, SplitNode,
 };
 
+fn disable_minimize_to_tray(state: &mut termewnal_ui::AppState) {
+    let _ = state.update(Message::OpenSettingsModal);
+    let _ = state.update(Message::SettingsMinimizeToTrayToggled(false));
+    let _ = state.update(Message::SettingsSave);
+}
+
 #[test]
 fn close_guard_triggers_only_on_last_window_when_background_work_is_active() {
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
         super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+    disable_minimize_to_tray(&mut state);
 
     let w1 = window::Id::unique();
     let w2 = window::Id::unique();
@@ -94,6 +101,7 @@ fn close_guard_stop_and_quit_stops_background_work_and_idle_last_window_exits_di
     let temp = TempDir::new().expect("create temp XDG root");
     let mut state =
         super::common::boot_test_app(ConfigPaths::from_root(temp.path())).expect("boot AppState");
+    disable_minimize_to_tray(&mut state);
     let w1 = window::Id::unique();
     let _ = state.update(Message::WindowOpened(w1));
 
@@ -119,6 +127,7 @@ fn close_guard_stop_and_quit_stops_background_work_and_idle_last_window_exits_di
     let temp2 = TempDir::new().expect("create second temp XDG root");
     let mut idle_state =
         super::common::boot_test_app(ConfigPaths::from_root(temp2.path())).expect("boot idle AppState");
+    disable_minimize_to_tray(&mut idle_state);
     let w2 = window::Id::unique();
     let _ = idle_state.update(Message::WindowOpened(w2));
 

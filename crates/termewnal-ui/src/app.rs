@@ -1347,6 +1347,8 @@ pub enum Message {
     },
     SettingsHideTabIndexToggled(bool),
     SettingsFlexTabsToggled(bool),
+    SettingsTrayEnabledToggled(bool),
+    SettingsMinimizeToTrayToggled(bool),
     SettingsThemeOverrideChanged {
         field: ThemeOverrideField,
         value: String,
@@ -1598,6 +1600,7 @@ pub struct AppState {
     docker_runner_factory: Arc<dyn Fn() -> Box<dyn CommandOutputRunner> + Send + Sync>,
     sync_service: Arc<ConfigSyncService>,
     quake: QuakeController,
+    desktop_integrations_enabled: bool,
     tray_hidden: bool,
     tray_adapter: Arc<dyn SystemTrayAdapter>,
     tray_rx: Option<Arc<Mutex<Option<mpsc::UnboundedReceiver<TrayAction>>>>>,
@@ -1666,6 +1669,7 @@ impl AppState {
     }
 
     fn enable_desktop_integrations(&mut self) {
+        self.desktop_integrations_enabled = true;
         if self.config.tray.enabled {
             let (tray_tx, tray_rx) = mpsc::unbounded_channel();
             self.tray_adapter = default_system_tray(tray_tx);
@@ -1844,6 +1848,7 @@ impl AppState {
             docker_runner_factory: Arc::new(|| Box::new(OsCommandRunner)),
             sync_service: Arc::new(ConfigSyncService::new()),
             quake: QuakeController::default(),
+            desktop_integrations_enabled: false,
             tray_hidden: false,
             tray_adapter: Arc::new(NullSystemTray),
             tray_rx: None,
@@ -3463,6 +3468,29 @@ impl AppState {
                 self.command_palette.close();
                 self.toggle_tunnel(&tunnel_id)
             }
+            PaletteAction::QuitApp => {
+                self.command_palette.close();
+                let status = self.background_work_source.status();
+                if status.has_active_work() {
+                    let target_window = self
+                        .target_window_id(window_scope)
+                        .filter(|id| Some(*id) != self.quake.window_id())
+                        .or_else(|| self.non_quake_windows().into_iter().next());
+                    if let Some(wid) = target_window {
+                        self.close_guard = CloseGuardState::Confirming {
+                            window_id: wid,
+                            active_standalone_tunnels: status.active_standalone_tunnels,
+                            active_transfers: status.active_transfers,
+                        };
+                        if self.tray_hidden {
+                            return self.restore_tray_hidden_windows();
+                        }
+                        return Task::none();
+                    }
+                }
+                self.hotkey_guard = None;
+                self.update(Message::CloseGuardStopAndQuit)
+            }
         }
     }
 
@@ -4218,6 +4246,11 @@ impl AppState {
             Message::WindowFocused(id) => {
                 if self.windows.contains(&id) {
                     self.active_window = Some(id);
+                    if Some(id) != self.quake.window_id() && self.tray_hidden {
+                        self.tray_hidden = false;
+                        self.lifecycle = DaemonLifecycle::Active;
+                        self.sync_tray_state();
+                    }
                 }
                 Task::none()
             }
@@ -4269,6 +4302,9 @@ impl AppState {
             Message::NewWindow => self.open_coordinated_window(),
             Message::IpcCommand(cmd) => match cmd {
                 IpcCommand::OpenWindow => {
+                    if self.tray_hidden && !self.non_quake_windows().is_empty() {
+                        return self.restore_tray_hidden_windows();
+                    }
                     self.tray_hidden = false;
                     if self.windows.is_empty()
                         && self.lifecycle == DaemonLifecycle::BackgroundRunning
@@ -4296,10 +4332,7 @@ impl AppState {
                     task
                 }
                 IpcCommand::OpenTab { profile_id, cwd } => {
-                    self.tray_hidden = false;
-                    let task = self.open_tab_in_window_with_cwd(None, profile_id.as_deref(), cwd);
-                    self.sync_tray_state();
-                    task
+                    self.open_tab_restoring_tray(profile_id.as_deref(), cwd)
                 }
                 IpcCommand::ToggleQuake => self.toggle_quake_window(),
             },
@@ -4309,8 +4342,13 @@ impl AppState {
                     self.sync_tray_state();
                     return window::set_mode(id, window::Mode::Hidden);
                 }
-                let is_last_window = self.windows.len() <= 1;
+                let is_last_window = self.non_quake_windows().len() <= 1;
                 if is_last_window {
+                    if self.should_minimize_to_tray_on_close() {
+                        self.save_layout_best_effort();
+                        self.close_guard = CloseGuardState::Idle;
+                        return self.minimize_windows_to_tray(vec![id]);
+                    }
                     let status = self.background_work_source.status();
                     if status.has_active_work() {
                         self.close_guard = CloseGuardState::Confirming {
@@ -6530,6 +6568,14 @@ impl AppState {
                 self.apply_live_settings_preview();
                 Task::none()
             }
+            Message::SettingsTrayEnabledToggled(enabled) => {
+                self.settings_ui.set_tray_enabled(enabled);
+                Task::none()
+            }
+            Message::SettingsMinimizeToTrayToggled(enabled) => {
+                self.settings_ui.set_minimize_to_tray(enabled);
+                Task::none()
+            }
             Message::SettingsThemeOverrideChanged { field, value } => {
                 self.settings_ui.set_theme_override(field, value);
                 self.apply_live_settings_preview();
@@ -7353,48 +7399,91 @@ impl AppState {
         ])
     }
 
+    fn non_quake_windows(&self) -> Vec<window::Id> {
+        let quake_id = self.quake.window_id();
+        self.windows
+            .iter()
+            .copied()
+            .filter(|id| Some(*id) != quake_id)
+            .collect()
+    }
+
+    fn should_minimize_to_tray_on_close(&self) -> bool {
+        self.config.tray.enabled && self.config.tray.minimize_to_tray
+    }
+
+    fn minimize_windows_to_tray(&mut self, windows: Vec<window::Id>) -> Task<Message> {
+        self.tray_hidden = true;
+        self.lifecycle = DaemonLifecycle::BackgroundRunning;
+        self.sync_tray_state();
+        Task::batch(
+            windows
+                .into_iter()
+                .map(|id| window::set_mode(id, window::Mode::Hidden)),
+        )
+    }
+
+    fn restore_tray_hidden_windows(&mut self) -> Task<Message> {
+        let non_quake = self.non_quake_windows();
+        if non_quake.is_empty() {
+            return Task::none();
+        }
+        self.tray_hidden = false;
+        self.lifecycle = DaemonLifecycle::Active;
+        let focus_target = self
+            .active_window
+            .filter(|id| non_quake.contains(id))
+            .unwrap_or(non_quake[0]);
+        self.active_window = Some(focus_target);
+        let mut tasks: Vec<Task<Message>> = non_quake
+            .into_iter()
+            .flat_map(|id| {
+                [
+                    window::set_mode(id, window::Mode::Windowed),
+                    window::minimize(id, false),
+                ]
+            })
+            .collect();
+        tasks.push(window::gain_focus(focus_target));
+        self.sync_tray_state();
+        Task::batch(tasks)
+    }
+
+    fn open_tab_restoring_tray(
+        &mut self,
+        profile_id: Option<&str>,
+        cwd: Option<PathBuf>,
+    ) -> Task<Message> {
+        let restore_task = if self.tray_hidden && !self.non_quake_windows().is_empty() {
+            Some(self.restore_tray_hidden_windows())
+        } else {
+            self.tray_hidden = false;
+            self.lifecycle = DaemonLifecycle::Active;
+            None
+        };
+        let open_task = self.open_tab_in_window_with_cwd(None, profile_id, cwd);
+        self.sync_tray_state();
+        match restore_task {
+            Some(restore) => Task::batch([restore, open_task]),
+            None => open_task,
+        }
+    }
+
     fn handle_tray_action(&mut self, action: TrayAction) -> Task<Message> {
         match action {
             TrayAction::ShowOrHideWindow => {
-                let quake_id = self.quake.window_id();
-                let non_quake: Vec<window::Id> = self
-                    .windows
-                    .iter()
-                    .copied()
-                    .filter(|id| Some(*id) != quake_id)
-                    .collect();
+                let non_quake = self.non_quake_windows();
                 if !non_quake.is_empty() && !self.tray_hidden {
-                    self.tray_hidden = true;
-                    self.lifecycle = DaemonLifecycle::BackgroundRunning;
-                    self.sync_tray_state();
-                    Task::batch(
-                        non_quake
-                            .into_iter()
-                            .map(|id| window::set_mode(id, window::Mode::Hidden)),
-                    )
+                    self.minimize_windows_to_tray(non_quake)
                 } else if !non_quake.is_empty() {
-                    self.tray_hidden = false;
-                    self.lifecycle = DaemonLifecycle::Active;
-                    let first = non_quake[0];
-                    self.active_window = Some(first);
-                    let mut tasks: Vec<Task<Message>> = non_quake
-                        .into_iter()
-                        .map(|id| window::set_mode(id, window::Mode::Windowed))
-                        .collect();
-                    tasks.push(window::gain_focus(first));
-                    self.sync_tray_state();
-                    Task::batch(tasks)
+                    self.restore_tray_hidden_windows()
                 } else {
                     self.update(Message::IpcCommand(IpcCommand::OpenWindow))
                 }
             }
             TrayAction::ToggleQuake => self.toggle_quake_window(),
             TrayAction::LaunchProfile(profile_id) => {
-                self.tray_hidden = false;
-                self.lifecycle = DaemonLifecycle::Active;
-                let task = self.open_tab_in_window_with_cwd(None, Some(&profile_id), None);
-                self.sync_tray_state();
-                task
+                self.open_tab_restoring_tray(Some(&profile_id), None)
             }
             TrayAction::Quit => {
                 self.hotkey_guard = None;
@@ -7989,6 +8078,7 @@ impl AppState {
             && next_cfg.sync.provider != SyncProviderKind::None
             && (!next_cfg.sync.encrypt_bundle
                 || !self.settings_ui.sync_passphrase_draft().trim().is_empty());
+        let prev_tray_enabled = self.config.tray.enabled;
         self.config = next_cfg;
         self.settings_origin_config = None;
         self.rebuild_runtime_config_caches();
@@ -7996,14 +8086,30 @@ impl AppState {
         self.transfer_queue
             .set_transfer_config(self.config.transfer.clone());
         self.vault.apply_config(&self.config.vault);
+        let mut follow_up_tasks = Vec::new();
+        if self.desktop_integrations_enabled && prev_tray_enabled != self.config.tray.enabled {
+            if self.config.tray.enabled {
+                let (tray_tx, tray_rx) = mpsc::unbounded_channel();
+                self.tray_adapter = default_system_tray(tray_tx);
+                self.tray_rx = Some(Arc::new(Mutex::new(Some(tray_rx))));
+            } else {
+                self.tray_adapter = Arc::new(NullSystemTray);
+                self.tray_rx = None;
+                if self.tray_hidden {
+                    follow_up_tasks.push(self.restore_tray_hidden_windows());
+                }
+            }
+        }
+        self.sync_tray_state();
         self.last_error = None;
         if auto_sync {
-            let task = self.trigger_sync_task(true);
-            self.settings_ui.close();
-            task
-        } else {
-            self.settings_ui.close();
+            follow_up_tasks.push(self.trigger_sync_task(true));
+        }
+        self.settings_ui.close();
+        if follow_up_tasks.is_empty() {
             Task::none()
+        } else {
+            Task::batch(follow_up_tasks)
         }
     }
 

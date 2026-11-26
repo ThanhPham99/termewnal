@@ -289,6 +289,83 @@ fn system_tray_hide_show_tunnel_telemetry_profile_launch_and_quit() {
 }
 
 #[test]
+fn system_bar_close_minimizes_last_window_to_tray_and_ipc_restores_without_duplicating() {
+    let dir = TempDir::new().unwrap();
+    let paths = ConfigPaths::from_root(dir.path().to_path_buf());
+
+    let tray = RecordingSystemTray::new();
+    let mut state = boot_test_app(paths.clone())
+        .unwrap()
+        .with_tray_adapter(Arc::clone(&tray) as Arc<dyn termewnal_ui::SystemTrayAdapter>);
+    let w1 = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(w1));
+    let _ = state.update(Message::NewWindow);
+    assert_eq!(state.windows().len(), 2);
+    let w2 = *state.windows().iter().find(|&&id| id != w1).unwrap();
+
+    // Closing a non-last window closes only that window rather than hiding remaining windows.
+    let _ = state.update(Message::CloseRequested(w1));
+    assert!(!state.is_minimized_to_tray());
+    let _ = state.update(Message::WindowClosed(w1));
+    assert_eq!(state.windows().len(), 1);
+    assert!(state.windows().contains(&w2));
+
+    // Even with active background work, closing the last window minimizes to tray by default.
+    let tracker = state.background_work_tracker().clone();
+    tracker.set_active_standalone_tunnels(1);
+    tracker.set_active_transfers(1);
+    let sid = state.window_workspace(w2).unwrap().session_ids()[0];
+
+    let _ = state.update(Message::CloseRequested(w2));
+    assert!(state.is_minimized_to_tray());
+    assert_eq!(state.lifecycle(), DaemonLifecycle::BackgroundRunning);
+    assert_eq!(state.close_guard(), termewnal_ui::CloseGuardState::Idle);
+    assert!(state.windows().contains(&w2));
+    assert!(state.session(sid).is_some());
+    assert!(!tracker.stop_requested());
+    assert!(!tray.latest().unwrap().window_visible);
+    assert!(
+        tray.latest()
+            .unwrap()
+            .menu_entries()
+            .iter()
+            .any(|item| item.label == "Show Window")
+    );
+
+    // Relaunching via IPC OpenWindow restores the hidden window instead of spawning a second one.
+    let _ = state.update(Message::IpcCommand(IpcCommand::OpenWindow));
+    assert!(!state.is_minimized_to_tray());
+    assert_eq!(state.lifecycle(), DaemonLifecycle::Active);
+    assert_eq!(state.windows().len(), 1);
+    assert!(state.windows().contains(&w2));
+    assert!(tray.latest().unwrap().window_visible);
+
+    // Minimize again via CloseRequested, then open a new tab via IPC -> unhides and adds tab to w2.
+    let _ = state.update(Message::CloseRequested(w2));
+    assert!(state.is_minimized_to_tray());
+    let tabs_before = state.window_workspace(w2).unwrap().tab_count();
+    let _ = state.update(Message::IpcCommand(IpcCommand::OpenTab {
+        profile_id: None,
+        cwd: None,
+    }));
+    assert!(!state.is_minimized_to_tray());
+    assert_eq!(state.windows().len(), 1);
+    assert_eq!(state.window_workspace(w2).unwrap().tab_count(), tabs_before + 1);
+
+    // Explicit Quit from Command Palette triggers Close Guard when background work is active.
+    let _ = state.update(Message::CommandPaletteExecuteItem(
+        termewnal_ui::command_palette::PaletteAction::QuitApp,
+    ));
+    assert!(matches!(
+        state.close_guard(),
+        termewnal_ui::CloseGuardState::Confirming { window_id, .. } if window_id == w2
+    ));
+    let _ = state.update(Message::CloseGuardStopAndQuit);
+    assert_eq!(state.lifecycle(), DaemonLifecycle::Exiting);
+    assert!(tracker.stop_requested());
+}
+
+#[test]
 fn cli_flags_parse_and_ipc_cwd_profile_and_toggle_quake_dispatch() {
     assert_eq!(
         parse_cli_launch_command(Vec::<&str>::new()),

@@ -71,6 +71,28 @@ cp "$ROOT_DIR/assets/termewnal-icon.png" "$DEB_STAGE/usr/share/icons/hicolor/512
 chmod 0644 "$DEB_STAGE/usr/share/icons/hicolor/512x512/apps/termewnal.png"
 
 INSTALLED_SIZE_KB="$(du -sk "$DEB_STAGE/usr" | awk '{print $1}')"
+RUNTIME_SHLIBS="libc6, libgcc-s1"
+if command -v dpkg-shlibdeps >/dev/null 2>&1; then
+    SHLIB_TMP="$PKG_ROOT/.shlibdeps"
+    rm -rf "$SHLIB_TMP"
+    mkdir -p "$SHLIB_TMP/debian"
+    cat > "$SHLIB_TMP/debian/control" <<EOF
+Source: termewnal
+Maintainer: Thanh Pham <thanhpham110699@gmail.com>
+
+Package: termewnal
+Architecture: ${ARCH}
+EOF
+    if SHLIB_OUT="$(cd "$SHLIB_TMP" && dpkg-shlibdeps -O "$DEB_STAGE/usr/bin/termewnal" 2>/dev/null)"; then
+        COMPUTED_DEPS="${SHLIB_OUT#shlibs:Depends=}"
+        if [[ -n "$COMPUTED_DEPS" ]]; then
+            RUNTIME_SHLIBS="$COMPUTED_DEPS"
+        fi
+    fi
+    rm -rf "$SHLIB_TMP"
+fi
+DEB_DEPENDS="${RUNTIME_SHLIBS}, libxkbcommon0, libfontconfig1"
+
 cat > "$DEB_STAGE/DEBIAN/control" <<EOF
 Package: termewnal
 Version: ${VERSION}
@@ -78,7 +100,7 @@ Section: utils
 Priority: optional
 Architecture: ${ARCH}
 Installed-Size: ${INSTALLED_SIZE_KB}
-Depends: libc6, libgcc-s1, libxkbcommon0, libfontconfig1
+Depends: ${DEB_DEPENDS}
 Recommends: libwayland-client0, libx11-6, libdbus-1-3, libvulkan1
 Maintainer: Thanh Pham <thanhpham110699@gmail.com>
 Homepage: https://thanhpham99.github.io/apps/termewnal/

@@ -324,6 +324,16 @@ impl SettingsUiState {
         self.saved_notice = None;
     }
 
+    pub fn set_tray_enabled(&mut self, enabled: bool) {
+        self.draft.tray.enabled = enabled;
+        self.saved_notice = None;
+    }
+
+    pub fn set_minimize_to_tray(&mut self, enabled: bool) {
+        self.draft.tray.minimize_to_tray = enabled;
+        self.saved_notice = None;
+    }
+
     pub fn set_theme_override(&mut self, field: ThemeOverrideField, value: String) {
         let opt = (!value.trim().is_empty())
             .then(|| value.trim().to_string())
@@ -1492,6 +1502,32 @@ impl SettingsUiState {
                     self.draft.terminal.show_server_stats,
                     "Show server stats bar",
                     Message::SettingsShowServerStatsToggled,
+                    chrome,
+                ),
+                compact_form,
+                chrome,
+            ),
+            hairline_h(chrome),
+            form_line(
+                "System tray",
+                Some("Show Termewnal icon in the desktop notification area"),
+                apple_checkbox(
+                    self.draft.tray.enabled,
+                    "Enable system tray icon",
+                    Message::SettingsTrayEnabledToggled,
+                    chrome,
+                ),
+                compact_form,
+                chrome,
+            ),
+            hairline_h(chrome),
+            form_line(
+                "Close to tray",
+                Some("Minimize to tray instead of quitting when closing the last window"),
+                apple_checkbox(
+                    self.draft.tray.minimize_to_tray,
+                    "Minimize to tray on close",
+                    Message::SettingsMinimizeToTrayToggled,
                     chrome,
                 ),
                 compact_form,

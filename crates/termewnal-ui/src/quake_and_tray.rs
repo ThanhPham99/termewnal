@@ -592,284 +592,321 @@ impl SystemTrayAdapter for RecordingSystemTray {
 
 #[cfg(target_os = "linux")]
 mod linux_sni {
+    use std::sync::atomic::AtomicU32;
+    use tokio::sync::Notify;
+    use zbus::object_server::SignalEmitter;
+
     use super::*;
 
     struct SniService {
-    snapshot: Arc<Mutex<TrayStateSnapshot>>,
-    action_tx: mpsc::UnboundedSender<TrayAction>,
-}
-
-#[interface(name = "org.kde.StatusNotifierItem")]
-impl SniService {
-    #[zbus(property)]
-    fn category(&self) -> &str {
-        "ApplicationStatus"
+        snapshot: Arc<Mutex<TrayStateSnapshot>>,
+        action_tx: mpsc::UnboundedSender<TrayAction>,
     }
 
-    #[zbus(property)]
-    fn id(&self) -> &str {
-        "termewnal"
-    }
-
-    #[zbus(property)]
-    fn title(&self) -> &str {
-        "Termewnal"
-    }
-
-    #[zbus(property)]
-    fn status(&self) -> &str {
-        "Active"
-    }
-
-    #[zbus(property)]
-    fn icon_name(&self) -> &str {
-        "utilities-terminal"
-    }
-
-    #[zbus(property)]
-    fn icon_pixmap(&self) -> Vec<(i32, i32, Vec<u8>)> {
-        let mut argb = Vec::with_capacity(crate::window_chrome::APP_ICON_64_RGBA.len());
-        for rgba in crate::window_chrome::APP_ICON_64_RGBA.chunks_exact(4) {
-            argb.extend_from_slice(&[rgba[3], rgba[0], rgba[1], rgba[2]]);
+    #[interface(name = "org.kde.StatusNotifierItem")]
+    impl SniService {
+        #[zbus(property)]
+        fn category(&self) -> &str {
+            "ApplicationStatus"
         }
-        let side = crate::window_chrome::APP_ICON_SIZE as i32;
-        vec![(side, side, argb)]
-    }
 
-    #[zbus(property)]
-    fn item_is_menu(&self) -> bool {
-        false
-    }
-
-    #[zbus(property)]
-    fn menu(&self) -> ObjectPath<'_> {
-        ObjectPath::from_static_str_unchecked("/MenuBar")
-    }
-
-    #[zbus(property)]
-    fn tool_tip(&self) -> (String, Vec<(i32, i32, Vec<u8>)>, String, String) {
-        let body = self
-            .snapshot
-            .lock()
-            .expect("tray snapshot mutex")
-            .tooltip_text();
-        (
-            "utilities-terminal".to_string(),
-            Vec::new(),
-            "Termewnal".to_string(),
-            body,
-        )
-    }
-
-    fn activate(&self, _x: i32, _y: i32) {
-        let _ = self.action_tx.send(TrayAction::ShowOrHideWindow);
-    }
-
-    fn secondary_activate(&self, _x: i32, _y: i32) {
-        let _ = self.action_tx.send(TrayAction::ToggleQuake);
-    }
-}
-
-struct DbusMenuService {
-    snapshot: Arc<Mutex<TrayStateSnapshot>>,
-    action_tx: mpsc::UnboundedSender<TrayAction>,
-}
-
-fn owned_str(s: &str) -> OwnedValue {
-    Value::from(s)
-        .try_to_owned()
-        .expect("string converts to OwnedValue")
-}
-
-#[interface(name = "com.canonical.dbusmenu")]
-impl DbusMenuService {
-    #[zbus(property)]
-    fn version(&self) -> u32 {
-        4
-    }
-
-    #[zbus(property)]
-    fn status(&self) -> &str {
-        "normal"
-    }
-
-    fn get_layout(
-        &self,
-        parent_id: i32,
-        _recursion_depth: i32,
-        _property_names: Vec<String>,
-    ) -> (u32, (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>)) {
-        if parent_id != 0 {
-            return (1, (parent_id, HashMap::new(), Vec::new()));
+        #[zbus(property)]
+        fn id(&self) -> &str {
+            "termewnal"
         }
-        let entries = self
-            .snapshot
-            .lock()
-            .expect("tray snapshot mutex")
-            .menu_entries();
-        let mut children = Vec::with_capacity(entries.len());
-        for entry in entries {
-            let mut props = HashMap::new();
-            props.insert("label".to_string(), owned_str(&entry.label));
-            props.insert(
-                "enabled".to_string(),
-                OwnedValue::from(entry.enabled),
-            );
-            props.insert("visible".to_string(), OwnedValue::from(true));
-            let child_node: (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>) =
-                (entry.id, props, Vec::new());
-            if let Ok(val) = Value::from(child_node).try_to_owned() {
-                children.push(val);
+
+        #[zbus(property)]
+        fn title(&self) -> &str {
+            "Termewnal"
+        }
+
+        #[zbus(property)]
+        fn status(&self) -> &str {
+            "Active"
+        }
+
+        #[zbus(property)]
+        fn icon_name(&self) -> &str {
+            "utilities-terminal"
+        }
+
+        #[zbus(property)]
+        fn icon_pixmap(&self) -> Vec<(i32, i32, Vec<u8>)> {
+            let mut argb = Vec::with_capacity(crate::window_chrome::APP_ICON_64_RGBA.len());
+            for rgba in crate::window_chrome::APP_ICON_64_RGBA.chunks_exact(4) {
+                argb.extend_from_slice(&[rgba[3], rgba[0], rgba[1], rgba[2]]);
+            }
+            let side = crate::window_chrome::APP_ICON_SIZE as i32;
+            vec![(side, side, argb)]
+        }
+
+        #[zbus(property)]
+        fn item_is_menu(&self) -> bool {
+            false
+        }
+
+        #[zbus(property)]
+        fn menu(&self) -> ObjectPath<'_> {
+            ObjectPath::from_static_str_unchecked("/MenuBar")
+        }
+
+        #[zbus(property)]
+        fn tool_tip(&self) -> (String, Vec<(i32, i32, Vec<u8>)>, String, String) {
+            let body = self
+                .snapshot
+                .lock()
+                .expect("tray snapshot mutex")
+                .tooltip_text();
+            (
+                "utilities-terminal".to_string(),
+                Vec::new(),
+                "Termewnal".to_string(),
+                body,
+            )
+        }
+
+        #[zbus(signal)]
+        async fn new_tool_tip(emitter: &SignalEmitter<'_>) -> zbus::Result<()>;
+
+        fn activate(&self, _x: i32, _y: i32) {
+            let _ = self.action_tx.send(TrayAction::ShowOrHideWindow);
+        }
+
+        fn secondary_activate(&self, _x: i32, _y: i32) {
+            let _ = self.action_tx.send(TrayAction::ToggleQuake);
+        }
+    }
+
+    struct DbusMenuService {
+        snapshot: Arc<Mutex<TrayStateSnapshot>>,
+        action_tx: mpsc::UnboundedSender<TrayAction>,
+        revision: Arc<AtomicU32>,
+    }
+
+    fn owned_str(s: &str) -> OwnedValue {
+        Value::from(s)
+            .try_to_owned()
+            .expect("string converts to OwnedValue")
+    }
+
+    #[interface(name = "com.canonical.dbusmenu")]
+    impl DbusMenuService {
+        #[zbus(property)]
+        fn version(&self) -> u32 {
+            4
+        }
+
+        #[zbus(property)]
+        fn status(&self) -> &str {
+            "normal"
+        }
+
+        #[zbus(signal)]
+        async fn layout_updated(
+            emitter: &SignalEmitter<'_>,
+            revision: u32,
+            parent: i32,
+        ) -> zbus::Result<()>;
+
+        fn get_layout(
+            &self,
+            parent_id: i32,
+            _recursion_depth: i32,
+            _property_names: Vec<String>,
+        ) -> (u32, (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>)) {
+            let rev = self.revision.load(Ordering::SeqCst);
+            if parent_id != 0 {
+                return (rev, (parent_id, HashMap::new(), Vec::new()));
+            }
+            let entries = self
+                .snapshot
+                .lock()
+                .expect("tray snapshot mutex")
+                .menu_entries();
+            let mut children = Vec::with_capacity(entries.len());
+            for entry in entries {
+                let mut props = HashMap::new();
+                props.insert("label".to_string(), owned_str(&entry.label));
+                props.insert("enabled".to_string(), OwnedValue::from(entry.enabled));
+                props.insert("visible".to_string(), OwnedValue::from(true));
+                let child_node: (i32, HashMap<String, OwnedValue>, Vec<OwnedValue>) =
+                    (entry.id, props, Vec::new());
+                if let Ok(val) = Value::from(child_node).try_to_owned() {
+                    children.push(val);
+                }
+            }
+            let mut root_props = HashMap::new();
+            root_props.insert("children-display".to_string(), owned_str("submenu"));
+            (rev, (0, root_props, children))
+        }
+
+        fn get_group_properties(
+            &self,
+            ids: Vec<i32>,
+            _property_names: Vec<String>,
+        ) -> Vec<(i32, HashMap<String, OwnedValue>)> {
+            let entries = self
+                .snapshot
+                .lock()
+                .expect("tray snapshot mutex")
+                .menu_entries();
+            ids.into_iter()
+                .filter_map(|id| {
+                    entries.iter().find(|e| e.id == id).map(|e| {
+                        let mut props = HashMap::new();
+                        props.insert("label".to_string(), owned_str(&e.label));
+                        props.insert("enabled".to_string(), OwnedValue::from(e.enabled));
+                        (id, props)
+                    })
+                })
+                .collect()
+        }
+
+        fn event(&self, id: i32, event_id: &str, _data: OwnedValue, _timestamp: u32) {
+            if event_id != "clicked" {
+                return;
+            }
+            let action = {
+                let guard = self.snapshot.lock().expect("tray snapshot mutex");
+                guard
+                    .menu_entries()
+                    .into_iter()
+                    .find(|item| item.id == id)
+                    .and_then(|item| item.action)
+            };
+            if let Some(act) = action {
+                let _ = self.action_tx.send(act);
             }
         }
-        let mut root_props = HashMap::new();
-        root_props.insert(
-            "children-display".to_string(),
-            owned_str("submenu"),
-        );
-        (1, (0, root_props, children))
+
+        fn about_to_show(&self, _id: i32) -> bool {
+            true
+        }
     }
 
-    fn get_group_properties(
-        &self,
-        ids: Vec<i32>,
-        _property_names: Vec<String>,
-    ) -> Vec<(i32, HashMap<String, OwnedValue>)> {
-        let entries = self
-            .snapshot
-            .lock()
-            .expect("tray snapshot mutex")
-            .menu_entries();
-        ids.into_iter()
-            .filter_map(|id| {
-                entries.iter().find(|e| e.id == id).map(|e| {
-                    let mut props = HashMap::new();
-                    props.insert("label".to_string(), owned_str(&e.label));
-                    props.insert("enabled".to_string(), OwnedValue::from(e.enabled));
-                    (id, props)
+    /// Linux FreeDesktop `org.kde.StatusNotifierItem` System Tray implementation over `zbus`.
+    pub struct ZbusStatusNotifierItem {
+        snapshot: Arc<Mutex<TrayStateSnapshot>>,
+        revision: Arc<AtomicU32>,
+        state_changed: Arc<Notify>,
+        stop: Arc<AtomicBool>,
+        thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    }
+
+    impl ZbusStatusNotifierItem {
+        /// Spawns a background D-Bus StatusNotifierItem host registration when session D-Bus is available.
+        ///
+        /// Gracefully degrades on headless/non-DBus environments without panicking.
+        pub fn spawn(action_tx: mpsc::UnboundedSender<TrayAction>) -> Arc<Self> {
+            let snapshot = Arc::new(Mutex::new(TrayStateSnapshot::default()));
+            let revision = Arc::new(AtomicU32::new(1));
+            let state_changed = Arc::new(Notify::new());
+            let stop = Arc::new(AtomicBool::new(false));
+            let snap_bg = Arc::clone(&snapshot);
+            let rev_bg = Arc::clone(&revision);
+            let notify_bg = Arc::clone(&state_changed);
+            let stop_bg = Arc::clone(&stop);
+
+            let thread = std::thread::Builder::new()
+                .name("termewnal-sni-tray".to_string())
+                .spawn(move || {
+                    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    else {
+                        return;
+                    };
+                    rt.block_on(async move {
+                        let sni = SniService {
+                            snapshot: Arc::clone(&snap_bg),
+                            action_tx: action_tx.clone(),
+                        };
+                        let menu = DbusMenuService {
+                            snapshot: snap_bg,
+                            action_tx,
+                            revision: Arc::clone(&rev_bg),
+                        };
+                        let bus_name = format!("org.kde.StatusNotifierItem-{}-1", std::process::id());
+                        let Ok(builder) = zbus::connection::Builder::session() else {
+                            debug!("D-Bus session bus unavailable; skipping StatusNotifierItem registration");
+                            return;
+                        };
+                        let Ok(builder) = builder.name(bus_name.as_str()) else {
+                            return;
+                        };
+                        let Ok(builder) = builder.serve_at("/StatusNotifierItem", sni) else {
+                            return;
+                        };
+                        let Ok(builder) = builder.serve_at("/MenuBar", menu) else {
+                            return;
+                        };
+                        let Ok(conn) = builder.build().await else {
+                            debug!("failed publishing StatusNotifierItem objects on session D-Bus");
+                            return;
+                        };
+                        let _ = conn
+                            .call_method(
+                                Some("org.kde.StatusNotifierWatcher"),
+                                "/StatusNotifierWatcher",
+                                Some("org.kde.StatusNotifierWatcher"),
+                                "RegisterStatusNotifierItem",
+                                &(bus_name.as_str(),),
+                            )
+                            .await;
+                        while !stop_bg.load(Ordering::SeqCst) {
+                            tokio::select! {
+                                _ = notify_bg.notified() => {
+                                    let rev = rev_bg.load(Ordering::SeqCst);
+                                    if let Ok(menu_iface) = conn.object_server().interface::<_, DbusMenuService>("/MenuBar").await {
+                                        let _ = menu_iface.layout_updated(rev, 0).await;
+                                    }
+                                    if let Ok(sni_iface) = conn.object_server().interface::<_, SniService>("/StatusNotifierItem").await {
+                                        let _ = sni_iface.new_tool_tip().await;
+                                    }
+                                }
+                                _ = tokio::time::sleep(Duration::from_millis(150)) => {}
+                            }
+                        }
+                    });
                 })
+                .ok();
+
+            Arc::new(Self {
+                snapshot,
+                revision,
+                state_changed,
+                stop,
+                thread: Mutex::new(thread),
             })
-            .collect()
-    }
-
-    fn event(&self, id: i32, event_id: &str, _data: OwnedValue, _timestamp: u32) {
-        if event_id != "clicked" {
-            return;
-        }
-        let action = {
-            let guard = self.snapshot.lock().expect("tray snapshot mutex");
-            guard
-                .menu_entries()
-                .into_iter()
-                .find(|item| item.id == id)
-                .and_then(|item| item.action)
-        };
-        if let Some(act) = action {
-            let _ = self.action_tx.send(act);
         }
     }
 
-    fn about_to_show(&self, _id: i32) -> bool {
-        false
-    }
-}
-
-/// Linux FreeDesktop `org.kde.StatusNotifierItem` System Tray implementation over `zbus`.
-pub struct ZbusStatusNotifierItem {
-    snapshot: Arc<Mutex<TrayStateSnapshot>>,
-    stop: Arc<AtomicBool>,
-    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
-}
-
-impl ZbusStatusNotifierItem {
-    /// Spawns a background D-Bus StatusNotifierItem host registration when session D-Bus is available.
-    ///
-    /// Gracefully degrades on headless/non-DBus environments without panicking.
-    pub fn spawn(action_tx: mpsc::UnboundedSender<TrayAction>) -> Arc<Self> {
-        let snapshot = Arc::new(Mutex::new(TrayStateSnapshot::default()));
-        let stop = Arc::new(AtomicBool::new(false));
-        let snap_bg = Arc::clone(&snapshot);
-        let stop_bg = Arc::clone(&stop);
-
-        let thread = std::thread::Builder::new()
-            .name("termewnal-sni-tray".to_string())
-            .spawn(move || {
-                let Ok(rt) = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                else {
-                    return;
-                };
-                rt.block_on(async move {
-                    let sni = SniService {
-                        snapshot: Arc::clone(&snap_bg),
-                        action_tx: action_tx.clone(),
-                    };
-                    let menu = DbusMenuService {
-                        snapshot: snap_bg,
-                        action_tx,
-                    };
-                    let bus_name = format!("org.kde.StatusNotifierItem-{}-1", std::process::id());
-                    let Ok(builder) = zbus::connection::Builder::session() else {
-                        debug!("D-Bus session bus unavailable; skipping StatusNotifierItem registration");
-                        return;
-                    };
-                    let Ok(builder) = builder.name(bus_name.as_str()) else {
-                        return;
-                    };
-                    let Ok(builder) = builder.serve_at("/StatusNotifierItem", sni) else {
-                        return;
-                    };
-                    let Ok(builder) = builder.serve_at("/MenuBar", menu) else {
-                        return;
-                    };
-                    let Ok(conn) = builder.build().await else {
-                        debug!("failed publishing StatusNotifierItem objects on session D-Bus");
-                        return;
-                    };
-                    let _ = conn
-                        .call_method(
-                            Some("org.kde.StatusNotifierWatcher"),
-                            "/StatusNotifierWatcher",
-                            Some("org.kde.StatusNotifierWatcher"),
-                            "RegisterStatusNotifierItem",
-                            &(bus_name.as_str(),),
-                        )
-                        .await;
-                    while !stop_bg.load(Ordering::SeqCst) {
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                    }
-                });
-            })
-            .ok();
-
-        Arc::new(Self {
-            snapshot,
-            stop,
-            thread: Mutex::new(thread),
-        })
-    }
-}
-
-impl Drop for ZbusStatusNotifierItem {
-    fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
-        if let Ok(mut guard) = self.thread.lock()
-            && let Some(join) = guard.take()
-        {
-            let _ = join.join();
+    impl Drop for ZbusStatusNotifierItem {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            self.state_changed.notify_one();
+            if let Ok(mut guard) = self.thread.lock()
+                && let Some(join) = guard.take()
+            {
+                let _ = join.join();
+            }
         }
     }
-}
 
-impl SystemTrayAdapter for ZbusStatusNotifierItem {
-    fn update_state(&self, snapshot: TrayStateSnapshot) {
-        *self
-            .snapshot
-            .lock()
-            .expect("tray snapshot mutex poisoned") = snapshot;
+    impl SystemTrayAdapter for ZbusStatusNotifierItem {
+        fn update_state(&self, snapshot: TrayStateSnapshot) {
+            let mut guard = self
+                .snapshot
+                .lock()
+                .expect("tray snapshot mutex poisoned");
+            if *guard != snapshot {
+                *guard = snapshot;
+                drop(guard);
+                self.revision.fetch_add(1, Ordering::SeqCst);
+                self.state_changed.notify_one();
+            }
+        }
     }
-}
 }
 
 #[cfg(target_os = "linux")]

@@ -174,6 +174,7 @@ pub enum PaletteAction {
     OpenProtocolLauncher,
     TriggerZmodemSend,
     RunQuickCommand(String),
+    QuitApp,
 }
 
 /// Lightweight active `Session` summary supplied to the Command Palette switcher.
@@ -897,6 +898,20 @@ fn workspace_command_items() -> Vec<PaletteItem> {
             keywords: vec!["close".to_string(), "pane".to_string(), "kill".to_string()],
             shortcut: Some("Ctrl+Shift+W".to_string()),
             action: PaletteAction::CloseFocusedPane,
+        },
+        PaletteItem {
+            id: "cmd:quit-app".to_string(),
+            category: PaletteCategory::Command,
+            title: "Quit Termewnal".to_string(),
+            subtitle: "Stop active sessions and exit Termewnal completely".to_string(),
+            keywords: vec![
+                "quit".to_string(),
+                "exit".to_string(),
+                "shutdown".to_string(),
+                "terminate".to_string(),
+            ],
+            shortcut: None,
+            action: PaletteAction::QuitApp,
         },
     ]
 }
