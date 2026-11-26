@@ -81,81 +81,9 @@ jobs:
             dist/termewnal_${{ steps.meta.outputs.version }}_amd64.deb
             dist/termewnal-${{ steps.meta.outputs.version }}-linux-x86_64.tar.gz
 
-  build-windows:
-    name: Build Windows (x86_64)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: Ensure NSIS is available
-        shell: pwsh
-        run: |
-          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) {
-            choco install nsis -y
-          }
-
-      - name: Determine version
-        id: meta
-        shell: pwsh
-        run: |
-          $ver = "${{ inputs.version }}"
-          if (-not $ver -and "$env:GITHUB_REF" -like "refs/tags/v*") {
-            $ver = "$env:GITHUB_REF".Substring("refs/tags/v".Length)
-          }
-          if (-not $ver) {
-            $match = Select-String -Path "Cargo.toml" -Pattern '^version = "([^"]+)"' | Select-Object -First 1
-            $ver = $match.Matches[0].Groups[1].Value
-          }
-          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-
-      - name: Run workspace checks & tests
-        run: |
-          cargo check --workspace --all-targets
-          cargo test --workspace
-
-      - name: Build Windows release binary
-        run: cargo build --release -p termewnal-ui --bin termewnal
-
-      - name: Package Windows NSIS installer and portable ZIP
-        shell: pwsh
-        run: |
-          $ver = "${{ steps.meta.outputs.version }}"
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-
-          $nsisArgs = @(
-            "/DVERSION=$ver",
-            "/DBIN_PATH=..\target\release\termewnal.exe",
-            "/DOUT_FILE=..\dist\termewnal-$ver-windows-x86_64-setup.exe",
-            "scripts\termewnal.nsi"
-          )
-          makensis.exe @nsisArgs
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-
-          $zipStage = "target\pkg\termewnal-$ver-windows-x86_64"
-          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $zipStage
-          New-Item -ItemType Directory -Force -Path $zipStage | Out-Null
-          Copy-Item "target\release\termewnal.exe" "$zipStage\termewnal.exe"
-          Copy-Item "README.md" "$zipStage\README.md"
-          Compress-Archive -Path "$zipStage\*" -DestinationPath "dist\termewnal-$ver-windows-x86_64.zip" -Force
-
-      - name: Upload Windows release artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: windows-artifacts
-          path: |
-            dist/termewnal-${{ steps.meta.outputs.version }}-windows-x86_64-setup.exe
-            dist/termewnal-${{ steps.meta.outputs.version }}-windows-x86_64.zip
-
   publish-release:
     name: Publish GitHub Release
-    needs: [build-linux, build-windows]
+    needs: [build-linux]
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
