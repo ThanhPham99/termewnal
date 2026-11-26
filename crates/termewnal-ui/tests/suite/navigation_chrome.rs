@@ -1,4 +1,5 @@
-use std::time::Duration;
+use std::fs;
+use std::time::{Duration, Instant};
 
 use iced::keyboard::{Key, Modifiers, key::Named};
 use tempfile::TempDir;
@@ -9,8 +10,8 @@ use termewnal_core::{
 use termewnal_ssh::TransportStatus;
 use termewnal_ui::command_palette::{CommandPaletteMode, PaletteAction, QuickConnectTarget};
 use termewnal_ui::sidebar::{
-    ActiveTunnelEntry, SidebarFilterScope, SidebarSection, SystemSshProfile, TunnelRuntimeState,
-    UNGROUPED_LABEL,
+    ActiveTunnelEntry, SidebarFilterScope, SidebarSection, SidebarSelectedEntry, SidebarState,
+    SystemSshProfile, TunnelRuntimeState, UNGROUPED_LABEL,
 };
 use termewnal_ui::status_bar::{
     SessionKindLabel, StatusBarAction, TransferSummaryHook, TunnelSummaryHook,
@@ -995,4 +996,90 @@ fn sidebar_right_click_group_management_and_drag_drop_workflows() {
     drop(state.view(win));
     let _ = state.update(Message::ExternalFilesLeft);
     assert!(state.drag_drop().external_file_hover.is_none());
+}
+
+#[test]
+fn sidebar_requires_double_click_to_connect_saved_profiles_and_system_ssh() {
+    let mut sb = SidebarState::new();
+    let t0 = Instant::now();
+    assert!(!sb.handle_profile_click("p1", t0));
+    assert!(sb.is_profile_selected("p1"));
+    // Slow second click resets timer instead of connecting.
+    let t1 = t0 + Duration::from_millis(500);
+    assert!(!sb.handle_profile_click("p1", t1));
+    // Clicking another entry switches selection without connecting.
+    let t2 = t1 + Duration::from_millis(100);
+    assert!(!sb.handle_system_ssh_click("host-a", t2));
+    assert!(!sb.is_profile_selected("p1"));
+    assert!(sb.is_system_ssh_selected("host-a"));
+    // Rapid second click on the same entry confirms double-click and resets click state.
+    let t3 = t2 + Duration::from_millis(120);
+    assert!(sb.handle_system_ssh_click("host-a", t3));
+    let t4 = t3 + Duration::from_millis(80);
+    assert!(!sb.handle_system_ssh_click("host-a", t4));
+
+    let temp = TempDir::new().expect("temp dir");
+    let ssh_dir = temp.path().join(".ssh");
+    fs::create_dir_all(&ssh_dir).expect("create .ssh");
+    fs::write(
+        ssh_dir.join("config"),
+        "Host db-host\n    HostName 10.90.0.5\n    User dbops\n",
+    )
+    .expect("write ssh config");
+
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut prof_a = Profile::local_shell("Alpha Shell", None);
+    prof_a.id = "prof-a".to_string();
+    let mut prof_b = Profile::local_shell("Beta Shell", None);
+    prof_b.id = "prof-b".to_string();
+    let mut cfg = ProfilesConfig::default();
+    cfg.profiles = vec![prof_a, prof_b];
+    save_profiles(&paths, &cfg).expect("save profiles");
+
+    let mut state = super::common::boot_test_app(paths).expect("boot AppState");
+    let win = iced::window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+    assert_eq!(state.workspace().tab_count(), 1);
+
+    // Single-click selects Prof A without opening a session.
+    let _ = state.update(Message::SidebarProfileClicked("prof-a".to_string()));
+    assert_eq!(
+        state.sidebar().selected_entry(),
+        Some(&SidebarSelectedEntry::Profile("prof-a".to_string()))
+    );
+    assert_eq!(state.workspace().tab_count(), 1);
+
+    // Clicking Prof B immediately switches selection without launching Prof A or Prof B.
+    let _ = state.update(Message::SidebarProfileClicked("prof-b".to_string()));
+    assert_eq!(
+        state.sidebar().selected_entry(),
+        Some(&SidebarSelectedEntry::Profile("prof-b".to_string()))
+    );
+    assert_eq!(state.workspace().tab_count(), 1);
+    drop(state.view(win));
+
+    // Double-clicking Prof B connects/opens a new tab with Prof B.
+    let _ = state.update(Message::SidebarProfileClicked("prof-b".to_string()));
+    assert_eq!(state.workspace().tab_count(), 2);
+    let sid_b = state.active_session_id().expect("prof-b session active");
+    assert_eq!(
+        state.session(sid_b).and_then(|s| s.profile_id()),
+        Some("prof-b")
+    );
+
+    // Single-click selects ~/.ssh/config entry without launching; second click connects.
+    let _ = state.update(Message::SidebarSystemSshClicked("db-host".to_string()));
+    assert_eq!(
+        state.sidebar().selected_entry(),
+        Some(&SidebarSelectedEntry::SystemSsh("db-host".to_string()))
+    );
+    assert_eq!(state.workspace().tab_count(), 2);
+    drop(state.view(win));
+
+    let _ = state.update(Message::SidebarSystemSshClicked("db-host".to_string()));
+    assert_eq!(state.workspace().tab_count(), 3);
+    let ssh_sid = state.active_session_id().expect("system ssh active");
+    let slot = state.ssh_session(ssh_sid).expect("system ssh slot");
+    assert_eq!(slot.target().host, "10.90.0.5");
+    assert_eq!(slot.target().username, "dbops");
 }

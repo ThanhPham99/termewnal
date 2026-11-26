@@ -2,6 +2,8 @@
 //! derived from the active [`ThemePalette`], matching `Eugeny/tabby`'s `themes.service.ts` and
 //! `theme.new.scss`.
 
+use std::time::Instant;
+
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
 use iced::advanced::renderer::{self, Quad};
@@ -16,7 +18,9 @@ use iced::{
     Alignment, Background, Border, Color, Element, Event, Font, Length, Padding, Point, Rectangle,
     Shadow, Size, Theme, Vector, font, keyboard, mouse,
 };
-use termewnal_core::{RgbColor, ThemePalette};
+use termewnal_core::{
+    DEFAULT_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, RgbColor, ThemePalette,
+};
 
 /// Tabby desktop typography scale (`14px` base from `$font-size-base: 14rem / 16`).
 pub const FONT_TITLE: f32 = 18.0;
@@ -75,13 +79,91 @@ impl ViewportTier {
     }
 }
 
-/// Computes the responsive width for the always-visible Profile Sidebar.
+/// Computes the default responsive width for the Left Sidebar.
 pub fn sidebar_width_for_window(window_width: f32) -> f32 {
     match ViewportTier::from_width(window_width) {
-        ViewportTier::Wide => 250.0,
+        ViewportTier::Wide => DEFAULT_SIDEBAR_WIDTH,
         ViewportTier::Medium => 224.0,
         ViewportTier::Compact => (window_width * 0.30).clamp(176.0, 212.0),
     }
+}
+
+/// Clamps a persisted Left Sidebar width to safe bounds inside `window_width`.
+pub fn clamp_sidebar_width(preferred_width: f32, window_width: f32) -> f32 {
+    let preferred = if preferred_width.is_finite() {
+        preferred_width
+    } else {
+        DEFAULT_SIDEBAR_WIDTH
+    };
+    let max_for_window = (window_width - 260.0).max(MIN_SIDEBAR_WIDTH);
+    let upper = MAX_SIDEBAR_WIDTH.min(max_for_window);
+    let lower = MIN_SIDEBAR_WIDTH.min(upper);
+    preferred.clamp(lower, upper)
+}
+
+const DIVIDER_DOUBLE_CLICK_MS: u64 = 400;
+
+/// Outcome of pressing a resizable divider handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DividerPress {
+    StartDrag,
+    DoubleClickReset,
+}
+
+/// Shared widget state for draggable pane/sidebar/drawer dividers with double-click reset.
+#[derive(Debug, Default)]
+pub struct DividerDragState {
+    pub dragging: bool,
+    pub hovered: bool,
+    last_click_at: Option<Instant>,
+}
+
+impl DividerDragState {
+    /// Records a left mouse press on the divider and distinguishes drag vs double-click reset.
+    pub fn on_left_press(&mut self, now: Instant) -> DividerPress {
+        let is_double = self
+            .last_click_at
+            .is_some_and(|prev| now.duration_since(prev).as_millis() <= u128::from(DIVIDER_DOUBLE_CLICK_MS));
+        if is_double {
+            self.last_click_at = None;
+            self.dragging = false;
+            DividerPress::DoubleClickReset
+        } else {
+            self.last_click_at = Some(now);
+            self.dragging = true;
+            DividerPress::StartDrag
+        }
+    }
+}
+
+/// Renders a 1px interactive divider quad with accent highlighting on hover/drag.
+pub fn draw_interactive_divider(
+    renderer: &mut iced::Renderer,
+    theme: &Theme,
+    bounds: Rectangle,
+    state: &DividerDragState,
+    base_alpha: f32,
+) {
+    use iced::advanced::renderer::Renderer as _;
+
+    let ext = theme.extended_palette();
+    let color = if state.dragging || state.hovered {
+        ext.primary.strong.color
+    } else {
+        Color {
+            a: base_alpha,
+            ..ext.background.strong.color
+        }
+    };
+    renderer.fill_quad(
+        Quad {
+            bounds,
+            border: Border::default(),
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        Background::Color(color),
+    );
 }
 
 /// Computes a responsive modal width clamped inside `window_width` with comfortable gutters.

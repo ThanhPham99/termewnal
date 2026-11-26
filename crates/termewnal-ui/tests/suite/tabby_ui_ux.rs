@@ -418,8 +418,14 @@ fn modal_focus_isolation_and_multi_theme_and_welcome_views_render_cleanly() {
     let _ = state.update(Message::WindowOpened(win));
     let _ = state.update(Message::SetSidebarOpen(true));
     let _ = state.update(Message::SetSftpDrawerOpen(true));
+    assert!(!state.sftp_drawer().is_open());
 
-    // Render every built-in theme with sidebar + SFTP drawer open.
+    let ssh_profile = Profile::ssh("Render Host", "10.0.0.1", 22, "ops", termewnal_core::SshAuthMethod::Agent);
+    let _ = state.update(Message::OpenSshProfile(ssh_profile));
+    let _ = state.update(Message::SetSftpDrawerOpen(true));
+    assert!(state.sftp_drawer().is_open());
+
+    // Render every built-in theme with sidebar + per-pane SFTP panel open.
     for theme in BuiltinTheme::ALL {
         let mut tcfg = state.config().terminal.clone();
         tcfg.theme = theme.name().to_string();
@@ -450,9 +456,10 @@ fn modal_focus_isolation_and_multi_theme_and_welcome_views_render_cleanly() {
     let _ = state.update(Message::EscapePressed);
     assert!(!state.has_modal_open());
 
-    // Closing the active tab exposes the Tabby-style Welcome launcher view with saved profiles.
-    let tab_id = state.active_tab_id().expect("active tab");
-    let _ = state.update(Message::CloseTab(tab_id));
+    // Closing all open tabs exposes the Tabby-style Welcome launcher view with saved profiles.
+    while let Some(tab_id) = state.active_tab_id() {
+        let _ = state.update(Message::CloseTab(tab_id));
+    }
     assert!(state.active_tab_id().is_none());
     drop(state.view(win));
 }
@@ -517,7 +524,7 @@ fn responsive_apple_hig_layout_renders_across_all_viewport_tiers() {
     assert!(state.config().terminal.flex_tabs);
     let _ = state.update(Message::SettingsSave);
 
-    // Sidebar remains open regardless of SetSidebarOpen/ToggleSidebar alongside SFTP Drawer.
+    // Sidebar remains open regardless of SetSidebarOpen/ToggleSidebar alongside SFTP+ Panel.
     let _ = state.update(Message::SetSidebarOpen(false));
     assert!(state.sidebar().is_open());
     let _ = state.update(Message::ToggleSftpDrawer);

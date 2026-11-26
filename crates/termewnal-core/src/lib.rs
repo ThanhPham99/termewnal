@@ -22,9 +22,11 @@ pub use collections::{
 pub use config::{
     AppConfig, BellBehavior, CURRENT_SCHEMA_VERSION, ConfigPaths, CursorStyle,
     DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_KEEPALIVE_MAX_MISSED, DEFAULT_PART_THRESHOLD_BYTES,
-    HighlightRule, QuakeConfig, QuakeEdge, RightClickAction, SyncConfig, SyncProviderKind,
-    TabBarPosition, TerminalConfig, TransferConfig, TransferConflictPolicy, TrayConfig,
-    VaultBackend, VaultConfig, WindowConfig, ensure_config_files, load_config, save_config,
+    DEFAULT_SFTP_PANEL_WIDTH, DEFAULT_SIDEBAR_WIDTH, HighlightRule, MAX_SFTP_PANEL_WIDTH,
+    MAX_SIDEBAR_WIDTH, MIN_SFTP_PANEL_WIDTH, MIN_SIDEBAR_WIDTH, QuakeConfig, QuakeEdge,
+    RightClickAction, SyncConfig, SyncProviderKind, TabBarPosition, TerminalConfig, TransferConfig,
+    TransferConflictPolicy, TrayConfig, VaultBackend, VaultConfig, WindowConfig,
+    ensure_config_files, load_config, save_config,
 };
 pub use error::CoreError;
 pub use hot_reload::{

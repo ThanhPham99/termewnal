@@ -2,7 +2,7 @@
 Unicode True
 
 !ifndef VERSION
-  !define VERSION "1.0.1"
+  !define VERSION "1.0.2"
 !endif
 
 !ifndef BIN_PATH

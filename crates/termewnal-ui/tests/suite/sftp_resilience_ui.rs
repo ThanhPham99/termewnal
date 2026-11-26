@@ -572,12 +572,15 @@ async fn slice6_recursive_folder_drop_and_sftp_dir_download_preserve_permissions
 
     let (addr, host_pubkey, _srv_state, _shutdown) =
         spawn_ui_resilience_server(remote_root.clone()).await;
-    let (mut state, win, _sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
+    let (mut state, win, sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
     state.set_sftp_download_dir(local_dl.clone());
 
-    let _ = state.update(Message::ToggleSftpDrawer);
-    let _ = state.update(Message::SftpNavigateTo("/".to_string()));
-    let _ = state.update(Message::SftpDrawerFileDropped {
+    let _ = state.update(Message::SftpSessionNavigateTo {
+        session_id: sid,
+        path: "/".to_string(),
+    });
+    let _ = state.update(Message::SftpSessionFileDropped {
+        session_id: sid,
         path: local_src.clone(),
     });
 
@@ -612,15 +615,8 @@ async fn slice6_recursive_folder_drop_and_sftp_dir_download_preserve_permissions
         assert!(state.sftp_drawer().last_transfer_notice().is_some());
     }
 
-    // Trigger recursive folder download action via Message::SftpDownloadDir.
-    let _ = state.update(Message::SftpDownloadDir {
-        remote_path: "/bundle_dir".to_string(),
-        dir_name: "bundle_dir".to_string(),
-    });
-    // Drive the directory walk task via TransferQueue directly as well if headless test doesn't poll iced::Task.
-    let slot = state
-        .ssh_session(state.active_session_id().unwrap())
-        .unwrap();
+    // Drive recursive folder download result into SftpSessionDirEnqueueResult.
+    let slot = state.ssh_session(sid).unwrap();
     let endpoint = termewnal_ssh::SftpEndpoint::new(
         termewnal_ssh::ProfileTransportKey::from_connect_config(
             None,
@@ -638,7 +634,8 @@ async fn slice6_recursive_folder_drop_and_sftp_dir_download_preserve_permissions
         )
         .await
         .unwrap();
-    let _ = state.update(Message::SftpDirEnqueueResult {
+    let _ = state.update(Message::SftpSessionDirEnqueueResult {
+        session_id: sid,
         result: Ok(dl_summary),
     });
     assert!(state.transfer_queue().wait_until_idle(Duration::from_secs(10)).await);
@@ -680,12 +677,16 @@ async fn slice6_conflict_dialog_renders_and_resolves_rename_skip_and_apply_to_al
 
     let (addr, host_pubkey, _srv_state, _shutdown) =
         spawn_ui_resilience_server(remote_root.clone()).await;
-    let (mut state, win, _sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
+    let (mut state, win, sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
 
-    let _ = state.update(Message::ToggleSftpDrawer);
-    let _ = state.update(Message::SftpNavigateTo("/".to_string()));
+    assert!(state.sftp_drawer().is_open());
+    let _ = state.update(Message::SftpSessionNavigateTo {
+        session_id: sid,
+        path: "/".to_string(),
+    });
     for name in ["a.txt", "b.txt", "c.txt"] {
-        let _ = state.update(Message::SftpDrawerFileDropped {
+        let _ = state.update(Message::SftpSessionFileDropped {
+            session_id: sid,
             path: uploads.join(name),
         });
     }
@@ -766,15 +767,21 @@ async fn slice6_part_fallback_notice_and_config_hot_reload_propagate_to_queue() 
         .unwrap()
         .insert("/large.bin.termewnal.part".to_string());
 
-    let (mut state, win, _sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
-    let _ = state.update(Message::ToggleSftpDrawer);
-    let _ = state.update(Message::SftpNavigateTo("/".to_string()));
+    let (mut state, win, sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
+    assert!(state.sftp_drawer().is_open());
+    let _ = state.update(Message::SftpSessionNavigateTo {
+        session_id: sid,
+        path: "/".to_string(),
+    });
 
     let payload = vec![0x77u8; 1_200_000];
     let local_large = uploads.join("large.bin");
     fs::write(&local_large, &payload).unwrap();
 
-    let _ = state.update(Message::SftpDrawerFileDropped { path: local_large });
+    let _ = state.update(Message::SftpSessionFileDropped {
+        session_id: sid,
+        path: local_large,
+    });
     assert!(state.transfer_queue().wait_until_idle(Duration::from_secs(10)).await);
     let _ = state.update(Message::TransferQueueUpdated(
         state.transfer_queue().snapshot(),
@@ -825,7 +832,7 @@ async fn slice6_sftp_download_rejects_path_traversal_file_and_dir_names_with_bro
 
     let (addr, host_pubkey, _srv_state, _shutdown) =
         spawn_ui_resilience_server(remote_root).await;
-    let (mut state, _win, _sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
+    let (mut state, _win, sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
     state.set_sftp_download_dir(dl_dir.clone());
 
     for bad_name in [
@@ -838,9 +845,19 @@ async fn slice6_sftp_download_rejects_path_traversal_file_and_dir_names_with_bro
         "..",
         "",
     ] {
-        let _ = state.update(Message::SftpDownloadFile {
-            remote_path: "/secret.txt".to_string(),
-            file_name: bad_name.to_string(),
+        let _ = state.update(Message::SftpSessionDownloadToPicked {
+            session_id: sid,
+            entries: vec![termewnal_ui::sftp_plus::FileBrowserEntry {
+                name: bad_name.to_string(),
+                full_path: "/secret.txt".to_string(),
+                is_dir: false,
+                is_symlink: false,
+                symlink_target: None,
+                size: 6,
+                modified_unix_secs: None,
+                permissions: None,
+            }],
+            dest_dir: Some(dl_dir.clone()),
         });
         assert!(
             state.sftp_drawer().browser_error().is_some(),
@@ -848,12 +865,25 @@ async fn slice6_sftp_download_rejects_path_traversal_file_and_dir_names_with_bro
         );
         assert!(state.transfer_queue().snapshot().transfers.is_empty());
 
-        let _ = state.update(Message::SftpNavigateTo("/".to_string()));
+        let _ = state.update(Message::SftpSessionNavigateTo {
+            session_id: sid,
+            path: "/".to_string(),
+        });
         assert!(state.sftp_drawer().browser_error().is_none());
 
-        let _ = state.update(Message::SftpDownloadDir {
-            remote_path: "/evil_dir".to_string(),
-            dir_name: bad_name.to_string(),
+        let _ = state.update(Message::SftpSessionDownloadToPicked {
+            session_id: sid,
+            entries: vec![termewnal_ui::sftp_plus::FileBrowserEntry {
+                name: bad_name.to_string(),
+                full_path: "/evil_dir".to_string(),
+                is_dir: true,
+                is_symlink: false,
+                symlink_target: None,
+                size: 0,
+                modified_unix_secs: None,
+                permissions: None,
+            }],
+            dest_dir: Some(dl_dir.clone()),
         });
         assert!(
             state.sftp_drawer().browser_error().is_some(),
@@ -861,7 +891,10 @@ async fn slice6_sftp_download_rejects_path_traversal_file_and_dir_names_with_bro
         );
         assert!(state.transfer_queue().snapshot().transfers.is_empty());
 
-        let _ = state.update(Message::SftpNavigateTo("/".to_string()));
+        let _ = state.update(Message::SftpSessionNavigateTo {
+            session_id: sid,
+            path: "/".to_string(),
+        });
     }
 
     assert!(!temp.path().join("escape.txt").exists());
@@ -874,7 +907,7 @@ async fn sftp_drawer_and_plus_display_auto_reconnecting_and_reconnected_successf
         ProfileTransportKey, RemoteListing, SftpTransportMode, TransferDirection, TransferId,
         TransferQueueSnapshot, TransferReconnectState, TransferSnapshot, TransferStatus,
     };
-    use termewnal_ui::{RecoveryNoticeKind, SftpConnectionState, SftpLayoutMode};
+    use termewnal_ui::{RecoveryNoticeKind, SftpConnectionState};
 
     let temp = TempDir::new().unwrap();
     let remote_root = temp.path().join("remote");
@@ -883,8 +916,8 @@ async fn sftp_drawer_and_plus_display_auto_reconnecting_and_reconnected_successf
         spawn_ui_resilience_server(remote_root).await;
     let (mut state, win, sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
 
-    let _ = state.update(Message::ToggleSftpDrawerForSession(sid));
-    let _ = state.update(Message::SftpRefresh);
+    assert!(state.sftp_drawer().is_open());
+    let _ = state.update(Message::SftpSessionRefresh(sid));
     let gen_drop = state.sftp_drawer().list_generation();
 
     // Connection error triggers AutoReconnecting instead of leaving a dead browser_error.
@@ -905,11 +938,9 @@ async fn sftp_drawer_and_plus_display_auto_reconnecting_and_reconnected_successf
     );
     assert!(bar_reconn.sftp_notice.as_ref().unwrap().message.contains("auto-reconnecting"));
     let _ = state.view(win);
-    let _ = state.update(Message::SftpSetLayoutMode(SftpLayoutMode::DualHorizontal));
-    let _ = state.view(win);
 
     // Subsequent successful listing transitions SFTP to ReconnectedSuccessfully.
-    let _ = state.update(Message::SftpRefresh);
+    let _ = state.update(Message::SftpSessionRefresh(sid));
     let gen_ok = state.sftp_drawer().list_generation();
     let _ = state.update(Message::SftpBrowseResult {
         session_id: sid,
@@ -932,11 +963,9 @@ async fn sftp_drawer_and_plus_display_auto_reconnecting_and_reconnected_successf
     );
     assert!(bar_ok.sftp_notice.as_ref().unwrap().message.contains("reconnected successfully"));
     let _ = state.view(win);
-    let _ = state.update(Message::SftpSetLayoutMode(SftpLayoutMode::SideDock));
-    let _ = state.view(win);
 
     // Non-connection error still surfaces browser_error normally.
-    let _ = state.update(Message::SftpRefresh);
+    let _ = state.update(Message::SftpSessionRefresh(sid));
     let gen_perm = state.sftp_drawer().list_generation();
     let _ = state.update(Message::SftpBrowseResult {
         session_id: sid,
@@ -1035,4 +1064,50 @@ async fn sftp_drawer_and_plus_display_auto_reconnecting_and_reconnected_successf
             .contains("Transfer reconnected successfully")
     );
     let _ = state.view(win);
+}
+
+#[tokio::test]
+async fn sftp_manager_status_and_probe_recovery_resume_dropped_transfers() {
+    use termewnal_ssh::{ProfileTransportKey, SftpTransportMode, SftpTransportStatus};
+
+    let temp = TempDir::new().unwrap();
+    let remote_root = temp.path().join("remote");
+    let local_uploads = temp.path().join("uploads");
+    fs::create_dir_all(&remote_root).unwrap();
+    fs::create_dir_all(&local_uploads).unwrap();
+
+    let (addr, host_pubkey, _srv_state, _shutdown) =
+        spawn_ui_resilience_server(remote_root.clone()).await;
+    let (mut state, _win, sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
+    let _ = state.update(Message::SftpSessionNavigateTo {
+        session_id: sid,
+        path: "/".to_string(),
+    });
+
+    let key = {
+        let slot = state.ssh_session(sid).unwrap();
+        ProfileTransportKey::from_connect_config(
+            slot.target().profile_id.clone(),
+            &slot.spec().connect_config,
+        )
+    };
+    let _ = state.update(Message::SftpManagerStatusUpdated(vec![(
+        key,
+        SftpTransportStatus::Reconnected {
+            mode: SftpTransportMode::IsolatedTransferTransport,
+        },
+    )]));
+    let _ = state.update(Message::ProbeTransferRecovery);
+    assert!(!state.transfer_queue().has_reconnectable_failures());
+
+    // Enqueue a valid upload and confirm transfer queue still runs smoothly after recovery events.
+    let payload = b"recovery-probe-ok".to_vec();
+    let p = local_uploads.join("probe.txt");
+    fs::write(&p, &payload).unwrap();
+    let _ = state.update(Message::SftpSessionFileDropped {
+        session_id: sid,
+        path: p,
+    });
+    assert!(state.transfer_queue().wait_until_idle(Duration::from_secs(10)).await);
+    assert_eq!(fs::read(remote_root.join("probe.txt")).unwrap(), payload);
 }

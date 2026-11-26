@@ -346,7 +346,7 @@ pub fn render_context_menu_overlay<'a>(
             col = col.push(menu_row("Quick Commands...", Some("Ctrl+Shift+Q"), chrome, Message::OpenQuickCommandsModal));
             col = col.push(menu_row("Zmodem Send File...", None, chrome, Message::TriggerZmodemSend(sid)));
             if *is_ssh {
-                col = col.push(menu_row("Toggle SFTP Drawer", Some("Ctrl+Shift+E"), chrome, Message::ToggleSftpDrawer));
+                col = col.push(menu_row("Toggle SFTP+ Panel", Some("Ctrl+Shift+E"), chrome, Message::ToggleSftpDrawer));
             }
             col = col.push(hairline_h(chrome));
             col = col.push(menu_row("Close Pane", Some("Ctrl+Shift+W"), chrome, Message::CloseFocusedPane));

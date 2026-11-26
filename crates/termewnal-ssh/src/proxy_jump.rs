@@ -5,7 +5,7 @@ use termewnal_core::{OpenSshHost, Profile, ProfileTarget, SshAuthMethod, vault::
 use tokio::task::JoinSet;
 
 use crate::auth::{AgentConnector, SshInteractionHandler};
-use crate::client::{SshConnectConfig, SshTransport, TcpKeepaliveSettings};
+use crate::client::{SshClientOptions, SshConnectConfig, SshTransport, TcpKeepaliveSettings};
 use crate::error::SshError;
 
 /// Connection target specification for a single intermediate `ProxyJump` hop.
@@ -246,14 +246,22 @@ pub async fn connect_transport_chain(
         return Ok(SshTransportChain::direct(transport));
     }
 
-    let (jump_hops, target) =
-        connect_chain_parts(config, keepalive, vault, interaction, agent_connector).await?;
+    let (jump_hops, target) = connect_chain_parts_with_options(
+        config,
+        keepalive,
+        SshClientOptions::interactive(),
+        vault,
+        interaction,
+        agent_connector,
+    )
+    .await?;
     Ok(SshTransportChain::from_parts(jump_hops, target))
 }
 
-pub(crate) async fn connect_chain_parts(
+pub(crate) async fn connect_chain_parts_with_options(
     config: &SshConnectConfig,
     keepalive: Option<TcpKeepaliveSettings>,
+    options: SshClientOptions,
     vault: Option<&dyn SecretStore>,
     interaction: Arc<dyn SshInteractionHandler>,
     agent_connector: Arc<dyn AgentConnector>,
@@ -262,9 +270,10 @@ pub(crate) async fn connect_chain_parts(
     let fallback_kh = config.known_hosts_path.as_deref();
 
     let first_cfg = config.proxy_jump[0].to_connect_config(fallback_kh);
-    let first_hop = SshTransport::connect_direct_with_keepalive(
+    let first_hop = SshTransport::connect_direct_with_options(
         &first_cfg,
         keepalive,
+        options,
         vault,
         Arc::clone(&interaction),
         Arc::clone(&agent_connector),
@@ -277,6 +286,7 @@ pub(crate) async fn connect_chain_parts(
         let next = match connect_hop_over_prev(
             guard.hops.last().expect("at least one hop exists"),
             &hop_cfg,
+            options,
             vault,
             Arc::clone(&interaction),
             Arc::clone(&agent_connector),
@@ -295,6 +305,7 @@ pub(crate) async fn connect_chain_parts(
     let target = match connect_hop_over_prev(
         guard.hops.last().expect("at least one hop exists"),
         config,
+        options,
         vault,
         interaction,
         agent_connector,
@@ -314,6 +325,7 @@ pub(crate) async fn connect_chain_parts(
 async fn connect_hop_over_prev(
     prev: &SshTransport,
     next_cfg: &SshConnectConfig,
+    options: SshClientOptions,
     vault: Option<&dyn SecretStore>,
     interaction: Arc<dyn SshInteractionHandler>,
     agent_connector: Arc<dyn AgentConnector>,
@@ -337,9 +349,10 @@ async fn connect_hop_over_prev(
             ),
         })?;
 
-    SshTransport::connect_over_stream(
+    SshTransport::connect_over_stream_with_options(
         channel.into_stream(),
         next_cfg,
+        options,
         vault,
         interaction,
         agent_connector,

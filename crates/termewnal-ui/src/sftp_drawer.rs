@@ -3,39 +3,41 @@ use std::time::Instant;
 
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
-use iced::advanced::renderer::{self, Quad, Renderer as _};
+use iced::advanced::renderer::{self};
 use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget};
 use iced::widget::{
     button, column, container, progress_bar, row, scrollable, space, text, text_input,
 };
 use iced::{
-    Alignment, Background, Border, Color, Element, Event, Length, Point, Rectangle, Size, Theme,
-    Vector, mouse, window,
+    Alignment, Color, Element, Event, Length, Point, Rectangle, Size, Theme, Vector, mouse,
+    window,
 };
-use termewnal_core::ThemePalette;
+use termewnal_core::{
+    DEFAULT_SFTP_PANEL_WIDTH, MAX_SFTP_PANEL_WIDTH, MIN_SFTP_PANEL_WIDTH, ThemePalette,
+};
 use termewnal_ssh::{
-    ConflictResolution, RemoteDirEntry, RemoteEntryKind, RemoteListing, SftpStatusNotice,
-    SftpTransportMode, TransferConflict, TransferDirection, TransferId, TransferNotice,
-    TransferQueueSnapshot, TransferReconnectState, TransferSnapshot, TransferStatus,
+    ConflictResolution, RemoteDirEntry, RemoteListing, SftpStatusNotice, TransferConflict,
+    TransferDirection, TransferId, TransferNotice, TransferQueueSnapshot, TransferReconnectState,
+    TransferSnapshot, TransferStatus,
 };
 
 use crate::app::{Message, SessionId};
 use crate::tunnel_ui::RECONNECT_NOTICE_TTL;
 use crate::ui_theme::{
-    ChromePalette, FONT_BODY, FONT_META, FONT_SUBHEAD, PillTone, apple_checkbox, badge_pill,
-    hairline_h, hairline_v, inset_well_style, list_row_button_style, modal_card_style,
-    modal_overlay, modal_width, mono_font, pill_button_style, sheet_header, status_dot,
+    ChromePalette, DividerDragState, DividerPress, FONT_BODY, FONT_META, FONT_SUBHEAD, PillTone,
+    apple_checkbox, badge_pill, draw_interactive_divider, hairline_h, inset_well_style,
+    modal_card_style, modal_overlay, modal_width, mono_font, pill_button_style, sheet_header,
     styled_input_style, tab_bar_button_style, tabby_progress_style, tabby_scrollable_style,
     ui_font_medium,
 };
 
-/// Default width in logical pixels of the right-docked SFTP Browser & `Transfer` Drawer.
-pub const DEFAULT_SFTP_DRAWER_WIDTH: f32 = 360.0;
-/// Minimum width in logical pixels when resizing the SFTP Drawer.
-pub const MIN_SFTP_DRAWER_WIDTH: f32 = 260.0;
-/// Maximum width in logical pixels when resizing the SFTP Drawer.
-pub const MAX_SFTP_DRAWER_WIDTH: f32 = 760.0;
+/// Default width in logical pixels of the right-docked SFTP Panel (`SFTP+`).
+pub const DEFAULT_SFTP_DRAWER_WIDTH: f32 = DEFAULT_SFTP_PANEL_WIDTH;
+/// Minimum width in logical pixels when resizing the SFTP Panel.
+pub const MIN_SFTP_DRAWER_WIDTH: f32 = MIN_SFTP_PANEL_WIDTH;
+/// Maximum width in logical pixels when resizing the SFTP Panel.
+pub const MAX_SFTP_DRAWER_WIDTH: f32 = MAX_SFTP_PANEL_WIDTH;
 
 const DIVIDER_THICKNESS: f32 = 1.0;
 const DIVIDER_HIT_PADDING: f32 = 5.0;
@@ -89,16 +91,16 @@ impl SftpConnectionState {
     }
 }
 
-/// UI state backing the toggleable (`Ctrl+Shift+E`), resizable SFTP Browser & `Transfer` Queue Drawer.
+/// UI state backing the per-pane, toggleable (`Ctrl+Shift+E`), resizable SFTP+ Panel.
 #[derive(Debug, Clone)]
 pub struct SftpDrawerState {
     open: bool,
+    manually_closed: bool,
+    panel_focused: bool,
     width: f32,
     bound_session_id: Option<SessionId>,
     session_label: Option<String>,
     current_path: String,
-    path_input: String,
-    new_folder_name: String,
     entries: Vec<RemoteDirEntry>,
     loading: bool,
     browser_error: Option<String>,
@@ -120,14 +122,16 @@ pub struct SftpDrawerState {
 impl Default for SftpDrawerState {
     fn default() -> Self {
         let download_dir = std::env::temp_dir().join("termewnal-downloads");
+        let mut plus = crate::sftp_plus::SftpPlusState::default();
+        plus.remote.path_input = ".".to_string();
         Self {
             open: false,
+            manually_closed: false,
+            panel_focused: false,
             width: DEFAULT_SFTP_DRAWER_WIDTH,
             bound_session_id: None,
             session_label: None,
             current_path: ".".to_string(),
-            path_input: ".".to_string(),
-            new_folder_name: String::new(),
             entries: Vec::new(),
             loading: false,
             browser_error: None,
@@ -143,7 +147,7 @@ impl Default for SftpDrawerState {
             download_dir,
             queue_snapshot: TransferQueueSnapshot::default(),
             list_generation: 0,
-            plus: crate::sftp_plus::SftpPlusState::default(),
+            plus,
         }
     }
 }
@@ -173,30 +177,60 @@ impl SftpDrawerState {
         }
     }
 
-    /// Returns the human-readable SSH session label displayed in this drawer's header.
+    /// Returns the human-readable SSH session label displayed in this panel's header.
     pub fn session_label(&self) -> Option<&str> {
         self.session_label.as_deref()
     }
 
-    /// Updates the human-readable SSH session label displayed in this drawer's header.
+    /// Updates the human-readable SSH session label displayed in this panel's header.
     pub fn set_session_label(&mut self, label: Option<String>) {
         self.session_label = label;
     }
 
-    /// Returns `true` when the SFTP Drawer is visible.
+    /// Returns `true` when the SFTP Panel is visible.
     pub fn is_open(&self) -> bool {
         self.open
     }
 
-    /// Opens or closes the SFTP Drawer.
-    pub fn set_open(&mut self, open: bool) {
-        self.open = open;
+    /// Returns `true` when the user manually closed this session's SFTP Panel.
+    pub fn is_manually_closed(&self) -> bool {
+        self.manually_closed
     }
 
-    /// Toggles SFTP Drawer visibility and returns the updated state.
+    /// Returns `true` when keyboard focus inside this Pane belongs to the SFTP Panel.
+    pub fn is_panel_focused(&self) -> bool {
+        self.open && self.panel_focused
+    }
+
+    /// Updates whether keyboard focus inside this Pane belongs to the SFTP Panel.
+    pub fn set_panel_focused(&mut self, focused: bool) {
+        self.panel_focused = focused && self.open;
+    }
+
+    /// Opens or closes the SFTP Panel from explicit user action, recording manual close state.
+    pub fn set_open(&mut self, open: bool) {
+        self.open = open;
+        self.manually_closed = !open;
+        if !open {
+            self.panel_focused = false;
+        }
+    }
+
+    /// Automatically opens the SFTP Panel on SSH connect unless the user closed it manually.
+    /// Returns `true` when the panel transitioned from closed to open.
+    pub fn auto_open_if_allowed(&mut self) -> bool {
+        if self.manually_closed || self.open {
+            return false;
+        }
+        self.open = true;
+        true
+    }
+
+    /// Toggles SFTP Panel visibility and returns the updated state.
     pub fn toggle(&mut self) -> bool {
-        self.open = !self.open;
-        self.open
+        let next = !self.open;
+        self.set_open(next);
+        next
     }
 
     /// Returns the current drawer width in logical pixels.
@@ -214,12 +248,11 @@ impl SftpDrawerState {
         self.bound_session_id
     }
 
-    /// Binds the SFTP Browser to `session_id`, resetting path/entries when switching sessions.
+    /// Binds the SFTP+ panel to `session_id`, resetting path/entries when switching sessions.
     pub fn bind_session(&mut self, session_id: Option<SessionId>) {
         if self.bound_session_id != session_id {
             self.bound_session_id = session_id;
             self.current_path = ".".to_string();
-            self.path_input = ".".to_string();
             self.entries.clear();
             self.browser_error = None;
             self.connection_state = SftpConnectionState::Idle;
@@ -229,22 +262,18 @@ impl SftpDrawerState {
             self.transport_notice = None;
             self.loading = false;
             self.plus.on_remote_session_changed();
+            self.plus.remote.path_input = ".".to_string();
         }
     }
 
-    /// Returns the current remote directory path displayed in the SFTP Browser.
+    /// Returns the current remote directory path displayed in SFTP+.
     pub fn current_path(&self) -> &str {
         &self.current_path
     }
 
-    /// Returns the editable path bar draft text.
+    /// Returns the editable remote path bar draft text.
     pub fn path_input(&self) -> &str {
-        &self.path_input
-    }
-
-    /// Updates the editable path bar draft text.
-    pub fn set_path_input(&mut self, value: String) {
-        self.path_input = value;
+        &self.plus.remote.path_input
     }
 
     /// Updates the target path immediately (useful before async navigation completes).
@@ -256,7 +285,8 @@ impl SftpDrawerState {
             p.trim().to_string()
         };
         self.current_path = normalized.clone();
-        self.path_input = normalized;
+        self.plus.remote.current_path = normalized.clone();
+        self.plus.remote.path_input = normalized;
     }
 
     /// Returns the remote directory path used when uploading dropped files for `session_id`.
@@ -266,16 +296,6 @@ impl SftpDrawerState {
         } else {
             ".".to_string()
         }
-    }
-
-    /// Returns the draft folder name for inline `mkdir`.
-    pub fn new_folder_name(&self) -> &str {
-        &self.new_folder_name
-    }
-
-    /// Updates the draft folder name for inline `mkdir`.
-    pub fn set_new_folder_name(&mut self, name: String) {
-        self.new_folder_name = name;
     }
 
     /// Returns the cached remote directory entries.
@@ -294,8 +314,9 @@ impl SftpDrawerState {
             self.bound_session_id = Some(session_id);
         }
         if !requested_path.trim().is_empty() {
-            self.current_path = requested_path.trim().to_string();
-            self.path_input = self.current_path.clone();
+            let normalized = requested_path.trim().to_string();
+            self.current_path = normalized.clone();
+            self.plus.remote.path_input = normalized;
         }
         self.list_generation = self.list_generation.wrapping_add(1);
         self.loading = true;
@@ -329,7 +350,6 @@ impl SftpDrawerState {
             Ok(listing) => {
                 let resolved = listing.resolved_path.clone();
                 self.current_path = resolved.clone();
-                self.path_input = resolved.clone();
                 self.entries = listing.entries;
                 self.browser_error = None;
                 self.transport_notice = Some(SftpStatusNotice {
@@ -587,15 +607,10 @@ impl SftpDrawerState {
     }
 }
 
-#[derive(Debug, Default)]
-struct DrawerDragState {
-    dragging: bool,
-    hovered: bool,
-}
-
-/// Right-docked container pairing `main` workspace content with a resizable SFTP Drawer
-/// that also captures OS file drops landed anywhere inside the drawer bounds.
+/// Right-docked container pairing `main` terminal content inside an SSH `Pane` with a resizable
+/// `SFTP Panel` that also captures OS file drops landed anywhere inside the panel bounds.
 pub struct SftpDrawerDock<'a> {
+    session_id: SessionId,
     drawer_width: f32,
     children: [Element<'a, Message, Theme, iced::Renderer>; 2],
 }
@@ -603,27 +618,34 @@ pub struct SftpDrawerDock<'a> {
 impl<'a> SftpDrawerDock<'a> {
     /// Wraps `main` on the left and `drawer` on the right with a draggable divider.
     pub fn new(
+        session_id: SessionId,
         drawer_width: f32,
         main: Element<'a, Message, Theme, iced::Renderer>,
         drawer: Element<'a, Message, Theme, iced::Renderer>,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
         Element::new(Self {
+            session_id,
             drawer_width: drawer_width.clamp(MIN_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH),
             children: [main, drawer],
         })
     }
 
-    fn effective_drawer_width(&self, total_width: f32) -> f32 {
-        let min_terminal = if total_width >= 700.0 {
-            300.0
+    /// Computes effective SFTP Panel width clamped to `[220px, 70% pane]` while preserving terminal space.
+    pub fn clamped_panel_width(preferred_width: f32, total_width: f32) -> f32 {
+        let min_terminal = if total_width >= 460.0 + DIVIDER_THICKNESS {
+            240.0
         } else {
-            (total_width * 0.45).clamp(160.0, 260.0)
+            (total_width * 0.45).clamp(140.0, 240.0)
         };
-        let ratio_cap = (total_width * 0.50).max(170.0);
+        let ratio_cap = (total_width * 0.70).max(160.0);
         let space_cap = (total_width - DIVIDER_THICKNESS - min_terminal).max(140.0);
         let max_allowed = ratio_cap.min(space_cap).max(140.0);
         let min_allowed = MIN_SFTP_DRAWER_WIDTH.min(max_allowed);
-        self.drawer_width.clamp(min_allowed, max_allowed)
+        preferred_width.clamp(min_allowed, max_allowed)
+    }
+
+    fn effective_drawer_width(&self, total_width: f32) -> f32 {
+        Self::clamped_panel_width(self.drawer_width, total_width)
     }
 
     fn layout_rects(&self, bounds: Rectangle) -> (Rectangle, Rectangle, Rectangle, Rectangle) {
@@ -648,11 +670,11 @@ impl<'a> SftpDrawerDock<'a> {
 
 impl Widget<Message, Theme, iced::Renderer> for SftpDrawerDock<'_> {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<DrawerDragState>()
+        tree::Tag::of::<DividerDragState>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(DrawerDragState::default())
+        tree::State::new(DividerDragState::default())
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -729,7 +751,7 @@ impl Widget<Message, Theme, iced::Renderer> for SftpDrawerDock<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let state = tree.state.downcast_mut::<DrawerDragState>();
+        let state = tree.state.downcast_mut::<DividerDragState>();
         let bounds = layout.bounds();
         let (_main_rect, _visual_rect, hit_rect, drawer_rect) = self.layout_rects(bounds);
 
@@ -737,13 +759,19 @@ impl Widget<Message, Theme, iced::Renderer> for SftpDrawerDock<'_> {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
                 if cursor.is_over(hit_rect) =>
             {
-                state.dragging = true;
+                match state.on_left_press(Instant::now()) {
+                    DividerPress::DoubleClickReset => {
+                        shell.publish(Message::ResetSftpDrawerWidth);
+                    }
+                    DividerPress::StartDrag => {}
+                }
                 shell.capture_event();
                 shell.request_redraw();
                 return;
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
                 state.dragging = false;
+                shell.publish(Message::CommitSftpDrawerWidth);
                 shell.capture_event();
                 shell.request_redraw();
                 return;
@@ -766,7 +794,10 @@ impl Widget<Message, Theme, iced::Renderer> for SftpDrawerDock<'_> {
             Event::Window(window::Event::FileDropped(path))
                 if cursor.is_over(drawer_rect) =>
             {
-                shell.publish(Message::SftpDrawerFileDropped { path: path.clone() });
+                shell.publish(Message::SftpSessionFileDropped {
+                    session_id: self.session_id,
+                    path: path.clone(),
+                });
                 shell.capture_event();
                 return;
             }
@@ -815,7 +846,7 @@ impl Widget<Message, Theme, iced::Renderer> for SftpDrawerDock<'_> {
         viewport: &Rectangle,
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
-        let state = tree.state.downcast_ref::<DrawerDragState>();
+        let state = tree.state.downcast_ref::<DividerDragState>();
         let (_main_rect, _visual_rect, hit_rect, _drawer_rect) =
             self.layout_rects(layout.bounds());
         if state.dragging || cursor.is_over(hit_rect) {
@@ -852,7 +883,7 @@ impl Widget<Message, Theme, iced::Renderer> for SftpDrawerDock<'_> {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        let state = tree.state.downcast_ref::<DrawerDragState>();
+        let state = tree.state.downcast_ref::<DividerDragState>();
         let (_main_rect, visual_rect, _hit_rect, _drawer_rect) =
             self.layout_rects(layout.bounds());
 
@@ -873,22 +904,7 @@ impl Widget<Message, Theme, iced::Renderer> for SftpDrawerDock<'_> {
             );
         }
 
-        let ext = theme.extended_palette();
-        let divider_color = if state.dragging || state.hovered {
-            ext.primary.base.color
-        } else {
-            Color {
-                a: 0.35,
-                ..ext.background.strong.color
-            }
-        };
-        renderer.fill_quad(
-            Quad {
-                bounds: visual_rect,
-                ..Quad::default()
-            },
-            divider_color,
-        );
+        draw_interactive_divider(renderer, theme, visual_rect, state, 0.35);
     }
 
     fn overlay<'b>(
@@ -922,478 +938,6 @@ impl Widget<Message, Theme, iced::Renderer> for SftpDrawerDock<'_> {
     }
 }
 
-/// Renders the SFTP Browser & `Transfer` Queue Drawer content panel.
-pub fn render_sftp_drawer<'a>(
-    state: &'a SftpDrawerState,
-    has_connected_ssh: bool,
-    palette: &ThemePalette,
-) -> Element<'a, Message, Theme, iced::Renderer> {
-    let chrome = ChromePalette::from_palette(palette);
-    let body = render_sftp_panel_inner(state, has_connected_ssh, chrome);
-    row![hairline_v(chrome), body]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
-}
-
-fn render_sftp_panel_inner<'a>(
-    state: &'a SftpDrawerState,
-    has_connected_ssh: bool,
-    chrome: ChromePalette,
-) -> Element<'a, Message, Theme, iced::Renderer> {
-    // Matches Tabby's `sftp-panel`: flush header + clickable breadcrumbs + borderless
-    // `.list-group-light` rows + thin 3px transfer progress bars.
-    let mut header_title = row![
-        text("SFTP")
-            .size(FONT_SUBHEAD)
-            .font(ui_font_medium())
-            .color(chrome.text_primary),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
-    if let Some(label) = state.session_label() {
-        header_title = header_title.push(
-            text(label.to_string())
-                .size(FONT_META)
-                .font(mono_font())
-                .color(chrome.accent)
-                .wrapping(iced::widget::text::Wrapping::None),
-        );
-    }
-    let header = row![
-        container(header_title).width(Length::Fill).clip(true),
-        button(text("SFTP+").size(FONT_META).font(ui_font_medium()))
-            .padding([2, 6])
-            .style(tab_bar_button_style(chrome, false, false))
-            .on_press(Message::SftpSetLayoutMode(
-                crate::sftp_plus::SftpLayoutMode::DualHorizontal
-            )),
-        button(text("Up").size(FONT_META))
-            .padding([2, 6])
-            .style(tab_bar_button_style(chrome, false, false))
-            .on_press(Message::SftpNavigateUp),
-        button(text("↻").size(13.0))
-            .padding([2, 6])
-            .style(tab_bar_button_style(chrome, false, false))
-            .on_press(Message::SftpRefresh),
-        button(text("×").size(14))
-            .padding([2, 6])
-            .style(tab_bar_button_style(chrome, false, false))
-            .on_press(Message::SetSftpDrawerOpen(false)),
-    ]
-    .spacing(2)
-    .align_y(Alignment::Center);
-
-    let breadcrumbs = render_path_breadcrumbs(state.current_path(), chrome);
-
-    let mut content = column![header, breadcrumbs].spacing(6);
-
-    match state.connection_state() {
-        SftpConnectionState::AutoReconnecting { .. } => {
-            if let Some(label) = state.connection_state().status_label() {
-                content = content.push(
-                    container(
-                        row![
-                            status_dot(chrome.warning),
-                            text(label).size(11).color(chrome.warning).width(Length::Fill),
-                            button(text("Retry now").size(FONT_META).font(ui_font_medium()))
-                                .padding([2, 7])
-                                .style(pill_button_style(chrome, PillTone::Subtle))
-                                .on_press(Message::SftpRefresh),
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
-                    )
-                    .width(Length::Fill)
-                    .padding([5, 8])
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(chrome.warning_soft)),
-                        border: Border {
-                            color: chrome.warning,
-                            width: 1.0,
-                            radius: 4.0.into(),
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
-        }
-        SftpConnectionState::ReconnectedSuccessfully => {
-            content = content.push(
-                container(
-                    row![
-                        status_dot(chrome.success),
-                        text("Reconnected successfully")
-                            .size(11)
-                            .font(ui_font_medium())
-                            .color(chrome.success),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .padding([5, 8])
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(chrome.success_soft)),
-                    border: Border {
-                        color: chrome.success,
-                        width: 1.0,
-                        radius: 4.0.into(),
-                    },
-                    ..Default::default()
-                }),
-            );
-        }
-        SftpConnectionState::Disconnected { .. } => {
-            if let Some(label) = state.connection_state().status_label() {
-                content = content.push(
-                    container(
-                        row![
-                            status_dot(chrome.danger),
-                            text(label).size(11).color(chrome.danger).width(Length::Fill),
-                            button(text("Reconnect").size(FONT_META).font(ui_font_medium()))
-                                .padding([2, 7])
-                                .style(pill_button_style(chrome, PillTone::Primary))
-                                .on_press(Message::SftpRefresh),
-                        ]
-                        .spacing(6)
-                        .align_y(Alignment::Center),
-                    )
-                    .width(Length::Fill)
-                    .padding([5, 8])
-                    .style(move |_| container::Style {
-                        background: Some(Background::Color(chrome.danger_soft)),
-                        border: Border {
-                            color: chrome.danger,
-                            width: 1.0,
-                            radius: 4.0.into(),
-                        },
-                        ..Default::default()
-                    }),
-                );
-            }
-        }
-        SftpConnectionState::Idle | SftpConnectionState::Connected => {}
-    }
-
-    if let Some(notice) = state.transport_notice() {
-        let (dot_color, copy) = match notice.mode {
-            SftpTransportMode::IsolatedTransferTransport => (
-                chrome.success,
-                "Isolated Transfer Transport".to_string(),
-            ),
-            SftpTransportMode::MuxFallback => (
-                chrome.warning,
-                notice
-                    .message
-                    .clone()
-                    .unwrap_or_else(|| "Mux fallback on Primary Transport".to_string()),
-            ),
-        };
-        content = content.push(
-            container(
-                row![status_dot(dot_color), text(copy).size(11).color(chrome.text_muted)]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-            )
-            .width(Length::Fill)
-            .padding([4, 8])
-            .style(move |_| container::Style {
-                background: Some(Background::Color(chrome.bg_more)),
-                border: Border {
-                    color: chrome.hairline,
-                    width: 1.0,
-                    radius: 4.0.into(),
-                },
-                ..Default::default()
-            }),
-        );
-    }
-
-    let path_row = row![
-        text_input("Remote path...", state.path_input())
-            .on_input(Message::SftpPathInputChanged)
-            .on_submit(Message::SftpNavigateTo(state.path_input().to_string()))
-            .size(FONT_META)
-            .font(mono_font())
-            .padding([4, 7])
-            .style(styled_input_style(chrome))
-            .width(Length::Fill),
-        button(text("Go").size(FONT_META))
-            .padding([4, 7])
-            .style(tab_bar_button_style(chrome, false, false))
-            .on_press(Message::SftpNavigateTo(state.path_input().to_string())),
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center);
-    content = content.push(path_row);
-
-    let mkdir_row = row![
-        text_input("New folder...", state.new_folder_name())
-            .on_input(Message::SftpNewFolderInputChanged)
-            .on_submit(Message::SftpCreateFolder)
-            .size(FONT_META)
-            .padding([4, 7])
-            .style(styled_input_style(chrome))
-            .width(Length::Fill),
-        button(text("+Dir").size(FONT_META))
-            .padding([4, 7])
-            .style(tab_bar_button_style(chrome, false, false))
-            .on_press(Message::SftpCreateFolder),
-    ]
-    .spacing(4)
-    .align_y(Alignment::Center);
-    content = content.push(mkdir_row);
-
-    if let Some(notice) = state.last_transfer_notice() {
-        content = content.push(
-            container(text(notice.to_string()).size(11).color(chrome.warning))
-                .width(Length::Fill)
-                .padding([5, 8])
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(chrome.warning_soft)),
-                    border: Border {
-                        color: chrome.warning,
-                        width: 1.0,
-                        radius: 4.0.into(),
-                    },
-                    ..Default::default()
-                }),
-        );
-    }
-
-    if let Some(err) = state.browser_error() {
-        content = content.push(text(err.to_string()).size(11).color(chrome.danger));
-    }
-
-    let browser_list = render_browser_entries(state, has_connected_ssh, chrome);
-    content = content.push(
-        scrollable(
-            container(browser_list)
-                .padding(iced::Padding {
-                    top: 0.0,
-                    right: 8.0,
-                    bottom: 0.0,
-                    left: 0.0,
-                })
-                .width(Length::Fill),
-        )
-        .style(tabby_scrollable_style(chrome))
-        .width(Length::Fill)
-        .height(Length::FillPortion(3)),
-    );
-
-    content = content.push(hairline_h(chrome));
-    content = content.push(render_transfer_queue_section(state, chrome));
-
-    container(content.padding(8))
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(move |_theme: &Theme| container::Style {
-            background: Some(Background::Color(chrome.chrome_bg)),
-            text_color: Some(chrome.text_primary),
-            ..Default::default()
-        })
-        .into()
-}
-
-fn render_path_breadcrumbs<'a>(
-    current_path: &str,
-    chrome: ChromePalette,
-) -> Element<'a, Message, Theme, iced::Renderer> {
-    let trimmed = current_path.trim();
-    let is_abs = trimmed.starts_with('/');
-    let root_label = if is_abs { "/" } else { "." };
-    let root_target = root_label.to_string();
-
-    let mut crumb_row = row![
-        button(
-            text(root_label)
-                .size(FONT_META)
-                .font(mono_font())
-                .color(chrome.accent),
-        )
-        .padding([2, 6])
-        .style(tab_bar_button_style(chrome, false, false))
-        .on_press(Message::SftpNavigateTo(root_target)),
-    ]
-    .spacing(2)
-    .align_y(Alignment::Center);
-
-    let mut acc = if is_abs {
-        String::new()
-    } else {
-        ".".to_string()
-    };
-    for seg in trimmed.split('/').filter(|s| !s.is_empty() && *s != ".") {
-        if is_abs {
-            acc = format!("{acc}/{seg}");
-        } else if acc == "." {
-            acc = seg.to_string();
-        } else {
-            acc = format!("{acc}/{seg}");
-        }
-        let target = acc.clone();
-        crumb_row = crumb_row
-            .push(text("/").size(FONT_META).color(chrome.text_muted))
-            .push(
-                button(
-                    text(seg.to_string())
-                        .size(FONT_META)
-                        .font(mono_font())
-                        .color(chrome.text_secondary),
-                )
-                .padding([2, 5])
-                .style(tab_bar_button_style(chrome, false, false))
-                .on_press(Message::SftpNavigateTo(target)),
-            );
-    }
-
-    container(crumb_row.wrap().vertical_spacing(2))
-        .width(Length::Fill)
-        .padding([3, 6])
-        .style(move |_| container::Style {
-            background: Some(Background::Color(chrome.bg_more)),
-            border: Border {
-                color: chrome.secondary,
-                width: 1.0,
-                radius: 4.0.into(),
-            },
-            ..Default::default()
-        })
-        .into()
-}
-
-fn render_browser_entries<'a>(
-    state: &'a SftpDrawerState,
-    has_connected_ssh: bool,
-    chrome: ChromePalette,
-) -> Element<'a, Message, Theme, iced::Renderer> {
-    let mut col = column![].spacing(1).width(Length::Fill);
-
-    if state.is_loading() {
-        col = col.push(
-            container(
-                text("Loading remote directory...")
-                    .size(FONT_BODY)
-                    .color(chrome.text_muted),
-            )
-            .padding([8, 6]),
-        );
-        return col.into();
-    } else if !has_connected_ssh && state.entries().is_empty() {
-        col = col.push(
-            container(
-                text("Connect an SSH session to browse files or drop files here to upload.")
-                    .size(FONT_BODY)
-                    .color(chrome.text_muted),
-            )
-            .padding([8, 6]),
-        );
-        return col.into();
-    } else if state.entries().is_empty() {
-        col = col.push(
-            container(
-                text("Directory is empty (drop files here to upload)")
-                    .size(FONT_BODY)
-                    .color(chrome.text_muted),
-            )
-            .padding([8, 6]),
-        );
-        return col.into();
-    }
-
-    let total = state.entries().len();
-    for (idx, entry) in state.entries().iter().enumerate() {
-        let (kind_tag, tag_color) = match entry.kind {
-            RemoteEntryKind::Dir => ("DIR", chrome.accent),
-            RemoteEntryKind::Symlink => ("LNK", chrome.warning),
-            RemoteEntryKind::File | RemoteEntryKind::Other => ("FILE", chrome.text_muted),
-        };
-        let meta_label = if entry.is_dir() {
-            "Directory".to_string()
-        } else {
-            format_bytes(entry.size)
-        };
-
-        let name_col = container(
-            column![
-                row![
-                    text(kind_tag)
-                        .size(FONT_META)
-                        .font(mono_font())
-                        .color(tag_color),
-                    text(entry.name.clone())
-                        .size(FONT_BODY)
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .color(chrome.text_primary),
-                ]
-                .spacing(5)
-                .align_y(Alignment::Center),
-                text(meta_label)
-                    .size(FONT_META)
-                    .font(mono_font())
-                    .color(chrome.text_muted),
-            ]
-            .spacing(1),
-        )
-        .width(Length::Fill)
-        .clip(true);
-
-        let leading: Element<'a, Message, Theme, iced::Renderer> = if entry.is_dir() {
-            button(name_col)
-                .padding([4, 4])
-                .width(Length::Fill)
-                .style(list_row_button_style(chrome, false))
-                .on_press(Message::SftpNavigateTo(entry.path.clone()))
-                .into()
-        } else {
-            container(name_col).padding([4, 4]).width(Length::Fill).into()
-        };
-
-        let mut row_el = row![leading].spacing(2).align_y(Alignment::Center);
-
-        if entry.is_dir() {
-            row_el = row_el.push(
-                button(text("Get").size(FONT_META))
-                    .padding([2, 5])
-                    .style(tab_bar_button_style(chrome, false, false))
-                    .on_press(Message::SftpDownloadDir {
-                        remote_path: entry.path.clone(),
-                        dir_name: entry.name.clone(),
-                    }),
-            );
-        } else {
-            row_el = row_el.push(
-                button(text("Get").size(FONT_META))
-                    .padding([2, 5])
-                    .style(tab_bar_button_style(chrome, false, false))
-                    .on_press(Message::SftpDownloadFile {
-                        remote_path: entry.path.clone(),
-                        file_name: entry.name.clone(),
-                    }),
-            );
-        }
-
-        row_el = row_el.push(
-            button(text("Del").size(FONT_META))
-                .padding([2, 5])
-                .style(tab_bar_button_style(chrome, false, true))
-                .on_press(Message::SftpDeleteEntry {
-                    path: entry.path.clone(),
-                    is_dir: entry.is_dir(),
-                }),
-        );
-
-        col = col.push(container(row_el).padding([2, 2]).width(Length::Fill));
-        if idx + 1 < total {
-            col = col.push(hairline_h(chrome));
-        }
-    }
-
-    col.into()
-}
-
 pub(crate) fn render_transfer_queue_section<'a>(
     state: &'a SftpDrawerState,
     chrome: ChromePalette,
@@ -1419,7 +963,7 @@ pub(crate) fn render_transfer_queue_section<'a>(
     let mut list = column![].spacing(4);
     if snap.transfers.is_empty() {
         list = list.push(
-            text("No transfers queued. Drop files onto drawer or Shift+Drop on SSH pane.")
+            text("No transfers queued. Drop files onto SFTP+ or Shift+Drop on SSH pane.")
                 .size(FONT_META)
                 .color(chrome.text_muted),
         );

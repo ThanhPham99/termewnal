@@ -18,7 +18,10 @@ arboard.workspace = true
 chrono.workspace = true
 iced.workspace = true
 interprocess.workspace = true
+notify.workspace = true
+notify-debouncer-mini.workspace = true
 open.workspace = true
+rfd.workspace = true
 serde.workspace = true
 termewnal-core = { path = "../termewnal-core" }
 termewnal-protocols = { path = "../termewnal-protocols" }

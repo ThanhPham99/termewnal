@@ -1,9 +1,8 @@
-//! Dual-pane Tabby-SFTP-Plus commander UI, browsing state, file operations, context menu, and modals.
+//! Remote-only SFTP Panel (`SFTP+`) UI, browsing state, file operations, context menu, and modals.
 
 use std::collections::BTreeSet;
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{Instant, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::Instant;
 
 use chrono::{DateTime, Local};
 use iced::advanced::layout::{self, Layout};
@@ -16,66 +15,28 @@ use iced::widget::{
 };
 use iced::{
     Alignment, Background, Border, Color, Element, Event, Length, Padding, Point, Rectangle, Size,
-    Theme, keyboard, mouse, window,
+    Theme, keyboard, mouse,
 };
 use termewnal_core::{SftpState, ThemePalette};
-use termewnal_ssh::{RemoteDirEntry, RemoteEntryKind, join_remote_path, parent_remote_path};
+use termewnal_ssh::{RemoteDirEntry, RemoteEntryKind, SftpTransportMode, TransferId};
 
-use crate::app::Message;
+use crate::app::{Message, SessionId};
+use crate::app_picker::{InstalledApp, filter_installed_apps};
 use crate::sftp_drawer::{
     SftpConnectionState, SftpDrawerState, format_bytes, render_transfer_queue_section,
 };
 use crate::ui_theme::{
     ChromePalette, FONT_BODY, FONT_META, FONT_SUBHEAD, PillTone, anchored_menu, apple_checkbox,
-    badge_pill, hairline_h, hairline_v, inset_well_style, list_row_button_style, modal_body_height,
+    badge_pill, hairline_h, inset_well_style, list_row_button_style, modal_body_height,
     modal_card_style, modal_overlay, modal_width, mono_font, pill_button_style, status_dot,
     styled_input_style, tab_bar_button_style, tabby_scrollable_style, ui_font, ui_font_medium,
     ui_font_semibold,
 };
 
 const DOUBLE_CLICK_MAX_MS: u64 = 400;
-const SFTP_PATH_INPUT_LOCAL_ID: &str = "sftp-plus-local-path";
-const SFTP_PATH_INPUT_REMOTE_ID: &str = "sftp-plus-remote-path";
 const SFTP_MODAL_INPUT_ID: &str = "sftp-plus-modal-input";
 
-/// Presentation layout mode for the SFTP browser.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum SftpLayoutMode {
-    /// Side-by-side dual pane commander (`Local | Remote`), matching Tabby SFTP+.
-    #[default]
-    DualHorizontal,
-    /// Stacked dual pane commander (`Local` top, `Remote` bottom).
-    DualVertical,
-    /// Compact single-pane right-side dock alongside the terminal.
-    SideDock,
-}
-
-/// Identifies either the local or remote file pane in the dual-pane commander.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum SftpPaneSide {
-    Local,
-    Remote,
-}
-
-impl SftpPaneSide {
-    /// Returns the opposite pane (`Local` <-> `Remote`).
-    pub const fn other(self) -> Self {
-        match self {
-            Self::Local => Self::Remote,
-            Self::Remote => Self::Local,
-        }
-    }
-
-    /// Short display title shown in the pane toolbar.
-    pub const fn label(self) -> &'static str {
-        match self {
-            Self::Local => "Local",
-            Self::Remote => "Remote",
-        }
-    }
-}
-
-/// Sortable columns displayed in each pane's file table.
+/// Sortable columns displayed in the SFTP Panel file table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SftpSortColumn {
     #[default]
@@ -85,7 +46,7 @@ pub enum SftpSortColumn {
     Permission,
 }
 
-/// Unified directory entry model backing both `Local` and `Remote` panes.
+/// Remote directory entry view model rendered in the SFTP Panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileBrowserEntry {
     pub name: String,
@@ -116,7 +77,7 @@ impl FileBrowserEntry {
     }
 }
 
-/// Per-pane navigation, history, filtering, sorting, and selection state.
+/// Remote navigation, history, filtering, sorting, and selection state for one SSH `Session`.
 #[derive(Debug, Clone)]
 pub struct SftpPaneBrowseState {
     pub initialized: bool,
@@ -216,8 +177,6 @@ impl SftpPaneBrowseState {
         }
         if self.current_path != trimmed {
             self.selected_paths.clear();
-        } else {
-            // Preserve valid paths after refresh; caller prunes deleted items if needed.
         }
         self.current_path = trimmed.to_string();
         self.path_input = trimmed.to_string();
@@ -250,35 +209,32 @@ impl SftpPaneBrowseState {
     }
 }
 
-/// Clipboard operation kind for `Copy` / `Cut` / `Paste` inside SFTP+.
+/// Clipboard operation kind for `Copy` / `Cut` / `Paste` inside the remote SFTP Panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SftpClipboardOp {
     Copy,
     Cut,
 }
 
-/// Internal file clipboard shared between Local and Remote panes.
+/// Internal remote file clipboard for the SFTP Panel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SftpClipboard {
     pub op: SftpClipboardOp,
-    pub source_side: SftpPaneSide,
     pub entries: Vec<FileBrowserEntry>,
 }
 
-/// Right-click context menu state inside SFTP+.
+/// Right-click context menu state inside the SFTP Panel.
 #[derive(Debug, Clone, Default)]
 pub struct SftpContextMenuState {
     pub open: bool,
-    pub side: Option<SftpPaneSide>,
     pub target_path: Option<String>,
     pub position: Point,
 }
 
 impl SftpContextMenuState {
-    /// Opens the floating context menu at `position` scoped to `side`.
-    pub fn show(&mut self, side: SftpPaneSide, target_path: Option<String>, position: Point) {
+    /// Opens the floating context menu at `position`.
+    pub fn show(&mut self, target_path: Option<String>, position: Point) {
         self.open = true;
-        self.side = Some(side);
         self.target_path = target_path;
         self.position = position;
     }
@@ -290,12 +246,16 @@ impl SftpContextMenuState {
     }
 }
 
-/// Actions offered in the SFTP+ right-click context menu.
+/// Actions offered in the SFTP Panel right-click context menu and keyboard shortcuts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SftpContextActionKind {
-    Transfer,
+    Download,
+    DownloadTo,
+    UploadFiles,
+    UploadFolder,
     View,
     Edit,
+    OpenWith,
     Copy,
     Cut,
     Paste,
@@ -311,39 +271,34 @@ pub enum SftpContextActionKind {
     CopyPath,
 }
 
-/// Modal dialogs owned by the SFTP+ commander.
+/// Modal dialogs owned by the SFTP Panel (`SFTP+`).
 #[derive(Debug, Clone, Default)]
 pub enum SftpModalState {
     #[default]
     None,
     CreateEntry {
-        side: SftpPaneSide,
         parent_dir: String,
         is_dir: bool,
         name: String,
         error: Option<String>,
     },
     Rename {
-        side: SftpPaneSide,
         old_path: String,
         new_name: String,
         error: Option<String>,
     },
     EditPermissions {
-        side: SftpPaneSide,
         target_paths: Vec<String>,
         octal_input: String,
         mode_bits: u32,
         error: Option<String>,
     },
     Properties {
-        side: SftpPaneSide,
         entry: FileBrowserEntry,
         extra_selected: usize,
         total_selected_bytes: u64,
     },
     FileViewer {
-        side: SftpPaneSide,
         path: String,
         file_name: String,
         editable: bool,
@@ -353,206 +308,107 @@ pub enum SftpModalState {
         error: Option<String>,
         content: text_editor::Content<iced::Renderer>,
     },
+    OpenWith {
+        entry: FileBrowserEntry,
+        loading: bool,
+        search_query: String,
+        apps: Vec<InstalledApp>,
+        selected_launch_path: Option<PathBuf>,
+        last_clicked: Option<(PathBuf, Instant)>,
+        error: Option<String>,
+    },
 }
 
 impl SftpModalState {
-    /// Returns `true` when any SFTP+ dialog is currently displayed.
+    /// Returns `true` when any SFTP Panel dialog is currently displayed.
     pub fn is_open(&self) -> bool {
         !matches!(self, Self::None)
     }
 }
 
-/// Extended state for the dual-pane SFTP+ commander embedded inside [`SftpDrawerState`].
-#[derive(Debug, Clone)]
+/// Metadata for a single remote file downloaded via `Open with...` and monitored for local saves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WatchedRemoteFile {
+    pub id: u64,
+    pub session_id: SessionId,
+    pub remote_path: String,
+    pub file_name: String,
+    pub local_path: PathBuf,
+    pub app_path: PathBuf,
+    pub app_name: String,
+    pub last_synced_hash: u64,
+    pub in_flight_upload_hash: Option<u64>,
+    pub pending_upload_id: Option<TransferId>,
+    pub pending_local_change: bool,
+    pub auto_upload: bool,
+    pub upload_failed: bool,
+    pub status_note: Option<String>,
+}
+
+/// Remote-only SFTP+ browsing and interaction state embedded inside [`SftpDrawerState`].
+#[derive(Debug, Clone, Default)]
 pub struct SftpPlusState {
-    pub layout_mode: SftpLayoutMode,
     pub transfers_panel_open: bool,
-    pub active_pane: SftpPaneSide,
-    pub local: SftpPaneBrowseState,
-    pub local_entries: Vec<FileBrowserEntry>,
-    pub remote_prefs: SftpPaneBrowseState,
+    pub remote: SftpPaneBrowseState,
     pub clipboard: Option<SftpClipboard>,
     pub context_menu: SftpContextMenuState,
     pub modal: SftpModalState,
-    pub last_click: Option<(SftpPaneSide, String, Instant)>,
-}
-
-impl Default for SftpPlusState {
-    fn default() -> Self {
-        Self {
-            layout_mode: SftpLayoutMode::DualHorizontal,
-            transfers_panel_open: false,
-            active_pane: SftpPaneSide::Local,
-            local: SftpPaneBrowseState::default(),
-            local_entries: Vec::new(),
-            remote_prefs: SftpPaneBrowseState::default(),
-            clipboard: None,
-            context_menu: SftpContextMenuState::default(),
-            modal: SftpModalState::None,
-            last_click: None,
-        }
-    }
+    pub last_click: Option<(String, Instant)>,
+    pub watched_files: Vec<WatchedRemoteFile>,
 }
 
 impl SftpPlusState {
-    /// Clears session-specific remote history/selection when switching SSH sessions.
+    /// Clears session-specific remote history/selection when switching or resetting SSH sessions.
     pub fn on_remote_session_changed(&mut self) {
-        self.remote_prefs.reset_remote_session();
+        self.remote.reset_remote_session();
         self.context_menu.close();
-        if matches!(
-            self.modal,
-            SftpModalState::FileViewer {
-                side: SftpPaneSide::Remote,
-                ..
-            } | SftpModalState::CreateEntry {
-                side: SftpPaneSide::Remote,
-                ..
-            } | SftpModalState::Rename {
-                side: SftpPaneSide::Remote,
-                ..
-            } | SftpModalState::EditPermissions {
-                side: SftpPaneSide::Remote,
-                ..
-            } | SftpModalState::Properties {
-                side: SftpPaneSide::Remote,
-                ..
-            }
-        ) {
-            self.modal = SftpModalState::None;
-        }
+        self.modal = SftpModalState::None;
+        self.watched_files.clear();
     }
 
     /// Updates remote history, home path, and selection upon a successful remote `list_dir`.
     pub fn on_remote_listed(&mut self, resolved_path: &str) {
-        self.remote_prefs.loading = false;
-        self.remote_prefs.record_arrival(resolved_path);
+        self.remote.loading = false;
+        self.remote.record_arrival(resolved_path);
     }
 
-    /// Records a single click on `path` in `side` and returns `true` when it qualifies as a double-click.
-    pub fn handle_row_click(&mut self, side: SftpPaneSide, path: &str, ctrl_held: bool) -> bool {
-        self.active_pane = side;
+    /// Records a single click on remote `path` and returns `true` when it qualifies as a double-click.
+    pub fn handle_row_click(&mut self, path: &str, ctrl_held: bool) -> bool {
         self.context_menu.close();
-        let prefs = match side {
-            SftpPaneSide::Local => &mut self.local,
-            SftpPaneSide::Remote => &mut self.remote_prefs,
-        };
         if ctrl_held {
-            if !prefs.selected_paths.insert(path.to_string()) {
-                prefs.selected_paths.remove(path);
+            if !self.remote.selected_paths.insert(path.to_string()) {
+                self.remote.selected_paths.remove(path);
             }
             self.last_click = None;
             return false;
         }
 
-        prefs.selected_paths.clear();
-        prefs.selected_paths.insert(path.to_string());
+        self.remote.selected_paths.clear();
+        self.remote.selected_paths.insert(path.to_string());
 
         let now = Instant::now();
-        let is_double = self.last_click.as_ref().is_some_and(
-            |(prev_side, prev_path, prev_at)| {
-                *prev_side == side
-                    && prev_path == path
-                    && now.duration_since(*prev_at).as_millis() <= u128::from(DOUBLE_CLICK_MAX_MS)
-            },
-        );
+        let is_double = self.last_click.as_ref().is_some_and(|(prev_path, prev_at)| {
+            prev_path == path
+                && now.duration_since(*prev_at).as_millis() <= u128::from(DOUBLE_CLICK_MAX_MS)
+        });
         if is_double {
             self.last_click = None;
             true
         } else {
-            self.last_click = Some((side, path.to_string(), now));
+            self.last_click = Some((path.to_string(), now));
             false
         }
     }
-
-    /// Ensures the local pane has loaded `home_dir` (lazily on first open).
-    pub fn ensure_local_initialized(&mut self, fallback_home: Option<&Path>) {
-        if self.local.initialized {
-            return;
-        }
-        let start = fallback_home
-            .map(Path::to_path_buf)
-            .unwrap_or_else(default_local_home_dir);
-        self.local.home_path = Some(start.to_string_lossy().into_owned());
-        self.navigate_local(&start.to_string_lossy());
-    }
-
-    /// Reads and applies a local directory listing into the `Local` pane.
-    pub fn navigate_local(&mut self, path: &str) {
-        let target = if path.trim().is_empty() {
-            self.local
-                .home_path
-                .clone()
-                .map(PathBuf::from)
-                .unwrap_or_else(default_local_home_dir)
-        } else {
-            PathBuf::from(path.trim())
-        };
-        match read_local_dir_entries(&target) {
-            Ok((resolved, entries)) => {
-                self.local.initialized = true;
-                if self.local.home_path.is_none() {
-                    self.local.home_path = Some(resolved.clone());
-                }
-                self.local.record_arrival(&resolved);
-                let present: BTreeSet<String> =
-                    entries.iter().map(|e| e.full_path.clone()).collect();
-                self.local
-                    .selected_paths
-                    .retain(|selected| present.contains(selected));
-                self.local_entries = entries;
-            }
-            Err(err) => {
-                self.local.navigating_history = false;
-                self.local.error = Some(err);
-            }
-        }
-    }
-
-    /// Re-reads the current local directory.
-    pub fn refresh_local(&mut self, fallback_home: Option<&Path>) {
-        if !self.local.initialized {
-            self.ensure_local_initialized(fallback_home);
-            return;
-        }
-        let path = self.local.current_path.clone();
-        self.navigate_local(&path);
-    }
 }
 
-/// Returns filtered & sorted entries for `side`.
-pub fn visible_pane_entries(
-    state: &SftpDrawerState,
-    side: SftpPaneSide,
-) -> Vec<FileBrowserEntry> {
-    let raw: Vec<FileBrowserEntry> = match side {
-        SftpPaneSide::Local => state.plus.local_entries.clone(),
-        SftpPaneSide::Remote => state
-            .entries()
-            .iter()
-            .map(FileBrowserEntry::from_remote)
-            .collect(),
-    };
-    let prefs = pane_prefs(state, side);
-    sort_and_filter_entries(&raw, prefs)
-}
-
-/// Returns immutable browse preferences for `side`.
-pub fn pane_prefs(state: &SftpDrawerState, side: SftpPaneSide) -> &SftpPaneBrowseState {
-    match side {
-        SftpPaneSide::Local => &state.plus.local,
-        SftpPaneSide::Remote => &state.plus.remote_prefs,
-    }
-}
-
-/// Returns mutable browse preferences for `side`.
-pub fn pane_prefs_mut(
-    state: &mut SftpDrawerState,
-    side: SftpPaneSide,
-) -> &mut SftpPaneBrowseState {
-    match side {
-        SftpPaneSide::Local => &mut state.plus.local,
-        SftpPaneSide::Remote => &mut state.plus.remote_prefs,
-    }
+/// Returns filtered & sorted remote entries for `state`.
+pub fn visible_remote_entries(state: &SftpDrawerState) -> Vec<FileBrowserEntry> {
+    let raw: Vec<FileBrowserEntry> = state
+        .entries()
+        .iter()
+        .map(FileBrowserEntry::from_remote)
+        .collect();
+    sort_and_filter_entries(&raw, &state.plus.remote)
 }
 
 /// Filters hidden entries and substring query, then sorts directories-first using `prefs`.
@@ -590,209 +446,6 @@ pub fn sort_and_filter_entries(
         ordered.then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
     });
     out
-}
-
-/// Resolves the best fallback local home directory from environment variables.
-pub fn default_local_home_dir() -> PathBuf {
-    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home);
-    }
-    if let Some(home) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
-        return PathBuf::from(home);
-    }
-    std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
-}
-
-/// Reads metadata for `dir` into `(resolved_path, entries)`.
-pub fn read_local_dir_entries(dir: &Path) -> Result<(String, Vec<FileBrowserEntry>), String> {
-    let canonical = fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let read = fs::read_dir(&canonical)
-        .map_err(|err| format!("failed to read {}: {err}", canonical.display()))?;
-    let mut out = Vec::new();
-    for item in read {
-        let entry = match item {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
-        let path = entry.path();
-        let name = entry.file_name().to_string_lossy().into_owned();
-        if name.is_empty() {
-            continue;
-        }
-        let sym_meta = fs::symlink_metadata(&path);
-        let follow_meta = fs::metadata(&path);
-        let is_symlink = sym_meta
-            .as_ref()
-            .is_ok_and(|m| m.file_type().is_symlink());
-        let symlink_target = if is_symlink {
-            fs::read_link(&path)
-                .ok()
-                .map(|p| p.to_string_lossy().into_owned())
-        } else {
-            None
-        };
-        let meta = follow_meta.as_ref().ok().or_else(|| sym_meta.as_ref().ok());
-        let is_dir = meta.is_some_and(|m| m.is_dir());
-        let size = if is_dir {
-            0
-        } else {
-            meta.map_or(0, |m| m.len())
-        };
-        let modified_unix_secs = meta
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .and_then(|d| i64::try_from(d.as_secs()).ok());
-        let permissions = meta.map(|m| local_mode_bits(m));
-        out.push(FileBrowserEntry {
-            name,
-            full_path: path.to_string_lossy().into_owned(),
-            is_dir,
-            is_symlink,
-            symlink_target,
-            size,
-            modified_unix_secs,
-            permissions,
-        });
-    }
-    Ok((canonical.to_string_lossy().into_owned(), out))
-}
-
-#[cfg(unix)]
-fn local_mode_bits(meta: &fs::Metadata) -> u32 {
-    use std::os::unix::fs::PermissionsExt as _;
-    meta.permissions().mode() & 0o7777
-}
-
-#[cfg(not(unix))]
-fn local_mode_bits(meta: &fs::Metadata) -> u32 {
-    if meta.is_dir() {
-        0o755
-    } else if meta.permissions().readonly() {
-        0o444
-    } else {
-        0o644
-    }
-}
-
-/// Applies POSIX permission bits to a local file or directory.
-#[cfg(unix)]
-pub fn set_local_permissions(path: &Path, mode_bits: u32) -> Result<(), String> {
-    use std::os::unix::fs::PermissionsExt as _;
-    let perms = fs::Permissions::from_mode(mode_bits & 0o7777);
-    fs::set_permissions(path, perms)
-        .map_err(|err| format!("chmod {} failed: {err}", path.display()))
-}
-
-#[cfg(not(unix))]
-pub fn set_local_permissions(path: &Path, mode_bits: u32) -> Result<(), String> {
-    let mut perms = fs::metadata(path)
-        .map_err(|err| format!("stat {} failed: {err}", path.display()))?
-        .permissions();
-    perms.set_readonly((mode_bits & 0o200) == 0);
-    fs::set_permissions(path, perms)
-        .map_err(|err| format!("chmod {} failed: {err}", path.display()))
-}
-
-/// Recursively copies `src` (file or directory) into destination path `dst`.
-pub fn copy_local_path_recursive(src: &Path, dst: &Path) -> Result<(), String> {
-    let meta = fs::symlink_metadata(src)
-        .map_err(|err| format!("failed to inspect {}: {err}", src.display()))?;
-    if meta.file_type().is_symlink() {
-        #[cfg(unix)]
-        {
-            let target = fs::read_link(src)
-                .map_err(|err| format!("failed to read symlink {}: {err}", src.display()))?;
-            std::os::unix::fs::symlink(&target, dst)
-                .map_err(|err| format!("failed to create symlink {}: {err}", dst.display()))?;
-            return Ok(());
-        }
-        #[cfg(not(unix))]
-        {
-            let resolved = fs::metadata(src)
-                .map_err(|err| format!("failed to resolve {}: {err}", src.display()))?;
-            if resolved.is_dir() {
-                fs::create_dir_all(dst)
-                    .map_err(|err| format!("mkdir {} failed: {err}", dst.display()))?;
-                return Ok(());
-            }
-            fs::copy(src, dst).map_err(|err| format!("copy failed: {err}"))?;
-            return Ok(());
-        }
-    }
-    if meta.is_dir() {
-        if dst == src || dst.starts_with(src) {
-            return Err("Cannot copy a directory into itself".to_string());
-        }
-        fs::create_dir_all(dst)
-            .map_err(|err| format!("failed to create directory {}: {err}", dst.display()))?;
-        for child in fs::read_dir(src)
-            .map_err(|err| format!("failed to read directory {}: {err}", src.display()))?
-        {
-            let child = child.map_err(|err| format!("read dir entry failed: {err}"))?;
-            let child_src = child.path();
-            let child_dst = dst.join(child.file_name());
-            copy_local_path_recursive(&child_src, &child_dst)?;
-        }
-        return Ok(());
-    }
-    if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| format!("mkdir {} failed: {err}", parent.display()))?;
-    }
-    fs::copy(src, dst)
-        .map_err(|err| format!("failed to copy {} to {}: {err}", src.display(), dst.display()))?;
-    Ok(())
-}
-
-/// Deletes a local file, symlink, or directory tree cleanly.
-pub fn remove_local_path(path: &Path, is_dir: bool) -> Result<(), String> {
-    let is_symlink = fs::symlink_metadata(path)
-        .is_ok_and(|m| m.file_type().is_symlink());
-    if is_dir && !is_symlink {
-        fs::remove_dir_all(path)
-            .map_err(|err| format!("failed to remove directory {}: {err}", path.display()))
-    } else {
-        fs::remove_file(path)
-            .map_err(|err| format!("failed to remove {}: {err}", path.display()))
-    }
-}
-
-/// Computes parent directory for a local filesystem path.
-pub fn parent_local_path(path: &str) -> String {
-    let p = Path::new(path);
-    match p.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent.to_string_lossy().into_owned(),
-        _ => path.to_string(),
-    }
-}
-
-/// Chooses an available collision-free local destination path when copying into the same directory.
-pub fn unique_local_copy_path(dst_dir: &Path, file_name: &str) -> PathBuf {
-    let candidate = dst_dir.join(file_name);
-    if !candidate.exists() {
-        return candidate;
-    }
-    let stem = Path::new(file_name)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(file_name);
-    let ext = Path::new(file_name)
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(|e| format!(".{e}"))
-        .unwrap_or_default();
-    for idx in 1..=999u32 {
-        let name = if idx == 1 {
-            format!("{stem} copy{ext}")
-        } else {
-            format!("{stem} copy {idx}{ext}")
-        };
-        let next = dst_dir.join(name);
-        if !next.exists() {
-            return next;
-        }
-    }
-    dst_dir.join(format!("{file_name}.copy"))
 }
 
 /// Formats byte count cleanly matching Tabby SFTP+ (`512 B`, `2.5 KB`, `362.3 KB`, `1.4 MB`).
@@ -848,59 +501,48 @@ pub fn format_octal_mode(mode: u32) -> String {
     format!("{:03o}", mode & 0o777)
 }
 
-/// Joins parent + child entry name cleanly for either local or remote side.
-pub fn join_pane_path(side: SftpPaneSide, parent: &str, name: &str) -> String {
-    match side {
-        SftpPaneSide::Local => Path::new(parent).join(name).to_string_lossy().into_owned(),
-        SftpPaneSide::Remote => join_remote_path(parent, name),
-    }
-}
-
-/// Returns parent path for either local or remote pane.
-pub fn parent_pane_path(side: SftpPaneSide, current: &str) -> String {
-    match side {
-        SftpPaneSide::Local => parent_local_path(current),
-        SftpPaneSide::Remote => parent_remote_path(current),
-    }
-}
-
-/// Renders the full Tabby SFTP+ dual-pane commander (`Local` <-> `Remote`).
-pub fn render_sftp_plus_commander<'a>(
+/// Renders the unified remote-only SFTP Panel (`SFTP+`) docked to the right of an SSH `Pane`.
+#[allow(clippy::too_many_arguments)]
+pub fn render_sftp_panel<'a>(
+    session_id: SessionId,
     state: &'a SftpDrawerState,
     sftp_state: &'a SftpState,
-    active_profile_id: Option<&'a str>,
+    bookmark_key: Option<&'a str>,
     has_connected_ssh: bool,
-    workspace_width: f32,
+    panel_width: f32,
     palette: &ThemePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
     let chrome = ChromePalette::from_palette(palette);
     let snap = state.queue_snapshot();
+    let prefs = &state.plus.remote;
     let remote_label = state.session_label().unwrap_or("Disconnected");
+    let is_focused = state.is_panel_focused();
 
-    let active_layout = state.plus.layout_mode;
     let mut title_row = row![
-        text("SFTP+")
-            .size(FONT_SUBHEAD)
-            .font(ui_font_semibold())
-            .color(chrome.text_primary),
-        space::horizontal().width(Length::Fixed(10.0)),
-        text("Local")
-            .size(FONT_META)
-            .font(ui_font())
-            .color(chrome.text_secondary),
-        container(SftpGlyph::widget(SftpGlyph::Swap, chrome.text_muted, 13.0))
-            .padding([0, 4]),
-        text(format!("Remote ({remote_label})"))
-            .size(FONT_META)
-            .font(mono_font())
-            .color(if has_connected_ssh {
+        SftpGlyph::widget(
+            SftpGlyph::Globe,
+            if is_focused || has_connected_ssh {
                 chrome.accent
             } else {
-                chrome.text_muted
-            })
+                chrome.text_secondary
+            },
+            13.0,
+        ),
+        text("SFTP+")
+            .size(FONT_BODY)
+            .font(ui_font_semibold())
+            .color(if is_focused {
+                chrome.accent
+            } else {
+                chrome.text_primary
+            }),
+        text(remote_label)
+            .size(FONT_META)
+            .font(mono_font())
+            .color(chrome.text_muted)
             .wrapping(text::Wrapping::None),
     ]
-    .spacing(4)
+    .spacing(5)
     .align_y(Alignment::Center);
 
     if let Some(status_label) = state.connection_state().status_label() {
@@ -916,7 +558,7 @@ pub fn render_sftp_plus_commander<'a>(
     }
 
     let transfers_active = snap.active_count + snap.queued_count;
-    let transfers_badge_label = if transfers_active > 0 {
+    let transfers_label = if transfers_active > 0 {
         format!("Transfers ({transfers_active})")
     } else if snap.transfers.is_empty() {
         "Transfers".to_string()
@@ -927,14 +569,16 @@ pub fn render_sftp_plus_commander<'a>(
         row![
             SftpGlyph::widget(
                 SftpGlyph::Transfers,
-                if transfers_active > 0 {
+                if state.plus.transfers_panel_open {
+                    chrome.accent_fg
+                } else if transfers_active > 0 {
                     chrome.accent
                 } else {
                     chrome.text_secondary
                 },
-                13.0
+                12.0,
             ),
-            text(transfers_badge_label)
+            text(transfers_label)
                 .size(FONT_META)
                 .font(ui_font_medium())
                 .color(if state.plus.transfers_panel_open {
@@ -943,10 +587,10 @@ pub fn render_sftp_plus_commander<'a>(
                     chrome.text_primary
                 }),
         ]
-        .spacing(5)
+        .spacing(4)
         .align_y(Alignment::Center),
     )
-    .padding([4, 9])
+    .padding([3, 8])
     .style(pill_button_style(
         chrome,
         if state.plus.transfers_panel_open {
@@ -955,162 +599,35 @@ pub fn render_sftp_plus_commander<'a>(
             PillTone::Subtle
         },
     ))
-    .on_press(Message::SftpToggleTransfersPanel);
-
-    let layout_btn = |glyph: SftpGlyph, mode: SftpLayoutMode| {
-        let is_active = active_layout == mode;
-        button(SftpGlyph::widget(
-            glyph,
-            if is_active {
-                chrome.accent
-            } else {
-                chrome.text_secondary
-            },
-            14.0,
-        ))
-        .padding([5, 7])
-        .style(tab_bar_button_style(chrome, is_active, false))
-        .on_press(Message::SftpSetLayoutMode(mode))
-    };
+    .on_press(Message::SftpSessionToggleTransfersPanel(session_id));
 
     let header_bar = container(
         row![
             container(title_row).width(Length::Fill).clip(true),
             transfers_btn,
-            layout_btn(SftpGlyph::LayoutHorizontal, SftpLayoutMode::DualHorizontal),
-            layout_btn(SftpGlyph::LayoutVertical, SftpLayoutMode::DualVertical),
-            layout_btn(SftpGlyph::LayoutSideDock, SftpLayoutMode::SideDock),
-            button(text("×").size(15.0).color(chrome.text_secondary))
-                .padding([2, 8])
+            button(text("×").size(14.0).color(chrome.text_secondary))
+                .padding([2, 7])
                 .style(tab_bar_button_style(chrome, false, false))
-                .on_press(Message::SetSftpDrawerOpen(false)),
+                .on_press(Message::SftpSessionClose(session_id)),
         ]
         .spacing(4)
         .align_y(Alignment::Center),
     )
-    .padding(Padding::from([5, 10]))
+    .padding(Padding::from([5, 8]))
     .width(Length::Fill)
     .style(move |_| container::Style {
         background: Some(chrome.chrome_bg.into()),
-        ..container::Style::default()
-    });
-
-    let pane_width = match active_layout {
-        SftpLayoutMode::DualHorizontal => (workspace_width * 0.5).max(320.0),
-        SftpLayoutMode::DualVertical | SftpLayoutMode::SideDock => workspace_width.max(360.0),
-    };
-
-    let local_pane = render_sftp_pane(
-        state,
-        SftpPaneSide::Local,
-        sftp_state.local_bookmarks(),
-        true,
-        pane_width,
-        chrome,
-    );
-    let remote_bookmarks = active_profile_id
-        .map(|pid| sftp_state.remote_bookmarks(pid))
-        .unwrap_or(&[]);
-    let remote_pane = render_sftp_pane(
-        state,
-        SftpPaneSide::Remote,
-        remote_bookmarks,
-        has_connected_ssh,
-        pane_width,
-        chrome,
-    );
-
-    let panes: Element<'a, Message, Theme, iced::Renderer> = match active_layout {
-        SftpLayoutMode::DualVertical => column![local_pane, hairline_h(chrome), remote_pane]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into(),
-        SftpLayoutMode::DualHorizontal | SftpLayoutMode::SideDock => {
-            row![local_pane, hairline_v(chrome), remote_pane]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into()
-        }
-    };
-
-    let mut root = column![header_bar, hairline_h(chrome), panes].width(Length::Fill).height(Length::Fill);
-
-    if state.plus.transfers_panel_open {
-        let queue_tray = container(
-            scrollable(
-                container(render_transfer_queue_section(state, chrome))
-                    .padding(Padding::from([8, 12])),
-            )
-            .height(Length::Fixed(164.0))
-            .style(tabby_scrollable_style(chrome)),
-        )
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(chrome.panel_bg.into()),
-            ..container::Style::default()
-        });
-        root = root.push(hairline_h(chrome)).push(queue_tray);
-    }
-
-    let commander = container(root)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(chrome.term_bg.into()),
-            ..container::Style::default()
-        });
-
-    SftpFileDropArea::wrap(commander.into())
-}
-
-fn render_sftp_pane<'a>(
-    state: &'a SftpDrawerState,
-    side: SftpPaneSide,
-    bookmarks: &'a [String],
-    connected: bool,
-    pane_width: f32,
-    chrome: ChromePalette,
-) -> Element<'a, Message, Theme, iced::Renderer> {
-    let prefs = pane_prefs(state, side);
-    let is_active = state.plus.active_pane == side;
-    let current_path = match side {
-        SftpPaneSide::Local => prefs.current_path.as_str(),
-        SftpPaneSide::Remote => state.current_path(),
-    };
-    let loading = match side {
-        SftpPaneSide::Local => prefs.loading,
-        SftpPaneSide::Remote => state.is_loading(),
-    };
-    let error = match side {
-        SftpPaneSide::Local => prefs.error.as_deref(),
-        SftpPaneSide::Remote => state.browser_error(),
-    };
-
-    let side_glyph = match side {
-        SftpPaneSide::Local => SftpGlyph::Computer,
-        SftpPaneSide::Remote => SftpGlyph::Globe,
-    };
-    let pane_badge = row![
-        SftpGlyph::widget(
-            side_glyph,
-            if is_active {
+        border: Border {
+            color: if is_focused {
                 chrome.accent
             } else {
-                chrome.text_secondary
+                Color::TRANSPARENT
             },
-            14.0,
-        ),
-        text(side.label())
-            .size(FONT_META)
-            .font(ui_font_medium())
-            .color(if is_active {
-                chrome.text_primary
-            } else {
-                chrome.text_secondary
-            }),
-    ]
-    .spacing(5)
-    .align_y(Alignment::Center);
+            width: if is_focused { 1.0 } else { 0.0 },
+            radius: 0.0.into(),
+        },
+        ..container::Style::default()
+    });
 
     let nav_icon = |glyph: SftpGlyph, enabled: bool, msg: Message| {
         let color = if enabled {
@@ -1130,19 +647,11 @@ fn render_sftp_pane<'a>(
         btn
     };
 
-    let path_id = match side {
-        SftpPaneSide::Local => Id::new(SFTP_PATH_INPUT_LOCAL_ID),
-        SftpPaneSide::Remote => Id::new(SFTP_PATH_INPUT_REMOTE_ID),
-    };
-    let path_input = text_input("Path...", &prefs.path_input)
-        .id(path_id)
-        .size(FONT_META)
-        .font(ui_font())
-        .padding([4, 8])
-        .width(Length::Fill)
-        .style(styled_input_style(chrome))
-        .on_input(move |v| Message::SftpPanePathInputChanged(side, v))
-        .on_submit(Message::SftpPaneNavigateSubmitted(side));
+    let current_path = state.current_path();
+    let bookmarks = bookmark_key
+        .map(|key| sftp_state.remote_bookmarks(key))
+        .unwrap_or(&[]);
+    let current_bookmarked = !current_path.is_empty() && bookmarks.iter().any(|b| b == current_path);
 
     let hidden_btn = button(SftpGlyph::widget(
         SftpGlyph::Eye,
@@ -1155,7 +664,7 @@ fn render_sftp_pane<'a>(
     ))
     .padding([4, 6])
     .style(tab_bar_button_style(chrome, prefs.show_hidden, false))
-    .on_press(Message::SftpPaneToggleHidden(side));
+    .on_press(Message::SftpSessionToggleHidden(session_id));
 
     let filter_btn = button(SftpGlyph::widget(
         SftpGlyph::Filter,
@@ -1172,10 +681,8 @@ fn render_sftp_pane<'a>(
         prefs.filter_open || !prefs.filter_query.is_empty(),
         false,
     ))
-    .on_press(Message::SftpPaneToggleFilter(side));
+    .on_press(Message::SftpSessionToggleFilter(session_id));
 
-    let current_bookmarked = !current_path.is_empty()
-        && bookmarks.iter().any(|b| b == current_path);
     let star_btn = button(SftpGlyph::widget(
         if current_bookmarked {
             SftpGlyph::StarFilled
@@ -1191,10 +698,10 @@ fn render_sftp_pane<'a>(
     ))
     .padding([4, 6])
     .style(tab_bar_button_style(chrome, prefs.bookmarks_open, false))
-    .on_press(Message::SftpPaneToggleBookmarks(side));
+    .on_press(Message::SftpSessionToggleBookmarks(session_id));
 
     let bookmark_menu = render_bookmarks_popover(
-        side,
+        session_id,
         current_path,
         current_bookmarked,
         bookmarks,
@@ -1204,45 +711,106 @@ fn render_sftp_pane<'a>(
         star_btn.into(),
         prefs.bookmarks_open,
         bookmark_menu,
-        264.0,
-        Message::SftpPaneDismissBookmarks(side),
+        244.0,
+        Message::SftpSessionDismissBookmarks(session_id),
     );
 
+    let upload_btn = |glyph: SftpGlyph, label: &'static str, msg: Message| {
+        let mut btn = button(
+            row![
+                SftpGlyph::widget(
+                    glyph,
+                    if has_connected_ssh {
+                        chrome.text_secondary
+                    } else {
+                        Color {
+                            a: 0.35,
+                            ..chrome.text_muted
+                        }
+                    },
+                    12.0,
+                ),
+                text(label)
+                    .size(FONT_META)
+                    .color(if has_connected_ssh {
+                        chrome.text_secondary
+                    } else {
+                        Color {
+                            a: 0.35,
+                            ..chrome.text_muted
+                        }
+                    }),
+            ]
+            .spacing(3)
+            .align_y(Alignment::Center),
+        )
+        .padding([3, 6])
+        .style(tab_bar_button_style(chrome, false, false));
+        if has_connected_ssh {
+            btn = btn.on_press(msg);
+        }
+        btn
+    };
+
+    let controls_row = row![
+        nav_icon(
+            SftpGlyph::ChevronLeft,
+            prefs.can_go_back(),
+            Message::SftpSessionBack(session_id),
+        ),
+        nav_icon(
+            SftpGlyph::ChevronRight,
+            prefs.can_go_forward(),
+            Message::SftpSessionForward(session_id),
+        ),
+        nav_icon(
+            SftpGlyph::ArrowUp,
+            !current_path.is_empty() && current_path != "/",
+            Message::SftpSessionUp(session_id),
+        ),
+        nav_icon(
+            SftpGlyph::Refresh,
+            has_connected_ssh,
+            Message::SftpSessionRefresh(session_id),
+        ),
+        nav_icon(
+            SftpGlyph::Home,
+            has_connected_ssh,
+            Message::SftpSessionHome(session_id),
+        ),
+        upload_btn(
+            SftpGlyph::UploadFile,
+            "File",
+            Message::SftpSessionUploadFiles(session_id),
+        ),
+        upload_btn(
+            SftpGlyph::UploadFolder,
+            "Dir",
+            Message::SftpSessionUploadFolder(session_id),
+        ),
+        hidden_btn,
+        filter_btn,
+        bookmarks_anchor,
+    ]
+    .spacing(2)
+    .align_y(Alignment::Center)
+    .wrap()
+    .vertical_spacing(3);
+
+    let path_input = text_input("Remote path...", &prefs.path_input)
+        .id(Id::from(format!("sftp-remote-path-{}", session_id.0)))
+        .size(FONT_META)
+        .font(mono_font())
+        .padding([4, 8])
+        .width(Length::Fill)
+        .style(styled_input_style(chrome))
+        .on_input(move |v| Message::SftpSessionPathInputChanged(session_id, v))
+        .on_submit(Message::SftpSessionNavigateSubmitted(session_id));
+
     let toolbar = container(
-        row![
-            pane_badge,
-            nav_icon(
-                SftpGlyph::ChevronLeft,
-                prefs.can_go_back(),
-                Message::SftpPaneBack(side),
-            ),
-            nav_icon(
-                SftpGlyph::ChevronRight,
-                prefs.can_go_forward(),
-                Message::SftpPaneForward(side),
-            ),
-            nav_icon(
-                SftpGlyph::ArrowUp,
-                !current_path.is_empty() && current_path != "/",
-                Message::SftpPaneUp(side),
-            ),
-            nav_icon(
-                SftpGlyph::Refresh,
-                connected || side == SftpPaneSide::Local,
-                Message::SftpPaneRefresh(side),
-            ),
-            nav_icon(
-                SftpGlyph::Home,
-                connected || side == SftpPaneSide::Local,
-                Message::SftpPaneHome(side),
-            ),
-            path_input,
-            hidden_btn,
-            filter_btn,
-            bookmarks_anchor,
-        ]
-        .spacing(3)
-        .align_y(Alignment::Center),
+        column![controls_row, path_input]
+            .spacing(4)
+            .width(Length::Fill),
     )
     .padding(Padding::from([5, 8]))
     .width(Length::Fill)
@@ -1251,7 +819,7 @@ fn render_sftp_pane<'a>(
         ..container::Style::default()
     });
 
-    let mut pane_col = column![toolbar, hairline_h(chrome)]
+    let mut panel_col = column![header_bar, hairline_h(chrome), toolbar, hairline_h(chrome)]
         .width(Length::Fill)
         .height(Length::Fill);
 
@@ -1264,11 +832,11 @@ fn render_sftp_pane<'a>(
                     .padding([3, 7])
                     .width(Length::Fill)
                     .style(styled_input_style(chrome))
-                    .on_input(move |q| Message::SftpPaneFilterChanged(side, q)),
+                    .on_input(move |q| Message::SftpSessionFilterChanged(session_id, q)),
                 button(text("×").size(13.0).color(chrome.text_muted))
                     .padding([2, 6])
                     .style(tab_bar_button_style(chrome, false, false))
-                    .on_press(Message::SftpPaneToggleFilter(side)),
+                    .on_press(Message::SftpSessionToggleFilter(session_id)),
             ]
             .spacing(6)
             .align_y(Alignment::Center),
@@ -1279,83 +847,89 @@ fn render_sftp_pane<'a>(
             background: Some(chrome.chrome_bg.into()),
             ..container::Style::default()
         });
-        pane_col = pane_col.push(filter_row).push(hairline_h(chrome));
+        panel_col = panel_col.push(filter_row).push(hairline_h(chrome));
     }
 
-    if side == SftpPaneSide::Remote {
-        match state.connection_state() {
-            SftpConnectionState::AutoReconnecting { .. } => {
-                let label = state
-                    .connection_state()
-                    .status_label()
-                    .unwrap_or_else(|| "Auto-reconnecting...".to_string());
-                let banner = container(
-                    row![
-                        status_dot(chrome.warning),
-                        text(label)
-                            .size(FONT_META)
-                            .color(chrome.warning)
-                            .width(Length::Fill),
-                        button(text("Retry now").size(FONT_META).color(chrome.text_primary))
-                            .padding([2, 7])
-                            .style(pill_button_style(chrome, PillTone::Subtle))
-                            .on_press(Message::SftpPaneRefresh(side)),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                )
-                .padding(Padding::from([5, 10]))
-                .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(chrome.warning_soft.into()),
-                    ..container::Style::default()
-                });
-                pane_col = pane_col.push(banner).push(hairline_h(chrome));
-            }
-            SftpConnectionState::ReconnectedSuccessfully => {
-                let banner = container(
-                    row![
-                        status_dot(chrome.success),
-                        text("Reconnected successfully")
-                            .size(FONT_META)
-                            .font(ui_font_medium())
-                            .color(chrome.success),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                )
-                .padding(Padding::from([5, 10]))
-                .width(Length::Fill)
-                .style(move |_| container::Style {
-                    background: Some(chrome.success_soft.into()),
-                    ..container::Style::default()
-                });
-                pane_col = pane_col.push(banner).push(hairline_h(chrome));
-            }
-            _ => {}
+    match state.connection_state() {
+        SftpConnectionState::AutoReconnecting { .. } => {
+            let label = state
+                .connection_state()
+                .status_label()
+                .unwrap_or_else(|| "Auto-reconnecting...".to_string());
+            let banner = container(
+                row![
+                    status_dot(chrome.warning),
+                    text(label)
+                        .size(FONT_META)
+                        .color(chrome.warning)
+                        .width(Length::Fill),
+                    button(text("Retry now").size(FONT_META).color(chrome.text_primary))
+                        .padding([2, 7])
+                        .style(pill_button_style(chrome, PillTone::Subtle))
+                        .on_press(Message::SftpSessionRefresh(session_id)),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([5, 8]))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(chrome.warning_soft.into()),
+                ..container::Style::default()
+            });
+            panel_col = panel_col.push(banner).push(hairline_h(chrome));
         }
+        SftpConnectionState::ReconnectedSuccessfully => {
+            let banner = container(
+                row![
+                    status_dot(chrome.success),
+                    text("Reconnected successfully")
+                        .size(FONT_META)
+                        .font(ui_font_medium())
+                        .color(chrome.success),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding(Padding::from([5, 8]))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(chrome.success_soft.into()),
+                ..container::Style::default()
+            });
+            panel_col = panel_col.push(banner).push(hairline_h(chrome));
+        }
+        _ => {}
     }
 
-    if side == SftpPaneSide::Remote
-        && !connected
+    if !has_connected_ssh
         && !matches!(
             state.connection_state(),
             SftpConnectionState::AutoReconnecting { .. }
         )
     {
         let banner = container(
-            text("No active SSH connection. Open SFTP+ from an SSH session to browse Remote.")
-                .size(FONT_META)
-                .color(chrome.text_muted),
+            row![
+                text("SSH session disconnected — reconnect to browse remote files.")
+                    .size(FONT_META)
+                    .color(chrome.text_muted)
+                    .width(Length::Fill),
+                button(text("Retry").size(FONT_META))
+                    .padding([2, 7])
+                    .style(pill_button_style(chrome, PillTone::Subtle))
+                    .on_press(Message::SftpSessionRefresh(session_id)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center),
         )
-        .padding(Padding::from([6, 10]))
+        .padding(Padding::from([5, 8]))
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(chrome.well_bg.into()),
             ..container::Style::default()
         });
-        pane_col = pane_col.push(banner).push(hairline_h(chrome));
-    } else if let Some(err) = error {
+        panel_col = panel_col.push(banner).push(hairline_h(chrome));
+    } else if let Some(err) = state.browser_error() {
         let err_bar = container(
             row![
                 text(err.to_string())
@@ -1365,22 +939,60 @@ fn render_sftp_pane<'a>(
                 button(text("Retry").size(FONT_META).color(chrome.text_primary))
                     .padding([2, 7])
                     .style(pill_button_style(chrome, PillTone::Subtle))
-                    .on_press(Message::SftpPaneRefresh(side)),
+                    .on_press(Message::SftpSessionRefresh(session_id)),
             ]
-            .spacing(8)
+            .spacing(6)
             .align_y(Alignment::Center),
         )
-        .padding(Padding::from([5, 10]))
+        .padding(Padding::from([5, 8]))
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(chrome.danger_soft.into()),
             ..container::Style::default()
         });
-        pane_col = pane_col.push(err_bar).push(hairline_h(chrome));
+        panel_col = panel_col.push(err_bar).push(hairline_h(chrome));
     }
 
-    let show_perm = pane_width >= 500.0;
-    let show_modified = pane_width >= 370.0;
+    if let Some(notice) = state.transport_notice()
+        && notice.mode == SftpTransportMode::MuxFallback
+    {
+        let copy = notice
+            .message
+            .clone()
+            .unwrap_or_else(|| "Mux fallback on Primary Transport".to_string());
+        panel_col = panel_col
+            .push(
+                container(
+                    row![status_dot(chrome.warning), text(copy).size(11.0).color(chrome.text_muted)]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                )
+                .padding(Padding::from([4, 8]))
+                .width(Length::Fill)
+                .style(move |_| container::Style {
+                    background: Some(chrome.bg_more.into()),
+                    ..container::Style::default()
+                }),
+            )
+            .push(hairline_h(chrome));
+    }
+
+    if let Some(notice) = state.last_transfer_notice() {
+        panel_col = panel_col
+            .push(
+                container(text(notice.to_string()).size(11.0).color(chrome.warning))
+                    .padding(Padding::from([4, 8]))
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: Some(chrome.warning_soft.into()),
+                        ..container::Style::default()
+                    }),
+            )
+            .push(hairline_h(chrome));
+    }
+
+    let show_perm = panel_width >= 500.0;
+    let show_modified = panel_width >= 370.0;
 
     let col_header = |title: &'static str, col: SftpSortColumn, width: Length| {
         let indicator = if prefs.sort_col == col {
@@ -1399,9 +1011,9 @@ fn render_sftp_pane<'a>(
             .wrapping(text::Wrapping::None);
         button(container(label).width(Length::Fill).clip(true))
             .width(width)
-            .padding(Padding::from([4, 6]))
+            .padding(Padding::from([4, 5]))
             .style(list_row_button_style(chrome, false))
-            .on_press(Message::SftpPaneSortBy(side, col))
+            .on_press(Message::SftpSessionSortBy(session_id, col))
     };
 
     let mut header_row = row![col_header("Name", SftpSortColumn::Name, Length::Fill)]
@@ -1410,34 +1022,34 @@ fn render_sftp_pane<'a>(
     header_row = header_row.push(col_header(
         "Size",
         SftpSortColumn::Size,
-        Length::Fixed(82.0),
+        Length::Fixed(72.0),
     ));
     if show_modified {
         header_row = header_row.push(col_header(
             "Modified",
             SftpSortColumn::Modified,
-            Length::Fixed(142.0),
+            Length::Fixed(132.0),
         ));
     }
     if show_perm {
         header_row = header_row.push(col_header(
             "Permission",
             SftpSortColumn::Permission,
-            Length::Fixed(90.0),
+            Length::Fixed(86.0),
         ));
     }
 
     let table_header = container(header_row)
-        .padding(Padding::from([1, 6]))
+        .padding(Padding::from([1, 4]))
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(chrome.chrome_bg.into()),
             ..container::Style::default()
         });
 
-    pane_col = pane_col.push(table_header).push(hairline_h(chrome));
+    panel_col = panel_col.push(table_header).push(hairline_h(chrome));
 
-    let entries = visible_pane_entries(state, side);
+    let entries = visible_remote_entries(state);
     let total_items = entries.len();
     let selected_entries: Vec<&FileBrowserEntry> = entries
         .iter()
@@ -1451,15 +1063,15 @@ fn render_sftp_pane<'a>(
         .sum();
 
     let rows_content: Element<'a, Message, Theme, iced::Renderer> = if entries.is_empty() {
-        let empty_msg = if loading {
-            "Loading directory..."
+        let empty_msg = if state.is_loading() {
+            "Loading remote directory..."
         } else if !prefs.filter_query.is_empty() {
             "No matching entries"
         } else {
-            "Directory is empty"
+            "Directory is empty (drop files here to upload)"
         };
         container(text(empty_msg).size(FONT_META).color(chrome.text_muted))
-            .padding(16)
+            .padding(14)
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
@@ -1469,7 +1081,6 @@ fn render_sftp_pane<'a>(
             let is_selected = prefs.selected_paths.contains(&entry.full_path);
             let is_cut = state.plus.clipboard.as_ref().is_some_and(|clip| {
                 clip.op == SftpClipboardOp::Cut
-                    && clip.source_side == side
                     && clip.entries.iter().any(|c| c.full_path == entry.full_path)
             });
 
@@ -1493,8 +1104,6 @@ fn render_sftp_pane<'a>(
                     a: 0.5,
                     ..chrome.text_muted
                 }
-            } else if is_selected {
-                chrome.text_primary
             } else {
                 chrome.text_primary
             };
@@ -1534,7 +1143,7 @@ fn render_sftp_pane<'a>(
                         .color(meta_color)
                         .wrapping(text::Wrapping::None),
                 )
-                .width(Length::Fixed(82.0))
+                .width(Length::Fixed(72.0))
                 .clip(true),
             ]
             .spacing(4)
@@ -1549,7 +1158,7 @@ fn render_sftp_pane<'a>(
                             .color(meta_color)
                             .wrapping(text::Wrapping::None),
                     )
-                    .width(Length::Fixed(142.0))
+                    .width(Length::Fixed(132.0))
                     .clip(true),
                 );
             }
@@ -1562,13 +1171,13 @@ fn render_sftp_pane<'a>(
                             .color(meta_color)
                             .wrapping(text::Wrapping::None),
                     )
-                    .width(Length::Fixed(90.0))
+                    .width(Length::Fixed(86.0))
                     .clip(true),
                 );
             }
 
             let row_widget = SftpRowInteract::wrap(
-                side,
+                session_id,
                 entry.full_path.clone(),
                 is_selected,
                 chrome,
@@ -1586,8 +1195,8 @@ fn render_sftp_pane<'a>(
             .into()
     };
 
-    let surface = SftpPaneSurface::wrap(side, rows_content);
-    pane_col = pane_col.push(
+    let surface = SftpPaneSurface::wrap(session_id, rows_content);
+    panel_col = panel_col.push(
         container(surface)
             .width(Length::Fill)
             .height(Length::Fill),
@@ -1596,11 +1205,11 @@ fn render_sftp_pane<'a>(
     let footer_text = if selected_count > 0 {
         if selected_bytes > 0 {
             format!(
-                "{total_items} items — Selected {selected_count} items ({})",
+                "{total_items} items — Selected {selected_count} ({})",
                 format_sftp_size(selected_bytes)
             )
         } else {
-            format!("{total_items} items — Selected {selected_count} items")
+            format!("{total_items} items — Selected {selected_count}")
         }
     } else {
         format!("{total_items} items")
@@ -1611,9 +1220,9 @@ fn render_sftp_pane<'a>(
             .color(chrome.text_secondary)
             .width(Length::Fill),
     ]
-    .spacing(8)
+    .spacing(6)
     .align_y(Alignment::Center);
-    if loading {
+    if state.is_loading() {
         footer_row = footer_row.push(
             text("Loading...")
                 .size(FONT_META)
@@ -1622,27 +1231,167 @@ fn render_sftp_pane<'a>(
     }
 
     let footer = container(footer_row)
-        .padding(Padding::from([4, 10]))
+        .padding(Padding::from([4, 8]))
         .width(Length::Fill)
         .style(move |_| container::Style {
             background: Some(chrome.chrome_bg.into()),
             ..container::Style::default()
         });
 
-    pane_col = pane_col.push(hairline_h(chrome)).push(footer);
+    panel_col = panel_col.push(hairline_h(chrome)).push(footer);
 
-    container(pane_col)
+    if let Some(watched_bar) =
+        render_watched_open_with_bar(session_id, &state.plus.watched_files, chrome)
+    {
+        panel_col = panel_col.push(hairline_h(chrome)).push(watched_bar);
+    }
+
+    if state.plus.transfers_panel_open {
+        let queue_tray = container(
+            scrollable(
+                container(render_transfer_queue_section(state, chrome))
+                    .padding(Padding::from([6, 8])),
+            )
+            .height(Length::Fixed(164.0))
+            .style(tabby_scrollable_style(chrome)),
+        )
+        .width(Length::Fill)
+        .style(move |_| container::Style {
+            background: Some(chrome.panel_bg.into()),
+            ..container::Style::default()
+        });
+        panel_col = panel_col.push(hairline_h(chrome)).push(queue_tray);
+    }
+
+    let panel_box = container(panel_col)
         .width(Length::Fill)
         .height(Length::Fill)
         .style(move |_| container::Style {
             background: Some(chrome.term_bg.into()),
             ..container::Style::default()
-        })
-        .into()
+        });
+
+    SftpPanelInteract::wrap(session_id, panel_box.into())
+}
+
+fn render_watched_open_with_bar<'a>(
+    session_id: SessionId,
+    watched: &[WatchedRemoteFile],
+    chrome: ChromePalette,
+) -> Option<Element<'a, Message, Theme, iced::Renderer>> {
+    if watched.is_empty() {
+        return None;
+    }
+    let mut col = column![].spacing(4);
+    for item in watched {
+        let watch_id = item.id;
+        let is_uploading = item.pending_upload_id.is_some();
+        let dot_color = if item.upload_failed {
+            chrome.danger
+        } else if item.pending_local_change {
+            chrome.warning
+        } else if is_uploading {
+            chrome.accent
+        } else {
+            chrome.success
+        };
+        let summary = if is_uploading {
+            format!("Uploading {} ({})...", item.file_name, item.app_name)
+        } else if item.pending_local_change {
+            if let Some(note) = &item.status_note {
+                format!("{} — {note}", item.file_name)
+            } else {
+                format!("{} modified locally ({})", item.file_name, item.app_name)
+            }
+        } else if let Some(note) = &item.status_note {
+            format!("{} ({}) — {note}", item.file_name, item.app_name)
+        } else {
+            format!("Watching {} ({})", item.file_name, item.app_name)
+        };
+        let summary_color = if item.upload_failed {
+            chrome.danger
+        } else if item.pending_local_change {
+            chrome.warning
+        } else {
+            chrome.text_secondary
+        };
+
+        let mut row_el = row![
+            status_dot(dot_color),
+            text(summary)
+                .size(11.0)
+                .color(summary_color)
+                .width(Length::Fill),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        if item.pending_local_change && !is_uploading {
+            row_el = row_el.push(
+                button(text("Upload").size(11.0).font(ui_font_medium()))
+                    .padding([2, 7])
+                    .style(pill_button_style(chrome, PillTone::Primary))
+                    .on_press(Message::SftpOpenWithUploadNow {
+                        session_id,
+                        watch_id,
+                    }),
+            );
+            row_el = row_el.push(
+                button(text("Ignore").size(11.0))
+                    .padding([2, 7])
+                    .style(pill_button_style(chrome, PillTone::Subtle))
+                    .on_press(Message::SftpOpenWithIgnoreChange {
+                        session_id,
+                        watch_id,
+                    }),
+            );
+        }
+
+        let auto_label = if item.auto_upload {
+            "Auto: ON"
+        } else {
+            "Auto"
+        };
+        let auto_tone = if item.auto_upload {
+            PillTone::Primary
+        } else {
+            PillTone::Subtle
+        };
+        row_el = row_el.push(
+            button(text(auto_label).size(11.0))
+                .padding([2, 7])
+                .style(pill_button_style(chrome, auto_tone))
+                .on_press(Message::SftpOpenWithToggleAutoSync {
+                    session_id,
+                    watch_id,
+                }),
+        );
+        row_el = row_el.push(
+            button(text("×").size(12.0).color(chrome.text_muted))
+                .padding([1, 5])
+                .style(tab_bar_button_style(chrome, false, false))
+                .on_press(Message::SftpOpenWithStopWatch {
+                    session_id,
+                    watch_id,
+                }),
+        );
+
+        col = col.push(row_el);
+    }
+    Some(
+        container(col)
+            .padding(Padding::from([5, 8]))
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: Some(chrome.panel_bg.into()),
+                ..container::Style::default()
+            })
+            .into(),
+    )
 }
 
 fn render_bookmarks_popover<'a>(
-    side: SftpPaneSide,
+    session_id: SessionId,
     current_path: &str,
     is_bookmarked: bool,
     bookmarks: &[String],
@@ -1664,14 +1413,14 @@ fn render_bookmarks_popover<'a>(
     .padding([5, 8])
     .style(list_row_button_style(chrome, false));
     if !current_path.is_empty() {
-        toggle_btn = toggle_btn.on_press(Message::SftpPaneToggleBookmarkCurrent(side));
+        toggle_btn = toggle_btn.on_press(Message::SftpSessionToggleBookmarkCurrent(session_id));
     }
     col = col.push(toggle_btn).push(hairline_h(chrome));
 
     if bookmarks.is_empty() {
         col = col.push(
             container(
-                text("No saved bookmarks for this pane")
+                text("No saved remote bookmarks")
                     .size(FONT_META)
                     .color(chrome.text_muted),
             )
@@ -1698,15 +1447,15 @@ fn render_bookmarks_popover<'a>(
                 .width(Length::Fill)
                 .padding([4, 6])
                 .style(list_row_button_style(chrome, active))
-                .on_press(Message::SftpPaneSelectBookmark {
-                    side,
+                .on_press(Message::SftpSessionSelectBookmark {
+                    session_id,
                     path: path_for_jump,
                 }),
                 button(text("×").size(13.0).color(chrome.text_muted))
                     .padding([3, 6])
                     .style(tab_bar_button_style(chrome, false, false))
-                    .on_press(Message::SftpPaneRemoveBookmark {
-                        side,
+                    .on_press(Message::SftpSessionRemoveBookmark {
+                        session_id,
                         path: path_for_del,
                     }),
             ]
@@ -1720,12 +1469,12 @@ fn render_bookmarks_popover<'a>(
     }
 
     container(col)
-        .width(Length::Fixed(264.0))
+        .width(Length::Fixed(244.0))
         .style(move |_| modal_card_style(chrome, false))
         .into()
 }
 
-/// Renders the floating SFTP+ right-click context menu over a click-dismiss backdrop.
+/// Renders the floating SFTP Panel right-click context menu over a click-dismiss backdrop.
 pub fn render_sftp_context_menu_overlay<'a>(
     state: &'a SftpDrawerState,
     has_connected_ssh: bool,
@@ -1736,23 +1485,17 @@ pub fn render_sftp_context_menu_overlay<'a>(
     if !state.plus.context_menu.open {
         return None;
     }
-    let side = state.plus.context_menu.side?;
     let chrome = ChromePalette::from_palette(palette);
-    let prefs = pane_prefs(state, side);
-    let visible = visible_pane_entries(state, side);
+    let visible = visible_remote_entries(state);
     let selected_entries: Vec<&FileBrowserEntry> = visible
         .iter()
-        .filter(|e| prefs.selected_paths.contains(&e.full_path))
+        .filter(|e| state.plus.remote.selected_paths.contains(&e.full_path))
         .collect();
     let sel_count = selected_entries.len();
+    let single_selected = sel_count == 1;
     let single_file = sel_count == 1 && !selected_entries[0].is_dir;
     let has_selection = sel_count > 0;
-    let can_paste = state.plus.clipboard.is_some()
-        && (side == SftpPaneSide::Local || has_connected_ssh);
-    let transfer_label = match side {
-        SftpPaneSide::Local => "Upload",
-        SftpPaneSide::Remote => "Download",
-    };
+    let can_paste = state.plus.clipboard.is_some() && has_connected_ssh;
 
     let mut items = column![].spacing(2);
     let add_item = |col: iced::widget::Column<'a, Message, Theme, iced::Renderer>,
@@ -1796,14 +1539,54 @@ pub fn render_sftp_context_menu_overlay<'a>(
 
     items = add_item(
         items,
-        transfer_label,
+        "Download",
         None,
         has_selection && has_connected_ssh,
-        SftpContextActionKind::Transfer,
+        SftpContextActionKind::Download,
+    );
+    items = add_item(
+        items,
+        "Download to...",
+        None,
+        has_selection && has_connected_ssh,
+        SftpContextActionKind::DownloadTo,
+    );
+    items = add_item(
+        items,
+        "Upload Files...",
+        None,
+        has_connected_ssh,
+        SftpContextActionKind::UploadFiles,
+    );
+    items = add_item(
+        items,
+        "Upload Folder...",
+        None,
+        has_connected_ssh,
+        SftpContextActionKind::UploadFolder,
     );
     items = items.push(hairline_h(chrome));
-    items = add_item(items, "View", None, single_file, SftpContextActionKind::View);
-    items = add_item(items, "Edit", None, single_file, SftpContextActionKind::Edit);
+    items = add_item(
+        items,
+        "View",
+        None,
+        single_file && has_connected_ssh,
+        SftpContextActionKind::View,
+    );
+    items = add_item(
+        items,
+        "Edit",
+        None,
+        single_file && has_connected_ssh,
+        SftpContextActionKind::Edit,
+    );
+    items = add_item(
+        items,
+        "Open with...",
+        None,
+        single_selected && has_connected_ssh,
+        SftpContextActionKind::OpenWith,
+    );
     items = items.push(hairline_h(chrome));
     items = add_item(
         items,
@@ -1833,14 +1616,14 @@ pub fn render_sftp_context_menu_overlay<'a>(
         items,
         "Rename",
         Some("F2"),
-        sel_count == 1,
+        sel_count == 1 && has_connected_ssh,
         SftpContextActionKind::Rename,
     );
     items = add_item(
         items,
         "Delete",
         Some("Delete"),
-        has_selection,
+        has_selection && has_connected_ssh,
         SftpContextActionKind::Delete,
     );
     items = items.push(hairline_h(chrome));
@@ -1848,7 +1631,7 @@ pub fn render_sftp_context_menu_overlay<'a>(
         items,
         "Edit Permissions",
         None,
-        has_selection,
+        has_selection && has_connected_ssh,
         SftpContextActionKind::EditPermissions,
     );
     items = add_item(
@@ -1863,14 +1646,14 @@ pub fn render_sftp_context_menu_overlay<'a>(
         items,
         "New Folder",
         None,
-        side == SftpPaneSide::Local || has_connected_ssh,
+        has_connected_ssh,
         SftpContextActionKind::NewFolder,
     );
     items = add_item(
         items,
         "New File",
         None,
-        side == SftpPaneSide::Local || has_connected_ssh,
+        has_connected_ssh,
         SftpContextActionKind::NewFile,
     );
     items = items.push(hairline_h(chrome));
@@ -1878,7 +1661,7 @@ pub fn render_sftp_context_menu_overlay<'a>(
         items,
         "Refresh",
         Some("F5"),
-        side == SftpPaneSide::Local || has_connected_ssh,
+        has_connected_ssh,
         SftpContextActionKind::Refresh,
     );
     items = add_item(
@@ -1903,8 +1686,8 @@ pub fn render_sftp_context_menu_overlay<'a>(
         SftpContextActionKind::CopyPath,
     );
 
-    let menu_w = 224.0_f32;
-    let approx_h = if can_paste { 468.0_f32 } else { 440.0_f32 };
+    let menu_w = 228.0_f32;
+    let approx_h = if can_paste { 578.0_f32 } else { 550.0_f32 };
     let pos = state.plus.context_menu.position;
     let left = pos.x.clamp(8.0, (window_width - menu_w - 10.0).max(8.0));
     let top = pos.y.clamp(8.0, (window_height - approx_h - 10.0).max(8.0));
@@ -1935,7 +1718,7 @@ pub fn render_sftp_context_menu_overlay<'a>(
     Some(opaque(stack![scrim, positioned]).into())
 }
 
-/// Renders active SFTP+ dialog modals (New Folder/File, Rename, Edit Permissions, Properties, View/Edit).
+/// Renders active SFTP Panel dialog modals (New Folder/File, Rename, Edit Permissions, Properties, View/Edit).
 pub fn render_sftp_plus_modal<'a>(
     state: &'a SftpDrawerState,
     window_width: f32,
@@ -1946,7 +1729,6 @@ pub fn render_sftp_plus_modal<'a>(
     match &state.plus.modal {
         SftpModalState::None => None,
         SftpModalState::CreateEntry {
-            side,
             parent_dir,
             is_dir,
             name,
@@ -1959,7 +1741,7 @@ pub fn render_sftp_plus_modal<'a>(
                 "File name..."
             };
             let mut body = column![
-                text(format!("{} path: {}", side.label(), parent_dir))
+                text(format!("Remote path: {parent_dir}"))
                     .size(FONT_META)
                     .font(mono_font())
                     .color(chrome.text_secondary),
@@ -1998,13 +1780,12 @@ pub fn render_sftp_plus_modal<'a>(
             Some(modal_overlay(card, Some(Message::SftpDismissModal), 90.0))
         }
         SftpModalState::Rename {
-            side,
             old_path,
             new_name,
             error,
         } => {
             let mut body = column![
-                text(format!("{} item: {}", side.label(), old_path))
+                text(format!("Remote item: {old_path}"))
                     .size(FONT_META)
                     .font(mono_font())
                     .color(chrome.text_secondary),
@@ -2043,7 +1824,6 @@ pub fn render_sftp_plus_modal<'a>(
             Some(modal_overlay(card, Some(Message::SftpDismissModal), 90.0))
         }
         SftpModalState::EditPermissions {
-            side,
             target_paths,
             octal_input,
             mode_bits,
@@ -2097,7 +1877,7 @@ pub fn render_sftp_plus_modal<'a>(
             };
 
             let mut body = column![
-                text(format!("{} target: {target_summary}", side.label()))
+                text(format!("Remote target: {target_summary}"))
                     .size(FONT_META)
                     .font(mono_font())
                     .color(chrome.text_secondary),
@@ -2161,7 +1941,6 @@ pub fn render_sftp_plus_modal<'a>(
             Some(modal_overlay(card, Some(Message::SftpDismissModal), 80.0))
         }
         SftpModalState::Properties {
-            side,
             entry,
             extra_selected,
             total_selected_bytes,
@@ -2186,7 +1965,9 @@ pub fn render_sftp_plus_modal<'a>(
                 format!("{} ({} bytes)", format_sftp_size(entry.size), entry.size)
             };
             let perm_str = match entry.permissions {
-                Some(bits) => format!("{} ({})", format_posix_mode(Some(bits)), format_octal_mode(bits)),
+                Some(bits) => {
+                    format!("{} ({})", format_posix_mode(Some(bits)), format_octal_mode(bits))
+                }
                 None => "—".to_string(),
             };
 
@@ -2209,7 +1990,6 @@ pub fn render_sftp_plus_modal<'a>(
             };
 
             let mut props = column![
-                prop_row("Pane:", side.label().to_string()),
                 prop_row("Name:", entry.name.clone()),
                 prop_row("Path:", entry.full_path.clone()),
                 prop_row("Kind:", kind_str.to_string()),
@@ -2246,7 +2026,6 @@ pub fn render_sftp_plus_modal<'a>(
             Some(modal_overlay(card, Some(Message::SftpDismissModal), 80.0))
         }
         SftpModalState::FileViewer {
-            side,
             path,
             file_name,
             editable,
@@ -2266,7 +2045,7 @@ pub fn render_sftp_plus_modal<'a>(
 
             let mut body = column![
                 row![
-                    text(format!("{} · {path}", side.label()))
+                    text(format!("Remote · {path}"))
                         .size(FONT_META)
                         .font(mono_font())
                         .color(chrome.text_secondary)
@@ -2294,7 +2073,7 @@ pub fn render_sftp_plus_modal<'a>(
             if *loading {
                 body = body.push(
                     container(
-                        text("Loading file contents...")
+                        text("Loading remote file contents...")
                             .size(FONT_BODY)
                             .color(chrome.text_muted),
                     )
@@ -2356,6 +2135,253 @@ pub fn render_sftp_plus_modal<'a>(
             );
             Some(modal_overlay(card, Some(Message::SftpDismissModal), 44.0))
         }
+        SftpModalState::OpenWith {
+            entry,
+            loading,
+            search_query,
+            apps,
+            selected_launch_path,
+            error,
+            ..
+        } => {
+            let kind_badge = if entry.is_dir { "FOLDER" } else { "FILE" };
+            let title = format!("Open \"{}\" with...", entry.name);
+            let list_h = modal_body_height(320.0, window_height, 270.0);
+            let filtered = filter_installed_apps(apps, search_query);
+            let has_valid_selection = selected_launch_path
+                .as_ref()
+                .is_some_and(|sel| filtered.iter().any(|app| &app.launch_path == sel));
+
+            let mut body = column![
+                row![
+                    badge_pill(
+                        kind_badge,
+                        chrome.text_secondary,
+                        chrome.well_bg,
+                        chrome.border_subtle,
+                    ),
+                    text(entry.full_path.clone())
+                        .size(FONT_META)
+                        .font(mono_font())
+                        .color(chrome.text_secondary)
+                        .width(Length::Fill),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                text_input("Search installed applications...", search_query)
+                    .id(Id::new(SFTP_MODAL_INPUT_ID))
+                    .size(FONT_BODY)
+                    .padding([7, 10])
+                    .style(styled_input_style(chrome))
+                    .on_input(Message::SftpOpenWithSearchChanged)
+                    .on_submit(Message::SftpOpenWithConfirm),
+            ]
+            .spacing(10);
+
+            if *loading {
+                body = body.push(
+                    container(
+                        text("Scanning installed applications...")
+                            .size(FONT_BODY)
+                            .color(chrome.text_muted),
+                    )
+                    .height(Length::Fixed(list_h))
+                    .width(Length::Fill)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .style(move |_| inset_well_style(chrome)),
+                );
+            } else if filtered.is_empty() {
+                let empty_hint = if apps.is_empty() {
+                    "No desktop applications discovered. Click \"Browse App...\" to select an executable."
+                } else {
+                    "No applications match your filter. Clear the search or click \"Browse App...\"."
+                };
+                body = body.push(
+                    container(
+                        column![
+                            text("No applications found")
+                                .size(FONT_BODY)
+                                .font(ui_font_medium())
+                                .color(chrome.text_primary),
+                            text(empty_hint)
+                                .size(FONT_META)
+                                .color(chrome.text_muted),
+                        ]
+                        .spacing(4)
+                        .align_x(Alignment::Center),
+                    )
+                    .height(Length::Fixed(list_h))
+                    .width(Length::Fill)
+                    .padding(16)
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+                    .style(move |_| inset_well_style(chrome)),
+                );
+            } else {
+                let recommended: Vec<&InstalledApp> = filtered
+                    .iter()
+                    .copied()
+                    .filter(|app| app.is_default || app.is_recommended)
+                    .collect();
+                let others: Vec<&InstalledApp> = filtered
+                    .iter()
+                    .copied()
+                    .filter(|app| !app.is_default && !app.is_recommended)
+                    .collect();
+
+                let render_app_row = |app: &InstalledApp| -> Element<'a, Message, Theme, iced::Renderer> {
+                    let is_selected = selected_launch_path
+                        .as_ref()
+                        .is_some_and(|sel| sel == &app.launch_path);
+
+                    let mut title_col = column![
+                        text(app.name.clone())
+                            .size(FONT_BODY)
+                            .font(if is_selected {
+                                ui_font_semibold()
+                            } else {
+                                ui_font_medium()
+                            })
+                            .color(if is_selected {
+                                chrome.accent
+                            } else {
+                                chrome.text_primary
+                            }),
+                    ]
+                    .spacing(1)
+                    .width(Length::Fill);
+
+                    if let Some(sub) = app.subtitle.as_ref() {
+                        title_col = title_col.push(
+                            text(sub.clone())
+                                .size(FONT_META)
+                                .color(chrome.text_secondary),
+                        );
+                    }
+
+                    let mut meta_row = row![].spacing(6).align_y(Alignment::Center);
+                    if app.is_default {
+                        meta_row = meta_row.push(badge_pill(
+                            "Default",
+                            chrome.accent_fg,
+                            chrome.accent,
+                            chrome.border_subtle,
+                        ));
+                    } else if app.is_recommended {
+                        meta_row = meta_row.push(badge_pill(
+                            "Recommended",
+                            chrome.accent,
+                            chrome.accent_soft,
+                            chrome.border_subtle,
+                        ));
+                    }
+                    if app.terminal {
+                        meta_row = meta_row.push(badge_pill(
+                            "Terminal",
+                            chrome.text_secondary,
+                            chrome.well_bg,
+                            chrome.border_subtle,
+                        ));
+                    }
+                    meta_row = meta_row.push(
+                        text(app.command_label.clone())
+                            .size(FONT_META)
+                            .font(mono_font())
+                            .color(chrome.text_muted),
+                    );
+
+                    button(
+                        row![title_col, meta_row]
+                            .spacing(10)
+                            .align_y(Alignment::Center),
+                    )
+                    .width(Length::Fill)
+                    .padding([7, 10])
+                    .style(list_row_button_style(chrome, is_selected))
+                    .on_press(Message::SftpOpenWithSelectApp(app.launch_path.clone()))
+                    .into()
+                };
+
+                let mut app_list = column![].spacing(4).padding([4, 4]);
+                if !recommended.is_empty() {
+                    app_list = app_list.push(
+                        container(
+                            text("Recommended")
+                                .size(FONT_META)
+                                .font(ui_font_semibold())
+                                .color(chrome.text_secondary),
+                        )
+                        .padding([4, 6]),
+                    );
+                    for app in &recommended {
+                        app_list = app_list.push(render_app_row(app));
+                    }
+                }
+                if !others.is_empty() {
+                    let other_label = if recommended.is_empty() {
+                        "Installed Applications"
+                    } else {
+                        "Other Applications"
+                    };
+                    app_list = app_list.push(
+                        container(
+                            text(other_label)
+                                .size(FONT_META)
+                                .font(ui_font_semibold())
+                                .color(chrome.text_secondary),
+                        )
+                        .padding([6, 6]),
+                    );
+                    for app in &others {
+                        app_list = app_list.push(render_app_row(app));
+                    }
+                }
+
+                body = body.push(
+                    container(scrollable(app_list).style(tabby_scrollable_style(chrome)))
+                        .height(Length::Fixed(list_h))
+                        .width(Length::Fill)
+                        .padding(4)
+                        .style(move |_| inset_well_style(chrome)),
+                );
+            }
+
+            if let Some(err) = error {
+                body = body.push(text(err.clone()).size(FONT_META).color(chrome.danger));
+            }
+
+            let mut open_btn = button(text("Open").size(FONT_BODY).font(ui_font_medium()))
+                .padding([6, 16])
+                .style(pill_button_style(chrome, PillTone::Primary));
+            if has_valid_selection {
+                open_btn = open_btn.on_press(Message::SftpOpenWithConfirm);
+            }
+
+            let footer = row![
+                button(text("Browse App...").size(FONT_BODY).font(ui_font_medium()))
+                    .padding([6, 12])
+                    .style(pill_button_style(chrome, PillTone::Subtle))
+                    .on_press(Message::SftpOpenWithBrowseCustom),
+                space::horizontal(),
+                button(text("Cancel").size(FONT_BODY).font(ui_font_medium()))
+                    .padding([6, 14])
+                    .style(pill_button_style(chrome, PillTone::Subtle))
+                    .on_press(Message::SftpDismissModal),
+                open_btn,
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            let card = build_modal_shell(
+                &title,
+                body.into(),
+                footer.into(),
+                modal_width(540.0, window_width),
+                chrome,
+            );
+            Some(modal_overlay(card, Some(Message::SftpDismissModal), 64.0))
+        }
     }
 }
 
@@ -2392,13 +2418,10 @@ fn build_modal_shell<'a>(
 /// Crisp geometric pixel/vector icon widget drawn with Iced quads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SftpGlyph {
-    Computer,
     Globe,
-    Swap,
     Transfers,
-    LayoutHorizontal,
-    LayoutVertical,
-    LayoutSideDock,
+    UploadFile,
+    UploadFolder,
     ChevronLeft,
     ChevronRight,
     ArrowUp,
@@ -2500,11 +2523,6 @@ impl Widget<Message, Theme, iced::Renderer> for SftpGlyphWidget {
         };
 
         match self.glyph {
-            SftpGlyph::Computer => {
-                stroke(renderer, rect(0.10, 0.14, 0.80, 0.54), c, 1.3);
-                fill(renderer, rect(0.42, 0.68, 0.16, 0.12), c);
-                fill(renderer, rect(0.28, 0.80, 0.44, 0.08), c);
-            }
             SftpGlyph::Globe => {
                 use iced::advanced::renderer::Renderer as _;
                 renderer.fill_quad(
@@ -2522,31 +2540,24 @@ impl Widget<Message, Theme, iced::Renderer> for SftpGlyphWidget {
                 fill(renderer, rect(0.14, 0.46, 0.72, 0.08), c);
                 fill(renderer, rect(0.46, 0.14, 0.08, 0.72), c);
             }
-            SftpGlyph::Swap => {
-                fill(renderer, rect(0.12, 0.30, 0.64, 0.09), c);
-                fill(renderer, rect(0.64, 0.20, 0.12, 0.10), c);
-                fill(renderer, rect(0.74, 0.28, 0.12, 0.12), c);
-                fill(renderer, rect(0.24, 0.61, 0.64, 0.09), c);
-                fill(renderer, rect(0.14, 0.58, 0.12, 0.12), c);
-                fill(renderer, rect(0.24, 0.70, 0.12, 0.10), c);
-            }
             SftpGlyph::Transfers => {
                 fill(renderer, rect(0.26, 0.16, 0.10, 0.60), c);
                 fill(renderer, rect(0.16, 0.24, 0.30, 0.09), c);
                 fill(renderer, rect(0.64, 0.24, 0.10, 0.60), c);
                 fill(renderer, rect(0.54, 0.67, 0.30, 0.09), c);
             }
-            SftpGlyph::LayoutHorizontal => {
-                stroke(renderer, rect(0.10, 0.16, 0.80, 0.68), c, 1.3);
-                fill(renderer, rect(0.47, 0.18, 0.08, 0.64), c);
+            SftpGlyph::UploadFile => {
+                fill(renderer, rect(0.45, 0.16, 0.10, 0.48), c);
+                fill(renderer, rect(0.32, 0.26, 0.36, 0.09), c);
+                fill(renderer, rect(0.16, 0.74, 0.68, 0.10), c);
+                fill(renderer, rect(0.16, 0.60, 0.10, 0.16), c);
+                fill(renderer, rect(0.74, 0.60, 0.10, 0.16), c);
             }
-            SftpGlyph::LayoutVertical => {
-                stroke(renderer, rect(0.10, 0.16, 0.80, 0.68), c, 1.3);
-                fill(renderer, rect(0.12, 0.47, 0.76, 0.08), c);
-            }
-            SftpGlyph::LayoutSideDock => {
-                stroke(renderer, rect(0.10, 0.16, 0.80, 0.68), c, 1.3);
-                fill(renderer, rect(0.62, 0.18, 0.08, 0.64), c);
+            SftpGlyph::UploadFolder => {
+                fill(renderer, rect(0.10, 0.20, 0.34, 0.12), c);
+                stroke(renderer, rect(0.10, 0.30, 0.80, 0.54), c, 1.2);
+                fill(renderer, rect(0.46, 0.40, 0.09, 0.34), c);
+                fill(renderer, rect(0.35, 0.48, 0.30, 0.09), c);
             }
             SftpGlyph::ChevronLeft => {
                 fill(renderer, rect(0.54, 0.22, 0.11, 0.12), c);
@@ -2581,7 +2592,11 @@ impl Widget<Message, Theme, iced::Renderer> for SftpGlyphWidget {
                 fill(renderer, rect(0.30, 0.24, 0.40, 0.10), c);
                 fill(renderer, rect(0.16, 0.34, 0.68, 0.10), c);
                 fill(renderer, rect(0.24, 0.44, 0.52, 0.38), c);
-                fill(renderer, rect(0.43, 0.56, 0.14, 0.26), Color::from_rgba(0.0, 0.0, 0.0, 0.45));
+                fill(
+                    renderer,
+                    rect(0.43, 0.56, 0.14, 0.26),
+                    Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+                );
             }
             SftpGlyph::Eye => {
                 use iced::advanced::renderer::Renderer as _;
@@ -2644,13 +2659,127 @@ impl Widget<Message, Theme, iced::Renderer> for SftpGlyphWidget {
     }
 }
 
+struct SftpPanelInteract<'a> {
+    session_id: SessionId,
+    content: Element<'a, Message, Theme, iced::Renderer>,
+}
+
+impl<'a> SftpPanelInteract<'a> {
+    fn wrap(
+        session_id: SessionId,
+        content: Element<'a, Message, Theme, iced::Renderer>,
+    ) -> Element<'a, Message, Theme, iced::Renderer> {
+        Element::new(Self {
+            session_id,
+            content,
+        })
+    }
+}
+
+impl Widget<Message, Theme, iced::Renderer> for SftpPanelInteract<'_> {
+    fn children(&self) -> Vec<Tree> {
+        vec![Tree::new(&self.content)]
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(std::slice::from_ref(&self.content));
+    }
+
+    fn size(&self) -> Size<Length> {
+        self.content.as_widget().size()
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        self.content
+            .as_widget_mut()
+            .layout(&mut tree.children[0], renderer, limits)
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        self.content
+            .as_widget_mut()
+            .operate(&mut tree.children[0], layout, renderer, operation);
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        if matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(
+                mouse::Button::Left | mouse::Button::Right | mouse::Button::Middle
+            ))
+        ) && cursor.is_over(layout.bounds())
+        {
+            shell.publish(Message::FocusSftpPanel(self.session_id));
+        }
+        self.content.as_widget_mut().update(
+            &mut tree.children[0],
+            event,
+            layout,
+            cursor,
+            renderer,
+            clipboard,
+            shell,
+            viewport,
+        );
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        self.content
+            .as_widget()
+            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        self.content
+            .as_widget()
+            .draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
+    }
+}
+
 #[derive(Debug, Default)]
 struct RowInteractState {
     modifiers: keyboard::Modifiers,
 }
 
 struct SftpRowInteract<'a> {
-    side: SftpPaneSide,
+    session_id: SessionId,
     path: String,
     selected: bool,
     chrome: ChromePalette,
@@ -2659,14 +2788,14 @@ struct SftpRowInteract<'a> {
 
 impl<'a> SftpRowInteract<'a> {
     fn wrap(
-        side: SftpPaneSide,
+        session_id: SessionId,
         path: String,
         selected: bool,
         chrome: ChromePalette,
         content: Element<'a, Message, Theme, iced::Renderer>,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
         Element::new(Self {
-            side,
+            session_id,
             path,
             selected,
             chrome,
@@ -2737,8 +2866,8 @@ impl Widget<Message, Theme, iced::Renderer> for SftpRowInteract<'_> {
         if cursor.is_over(layout.bounds()) {
             match event {
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                    shell.publish(Message::SftpPaneRowClicked {
-                        side: self.side,
+                    shell.publish(Message::SftpSessionRowClicked {
+                        session_id: self.session_id,
                         path: self.path.clone(),
                         ctrl_held: state.modifiers.control() || state.modifiers.logo(),
                     });
@@ -2747,8 +2876,8 @@ impl Widget<Message, Theme, iced::Renderer> for SftpRowInteract<'_> {
                 }
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
                     if let Some(pos) = cursor.position() {
-                        shell.publish(Message::SftpOpenContextMenu {
-                            side: self.side,
+                        shell.publish(Message::SftpSessionOpenContextMenu {
+                            session_id: self.session_id,
                             target_path: Some(self.path.clone()),
                             position: pos,
                         });
@@ -2842,16 +2971,19 @@ impl Widget<Message, Theme, iced::Renderer> for SftpRowInteract<'_> {
 }
 
 struct SftpPaneSurface<'a> {
-    side: SftpPaneSide,
+    session_id: SessionId,
     content: Element<'a, Message, Theme, iced::Renderer>,
 }
 
 impl<'a> SftpPaneSurface<'a> {
     fn wrap(
-        side: SftpPaneSide,
+        session_id: SessionId,
         content: Element<'a, Message, Theme, iced::Renderer>,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
-        Element::new(Self { side, content })
+        Element::new(Self {
+            session_id,
+            content,
+        })
     }
 }
 
@@ -2913,130 +3045,17 @@ impl Widget<Message, Theme, iced::Renderer> for SftpPaneSurface<'_> {
             viewport,
         );
         if !shell.is_event_captured() && cursor.is_over(layout.bounds()) {
-            match event {
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
-                    shell.publish(Message::SftpSetActivePane(self.side));
-                }
-                Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
-                    if let Some(pos) = cursor.position() {
-                        shell.publish(Message::SftpOpenContextMenu {
-                            side: self.side,
-                            target_path: None,
-                            position: pos,
-                        });
-                        shell.capture_event();
-                    }
-                }
-                _ => {}
+            if let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) = event
+                && let Some(pos) = cursor.position()
+            {
+                shell.publish(Message::SftpSessionOpenContextMenu {
+                    session_id: self.session_id,
+                    target_path: None,
+                    position: pos,
+                });
+                shell.capture_event();
             }
         }
-    }
-
-    fn mouse_interaction(
-        &self,
-        tree: &Tree,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-        renderer: &iced::Renderer,
-    ) -> mouse::Interaction {
-        self.content
-            .as_widget()
-            .mouse_interaction(&tree.children[0], layout, cursor, viewport, renderer)
-    }
-
-    fn draw(
-        &self,
-        tree: &Tree,
-        renderer: &mut iced::Renderer,
-        theme: &Theme,
-        style: &renderer::Style,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        viewport: &Rectangle,
-    ) {
-        self.content
-            .as_widget()
-            .draw(&tree.children[0], renderer, theme, style, layout, cursor, viewport);
-    }
-}
-
-struct SftpFileDropArea<'a> {
-    content: Element<'a, Message, Theme, iced::Renderer>,
-}
-
-impl<'a> SftpFileDropArea<'a> {
-    fn wrap(
-        content: Element<'a, Message, Theme, iced::Renderer>,
-    ) -> Element<'a, Message, Theme, iced::Renderer> {
-        Element::new(Self { content })
-    }
-}
-
-impl Widget<Message, Theme, iced::Renderer> for SftpFileDropArea<'_> {
-    fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(&self.content)]
-    }
-
-    fn diff(&self, tree: &mut Tree) {
-        tree.diff_children(std::slice::from_ref(&self.content));
-    }
-
-    fn size(&self) -> Size<Length> {
-        self.content.as_widget().size()
-    }
-
-    fn layout(
-        &mut self,
-        tree: &mut Tree,
-        renderer: &iced::Renderer,
-        limits: &layout::Limits,
-    ) -> layout::Node {
-        self.content
-            .as_widget_mut()
-            .layout(&mut tree.children[0], renderer, limits)
-    }
-
-    fn operate(
-        &mut self,
-        tree: &mut Tree,
-        layout: Layout<'_>,
-        renderer: &iced::Renderer,
-        operation: &mut dyn Operation,
-    ) {
-        self.content
-            .as_widget_mut()
-            .operate(&mut tree.children[0], layout, renderer, operation);
-    }
-
-    fn update(
-        &mut self,
-        tree: &mut Tree,
-        event: &Event,
-        layout: Layout<'_>,
-        cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
-        clipboard: &mut dyn Clipboard,
-        shell: &mut Shell<'_, Message>,
-        viewport: &Rectangle,
-    ) {
-        if let Event::Window(window::Event::FileDropped(path)) = event
-            && cursor.is_over(layout.bounds())
-        {
-            shell.publish(Message::SftpDrawerFileDropped { path: path.clone() });
-            shell.capture_event();
-            return;
-        }
-        self.content.as_widget_mut().update(
-            &mut tree.children[0],
-            event,
-            layout,
-            cursor,
-            renderer,
-            clipboard,
-            shell,
-            viewport,
-        );
     }
 
     fn mouse_interaction(

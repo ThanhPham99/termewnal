@@ -81,6 +81,7 @@ pub struct SettingsUiState {
     opacity_text: String,
     scrollback_text: String,
     log_dir_text: String,
+    sftp_download_dir_text: String,
     keepalive_interval_text: String,
     keepalive_missed_text: String,
     auto_lock_text: String,
@@ -156,6 +157,12 @@ impl SettingsUiState {
         self.log_dir_text = config
             .terminal
             .log_directory
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_default();
+        self.sftp_download_dir_text = config
+            .terminal
+            .sftp_download_dir
             .as_ref()
             .map(|p| p.display().to_string())
             .unwrap_or_default();
@@ -625,6 +632,19 @@ impl SettingsUiState {
 
     pub fn set_follow_symlinks(&mut self, enabled: bool) {
         self.draft.transfer.follow_symlinks = enabled;
+        self.saved_notice = None;
+    }
+
+    pub fn set_auto_open_sftp(&mut self, enabled: bool) {
+        self.draft.terminal.auto_open_sftp = enabled;
+        self.saved_notice = None;
+    }
+
+    pub fn set_sftp_download_dir_text(&mut self, value: String) {
+        let trimmed = value.trim().to_string();
+        self.draft.terminal.sftp_download_dir = (!trimmed.is_empty()).then(|| PathBuf::from(trimmed));
+        self.sftp_download_dir_text = value;
+        self.error = None;
         self.saved_notice = None;
     }
 
@@ -2137,6 +2157,46 @@ impl SettingsUiState {
                     Message::SettingsFollowSymlinksToggled,
                     chrome,
                 ),
+                compact_form,
+                chrome,
+            ),
+            hairline_h(chrome),
+            form_line(
+                "Auto-open SFTP+",
+                Some("Automatically open and connect SFTP+ on new SSH connections"),
+                apple_checkbox(
+                    self.draft.terminal.auto_open_sftp,
+                    "Open SFTP+ panel automatically when SSH connects",
+                    Message::SettingsAutoOpenSftpToggled,
+                    chrome,
+                ),
+                compact_form,
+                chrome,
+            ),
+            hairline_h(chrome),
+            form_line(
+                "SFTP download folder",
+                Some("Leave empty to use system Downloads folder"),
+                row![
+                    text_input("System Downloads...", &self.sftp_download_dir_text)
+                        .on_input(Message::SettingsSftpDownloadDirChanged)
+                        .font(mono_font())
+                        .size(FONT_BODY)
+                        .padding([6, 10])
+                        .style(styled_input_style(chrome))
+                        .width(Length::Fill),
+                    button(text("Browse...").size(FONT_META).font(ui_font_medium()))
+                        .padding([6, 10])
+                        .style(pill_button_style(chrome, PillTone::Subtle))
+                        .on_press(Message::SettingsBrowseSftpDownloadDir),
+                    button(text("Reset").size(FONT_META))
+                        .padding([6, 10])
+                        .style(pill_button_style(chrome, PillTone::Ghost))
+                        .on_press(Message::SettingsResetSftpDownloadDir),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .into(),
                 compact_form,
                 chrome,
             ),

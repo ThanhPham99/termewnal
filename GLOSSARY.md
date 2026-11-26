@@ -12,6 +12,14 @@ _Avoid_: Server config, host entry, bookmark
 An active runtime workspace opened from a Profile or quick-connect, owning a terminal view, connection lifecycle state, and associated channels.
 _Avoid_: Tab, connection, window
 
+**Pane**:
+A rectangular region within a workspace tab that hosts one **Session** and, for SSH **Session**s, an optional **SFTP Panel** docked on its right side.
+_Avoid_: Split frame, terminal box
+
+**SFTP Panel**:
+A remote-only SFTP file browser and **Transfer** queue view (labeled `SFTP+` in the UI) docked to the right of an SSH **Session**'s **Pane**.
+_Avoid_: SFTP drawer, SFTP tab, dual-pane commander
+
 **Tunnel**:
 A port forwarding rule (`Local`, `Remote`, or `Dynamic` SOCKS5) and its managed lifecycle bound to an SSH connection.
 _Avoid_: Forward rule, port forward, proxy rule

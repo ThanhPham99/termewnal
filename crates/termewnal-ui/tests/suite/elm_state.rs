@@ -711,7 +711,7 @@ fn workspace_shortcuts_map_cleanly_without_hijacking_terminal_keys() {
 
     // Regular shell control keys and Ctrl+F (handled separately by window_shortcut_event)
     // must NOT be hijacked by workspace shortcuts; Ctrl+K opens Command Palette,
-    // and Ctrl+Shift+E toggles the SFTP Drawer.
+    // and Ctrl+Shift+E toggles the SFTP+ Panel.
     assert!(shortcut_for_key_event(&Key::Character("c".into()), Modifiers::CTRL, tab).is_none());
     assert!(shortcut_for_key_event(&Key::Character("d".into()), Modifiers::CTRL, tab).is_none());
     assert!(shortcut_for_key_event(&Key::Character("b".into()), Modifiers::CTRL, tab).is_none());

@@ -46,7 +46,11 @@ struct FaultServerState {
     /// When `Some(limit)`, drops the active SSH TCP connection once cumulative `.part` writes
     /// on the triggering connection reach `limit` (only triggered once).
     drop_conn_after_part_bytes: Mutex<Option<u64>>,
+    /// When `Some(limit)`, drops the active SSH TCP connection once cumulative reads
+    /// on the triggering connection reach `limit` (only triggered once).
+    drop_conn_after_read_bytes: Mutex<Option<u64>>,
     drop_conn_on_rename: AtomicBool,
+    drop_conn_on_mkdir: AtomicBool,
     dropped_once: AtomicBool,
     deny_open_exact: Mutex<BTreeSet<String>>,
     deny_rename_paths: Mutex<BTreeSet<String>>,
@@ -65,7 +69,9 @@ impl FaultServerState {
             connection_count: AtomicUsize::new(0),
             recorded_writes: Mutex::new(Vec::new()),
             drop_conn_after_part_bytes: Mutex::new(None),
+            drop_conn_after_read_bytes: Mutex::new(None),
             drop_conn_on_rename: AtomicBool::new(false),
+            drop_conn_on_mkdir: AtomicBool::new(false),
             dropped_once: AtomicBool::new(false),
             deny_open_exact: Mutex::new(BTreeSet::new()),
             deny_rename_paths: Mutex::new(BTreeSet::new()),
@@ -125,6 +131,7 @@ struct FaultSftpSubsystem {
     state: Arc<FaultServerState>,
     kill_switch: Arc<TcpKillSwitch>,
     conn_part_bytes_written: Arc<AtomicU64>,
+    conn_bytes_read: Arc<AtomicU64>,
     next_handle: u64,
     handles: HashMap<Vec<u8>, OpenHandle>,
 }
@@ -140,6 +147,7 @@ impl FaultSftpSubsystem {
             state,
             kill_switch,
             conn_part_bytes_written: Arc::new(AtomicU64::new(0)),
+            conn_bytes_read: Arc::new(AtomicU64::new(0)),
             next_handle: 1,
             handles: HashMap::new(),
         }
@@ -302,6 +310,11 @@ impl russh_sftp::server::Handler for FaultSftpSubsystem {
         path: SftpString,
         _attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
+        if self.state.drop_conn_on_mkdir.swap(false, Ordering::SeqCst) {
+            self.trigger_tcp_drop();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return Err(StatusCode::ConnectionLost);
+        }
         let abs = self.state.resolve_virtual(&path)?;
         fs::create_dir(&abs).map_err(|_| StatusCode::Failure)?;
         Ok(Self::ok_status(id))
@@ -399,6 +412,15 @@ impl russh_sftp::server::Handler for FaultSftpSubsystem {
         offset: u64,
         len: u32,
     ) -> Result<Data, Self::Error> {
+        let read_limit = *self.state.drop_conn_after_read_bytes.lock().unwrap();
+        if let Some(limit_bytes) = read_limit
+            && self.conn_bytes_read.load(Ordering::SeqCst) >= limit_bytes
+            && !self.state.dropped_once.swap(true, Ordering::SeqCst)
+        {
+            self.trigger_tcp_drop();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            return Err(StatusCode::ConnectionLost);
+        }
         let entry = self
             .handles
             .get_mut(handle.as_bytes())
@@ -411,6 +433,7 @@ impl russh_sftp::server::Handler for FaultSftpSubsystem {
         if n == 0 {
             return Err(StatusCode::Eof);
         }
+        self.conn_bytes_read.fetch_add(n as u64, Ordering::SeqCst);
         buf.truncate(n);
         Ok(Data { id, data: buf })
     }
@@ -1796,5 +1819,168 @@ async fn transfer_queue_tracks_auto_reconnecting_and_reconnected_on_drop() {
     assert_eq!(
         fs::read(remote_root.join("upload.bin")).unwrap().len(),
         1024 * 1024
+    );
+}
+
+#[tokio::test]
+async fn download_part_atomic_mid_drop_resume_and_source_change_reset() {
+    use termewnal_ssh::local_part_path_for;
+
+    let temp = TempDir::new().unwrap();
+    let local_dir = temp.path().join("downloads");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&local_dir).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let size = 2 * 1024 * 1024usize;
+    let payload: Vec<u8> = (0..size).map(|i| ((i * 31 + 11) % 251) as u8).collect();
+    fs::write(remote_root.join("big_dl.bin"), &payload).unwrap();
+
+    let srv = spawn_fault_server(remote_root.clone(), "ops", "fault-pw").await;
+    *srv.state.drop_conn_after_read_bytes.lock().unwrap() = Some(512 * 1024);
+
+    let endpoint = setup_endpoint(&temp, &srv);
+    let queue = TransferQueue::with_config(
+        SftpManager::new().with_retry_delay(Duration::from_millis(20)),
+        TransferQueueConfig {
+            reconnect_retry_delay: Duration::from_millis(40),
+            ..TransferQueueConfig::default()
+        },
+    );
+
+    // 1. >1 MiB download writes to `.termewnal.part`, recovers on TCP drop, resumes, and renames atomically.
+    let dl_dest = local_dir.join("big_dl.bin");
+    let tid = queue.enqueue_download(endpoint.clone(), "/big_dl.bin".to_string(), dl_dest.clone());
+    assert!(queue.wait_until_idle(Duration::from_secs(15)).await);
+
+    let snap = queue.get(tid).unwrap();
+    assert_eq!(snap.status, TransferStatus::Completed);
+    assert!(snap.using_part_file);
+    assert!(
+        snap.resume_offset >= 256 * 1024 && snap.resume_offset < size as u64,
+        "expected download resume offset >= 256 KiB and < {size}, got {}",
+        snap.resume_offset
+    );
+    assert_eq!(snap.bytes_transferred, size as u64);
+    assert_eq!(fs::read(&dl_dest).unwrap(), payload);
+    assert!(
+        !local_part_path_for(&dl_dest).exists(),
+        "atomic local rename must remove .termewnal.part after completion"
+    );
+
+    // 2. If remote source file changes size while paused/failed with partial `.part`, retry resets to 0
+    //    instead of corrupting the file with mismatched offset splicing.
+    let changed_dest = local_dir.join("mutating.bin");
+    fs::write(remote_root.join("mutating.bin"), &payload).unwrap();
+    srv.state.dropped_once.store(false, Ordering::SeqCst);
+    *srv.state.drop_conn_after_read_bytes.lock().unwrap() = Some(512 * 1024);
+
+    let no_retry_queue = TransferQueue::with_config(
+        SftpManager::new(),
+        TransferQueueConfig {
+            max_transport_retries: 0,
+            ..TransferQueueConfig::default()
+        },
+    );
+    let mut_id = no_retry_queue.enqueue_download(
+        endpoint,
+        "/mutating.bin".to_string(),
+        changed_dest.clone(),
+    );
+    assert!(no_retry_queue.wait_until_idle(Duration::from_secs(10)).await);
+    let failed_snap = no_retry_queue.get(mut_id).unwrap();
+    assert!(matches!(failed_snap.status, TransferStatus::Failed { .. }));
+    assert!(failed_snap.using_part_file);
+    assert!(local_part_path_for(&changed_dest).exists());
+    assert!(no_retry_queue.has_reconnectable_failures());
+
+    // Replace remote source with completely different shorter payload before retry.
+    *srv.state.drop_conn_after_read_bytes.lock().unwrap() = None;
+    let updated_payload: Vec<u8> = (0..1_300_000usize).map(|i| ((i * 17 + 5) % 241) as u8).collect();
+    fs::write(remote_root.join("mutating.bin"), &updated_payload).unwrap();
+
+    assert!(no_retry_queue.retry(mut_id));
+    assert!(no_retry_queue.wait_until_idle(Duration::from_secs(10)).await);
+    let retried_snap = no_retry_queue.get(mut_id).unwrap();
+    assert_eq!(retried_snap.status, TransferStatus::Completed);
+    assert_eq!(retried_snap.resume_offset, 0);
+    assert_eq!(fs::read(&changed_dest).unwrap(), updated_payload);
+    assert!(!local_part_path_for(&changed_dest).exists());
+}
+
+#[tokio::test]
+async fn upload_dir_batch_retries_after_mkdir_drop_and_concurrent_invalidate_session() {
+    let temp = TempDir::new().unwrap();
+    let local_proj = temp.path().join("proj");
+    let local_sub = local_proj.join("nested");
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&local_sub).unwrap();
+    fs::create_dir_all(&remote_root).unwrap();
+
+    let payload_a = vec![b'X'; 300_000];
+    let payload_b = vec![b'Y'; 300_000];
+    fs::write(local_proj.join("top.bin"), &payload_a).unwrap();
+    fs::write(local_sub.join("nested.bin"), &payload_b).unwrap();
+
+    let srv = spawn_fault_server(remote_root.clone(), "ops", "fault-pw").await;
+    // Inject a transient drop on the very first mkdir: UploadDirBatch must NOT permanently cache Err!
+    srv.state.drop_conn_on_mkdir.store(true, Ordering::SeqCst);
+
+    let endpoint = setup_endpoint(&temp, &srv);
+    let queue = TransferQueue::with_config(
+        SftpManager::new().with_retry_delay(Duration::from_millis(20)),
+        TransferQueueConfig {
+            reconnect_retry_delay: Duration::from_millis(40),
+            ..TransferQueueConfig::default()
+        },
+    );
+
+    let summary = queue
+        .enqueue_upload_path(endpoint.clone(), local_proj, "/proj".to_string())
+        .expect("enqueue upload dir");
+    assert_eq!(summary.transfer_ids.len(), 2);
+    assert!(queue.wait_until_idle(Duration::from_secs(15)).await);
+
+    for tid in &summary.transfer_ids {
+        let s = queue.get(*tid).unwrap();
+        assert_eq!(
+            s.status,
+            TransferStatus::Completed,
+            "dir upload failed after mkdir drop recovery: {:?}",
+            s
+        );
+    }
+    assert_eq!(fs::read(remote_root.join("proj/top.bin")).unwrap(), payload_a);
+    assert_eq!(
+        fs::read(remote_root.join("proj/nested/nested.bin")).unwrap(),
+        payload_b
+    );
+
+    // 3 concurrent `.termewnal.part` uploads hit one TCP drop: `invalidate_session` prevents late
+    // sibling errors from evicting the freshly reconnected pooled transport.
+    let conns_before = srv.state.connection_count.load(Ordering::SeqCst);
+    srv.state.dropped_once.store(false, Ordering::SeqCst);
+    *srv.state.drop_conn_after_part_bytes.lock().unwrap() = Some(256 * 1024);
+
+    let mut ids = Vec::new();
+    for idx in 0..3 {
+        let data: Vec<u8> = vec![(0x40 + idx) as u8; 1_500_000];
+        let p = temp.path().join(format!("conc_{idx}.bin"));
+        fs::write(&p, &data).unwrap();
+        ids.push((
+            queue.enqueue_upload(endpoint.clone(), p, format!("/conc_{idx}.bin")),
+            data,
+        ));
+    }
+    assert!(queue.wait_until_idle(Duration::from_secs(20)).await);
+    for (tid, data) in &ids {
+        assert_eq!(queue.get(*tid).unwrap().status, TransferStatus::Completed);
+        let remote_name = queue.get(*tid).unwrap().file_name;
+        assert_eq!(fs::read(remote_root.join(remote_name)).unwrap(), *data);
+    }
+    let conns_delta = srv.state.connection_count.load(Ordering::SeqCst) - conns_before;
+    assert!(
+        conns_delta <= 2,
+        "expected minimal reconnects without sibling thrashing, got {conns_delta} new connections"
     );
 }

@@ -1,6 +1,7 @@
 //! Termewnal desktop UI application state and terminal viewport widget.
 
 pub mod app;
+pub mod app_picker;
 pub mod close_guard;
 pub mod command_palette;
 pub mod config_reload_ui;
@@ -33,6 +34,7 @@ pub use app::{
     SerialSessionSlot, SessionId, SshSessionSlot, SshSessionTarget, TelnetSessionSlot,
     shortcut_for_key_event, shortcut_for_key_event_with_palette,
 };
+pub use app_picker::{AppCatalogProvider, InstalledApp};
 pub use close_guard::{
     BackgroundWorkSource, BackgroundWorkStatus, BackgroundWorkTracker, CloseGuardState,
     DaemonLifecycle,
@@ -69,17 +71,18 @@ pub use quake_and_tray::{
 pub use settings_ui::{SettingsTab, SettingsUiState, ThemeOverrideField};
 pub use sftp_drawer::{
     DEFAULT_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH, MIN_SFTP_DRAWER_WIDTH, SftpConnectionState,
-    SftpDrawerDock, SftpDrawerState, render_conflict_resolution_modal, render_sftp_drawer,
+    SftpDrawerDock, SftpDrawerState, render_conflict_resolution_modal,
 };
 pub use sftp_plus::{
     FileBrowserEntry, SftpClipboard, SftpClipboardOp, SftpContextActionKind,
-    SftpContextMenuState, SftpLayoutMode, SftpModalState, SftpPaneBrowseState, SftpPaneSide,
-    SftpPlusState, SftpSortColumn, render_sftp_context_menu_overlay, render_sftp_plus_commander,
-    render_sftp_plus_modal,
+    SftpContextMenuState, SftpModalState, SftpPaneBrowseState, SftpPlusState, SftpSortColumn,
+    WatchedRemoteFile, render_sftp_context_menu_overlay, render_sftp_panel, render_sftp_plus_modal,
+    visible_remote_entries,
 };
 pub use sidebar::{
-    ActiveTunnelEntry, ProfileGroupView, SidebarFilterScope, SidebarSection, SidebarSessionEntry,
-    SidebarState, SystemSshProfile, TunnelRuntimeState, UNGROUPED_LABEL,
+    ActiveTunnelEntry, ProfileGroupView, SidebarDock, SidebarFilterScope, SidebarSection,
+    SidebarSelectedEntry, SidebarSessionEntry, SidebarState, SystemSshProfile, TunnelRuntimeState,
+    UNGROUPED_LABEL,
 };
 pub use ssh_ui::{
     AuthPromptResponder, HostKeyResponder, MitmAlert, SshAuthPrompt, SshTargetSpec, SshUiEvent,

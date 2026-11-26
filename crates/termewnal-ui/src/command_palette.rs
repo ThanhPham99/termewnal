@@ -811,8 +811,8 @@ fn workspace_command_items() -> Vec<PaletteItem> {
         PaletteItem {
             id: "cmd:toggle-sftp-drawer".to_string(),
             category: PaletteCategory::Command,
-            title: "Toggle SFTP Browser & Transfers".to_string(),
-            subtitle: "Show or hide remote SFTP File Browser and Transfer Queue drawer".to_string(),
+            title: "Toggle SFTP+ Panel".to_string(),
+            subtitle: "Show or hide per-pane remote SFTP+ file browser and transfer queue".to_string(),
             keywords: vec![
                 "sftp".to_string(),
                 "transfer".to_string(),

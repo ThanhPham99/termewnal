@@ -1,9 +1,11 @@
+use std::ffi::OsString;
 use std::fs::{self, OpenOptions};
 use std::io::SeekFrom;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
+use rand::RngExt;
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpClientError;
 use russh_sftp::protocol::{OpenFlags, StatusCode};
@@ -28,15 +30,24 @@ pub const DEFAULT_MAX_CONCURRENT_TRANSFERS: usize = 3;
 /// Default pipelined chunk size (`255 KiB`, fitting within a single `256 KiB` SFTP write packet).
 pub const DEFAULT_TRANSFER_CHUNK_SIZE: usize = 255 * 1024;
 /// Default automatic transport-drop reconnect attempts during an active `Transfer`.
-pub const DEFAULT_MAX_TRANSPORT_RETRIES: u32 = 3;
-/// Default base backoff delay between automatic transport-drop retries.
-pub const DEFAULT_RECONNECT_RETRY_DELAY: Duration = Duration::from_millis(80);
+pub const DEFAULT_MAX_TRANSPORT_RETRIES: u32 = 5;
+/// Default base backoff delay between automatic transport-drop retries (`400 ms` exponential).
+pub const DEFAULT_RECONNECT_RETRY_DELAY: Duration = Duration::from_millis(400);
+const MAX_RECONNECT_BACKOFF_DELAY: Duration = Duration::from_secs(15);
+const PROGRESS_EMIT_INTERVAL: Duration = Duration::from_millis(120);
 const MIN_TRANSFER_CHUNK_SIZE: usize = 128 * 1024;
 const MAX_TRANSFER_CHUNK_SIZE: usize = 256 * 1024;
 
 /// Returns the staging `.termewnal.part` remote path for `remote_path`.
 pub fn part_path_for(remote_path: &str) -> String {
     format!("{remote_path}.termewnal.part")
+}
+
+/// Returns the local staging `.termewnal.part` path for `local_path`.
+pub fn local_part_path_for(local_path: &Path) -> PathBuf {
+    let mut raw: OsString = local_path.as_os_str().to_os_string();
+    raw.push(".termewnal.part");
+    PathBuf::from(raw)
 }
 
 /// Structured non-blocking status notice attached to a `Transfer` when fallback or safety rules apply.
@@ -310,18 +321,34 @@ pub struct UploadPlanOptions {
     pub resume_existing_target: bool,
 }
 
+/// Options supplied to [`TransferExecutorHook::prepare_download_with_options`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownloadPlanOptions {
+    pub part_threshold_bytes: u64,
+    pub resume_hint: u64,
+    pub overwrite_authorized: bool,
+    pub resume_existing_target: bool,
+    pub expected_source_size: Option<u64>,
+    pub expected_source_mtime: Option<u32>,
+}
+
 /// Target preparation descriptor produced by [`TransferExecutorHook::prepare_download`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DownloadTargetPlan {
+    pub write_path: PathBuf,
+    pub final_path: PathBuf,
     pub total_bytes: u64,
     pub resume_offset: u64,
     pub truncate: bool,
+    pub using_part_file: bool,
     pub permissions: Option<u32>,
+    pub modified_epoch_secs: Option<u32>,
+    pub overwrite_authorized: bool,
     pub status_notice: Option<String>,
     pub notice: Option<TransferNotice>,
 }
 
-/// Extension hook allowing `.termewnal.part` atomic uploads, byte-offset resume, and conflict
+/// Extension hook allowing `.termewnal.part` atomic transfers, byte-offset resume, and conflict
 /// resolution without rewriting [`TransferQueue`].
 pub trait TransferExecutorHook: Send + Sync {
     /// Inspects target existence before uploading and applies `policy`.
@@ -404,6 +431,17 @@ pub trait TransferExecutorHook: Send + Sync {
         local_path: &'a Path,
         resume_hint: u64,
     ) -> BoxFuture<'a, Result<DownloadTargetPlan, SshError>>;
+
+    /// Extended download planner aware of `.termewnal.part` staging and source integrity checks.
+    fn prepare_download_with_options<'a>(
+        &'a self,
+        sftp: &'a SftpSession,
+        remote_path: &'a str,
+        local_path: &'a Path,
+        options: DownloadPlanOptions,
+    ) -> BoxFuture<'a, Result<DownloadTargetPlan, SshError>> {
+        self.prepare_download(sftp, remote_path, local_path, options.resume_hint)
+    }
 }
 
 /// Ticket 13 [`TransferExecutorHook`] performing direct pipelined file transfers without `.part`.
@@ -476,10 +514,15 @@ impl TransferExecutorHook for DirectTransferHook {
                 (0, true)
             };
             Ok(DownloadTargetPlan {
+                write_path: local_path.to_path_buf(),
+                final_path: local_path.to_path_buf(),
                 total_bytes,
                 resume_offset,
                 truncate,
+                using_part_file: false,
                 permissions,
+                modified_epoch_secs: meta.mtime,
+                overwrite_authorized: false,
                 status_notice: None,
                 notice: None,
             })
@@ -591,6 +634,9 @@ impl TransferExecutorHook for ResilientTransferHook {
                         .file_name()
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_else(|| remote_leaf_name(remote_path));
+                    let part_file_size = fs::metadata(local_part_path_for(local_path))
+                        .ok()
+                        .map(|m| m.len());
                     let suggested_name = disambiguate_filename(&file_name, 1);
                     Ok(ConflictCheck::AwaitingConflict(TransferConflict {
                         transfer_id,
@@ -600,7 +646,7 @@ impl TransferExecutorHook for ResilientTransferHook {
                         remote_path: remote_path.to_string(),
                         source_size,
                         existing_target_size,
-                        part_file_size: None,
+                        part_file_size,
                         suggested_name,
                     }))
                 }
@@ -809,6 +855,123 @@ impl TransferExecutorHook for ResilientTransferHook {
         DirectTransferHook
             .prepare_download(sftp, remote_path, local_path, resume_hint)
     }
+
+    fn prepare_download_with_options<'a>(
+        &'a self,
+        sftp: &'a SftpSession,
+        remote_path: &'a str,
+        local_path: &'a Path,
+        options: DownloadPlanOptions,
+    ) -> BoxFuture<'a, Result<DownloadTargetPlan, SshError>> {
+        Box::pin(async move {
+            let meta = sftp.metadata(remote_path).await?;
+            let total_bytes = meta.size.unwrap_or(0);
+            let permissions = meta.permissions.map(|m| m & 0o7777);
+            let modified_epoch_secs = meta.mtime;
+            let source_changed = options
+                .expected_source_size
+                .is_some_and(|prev| prev != total_bytes)
+                || (options.expected_source_mtime.is_some()
+                    && modified_epoch_secs.is_some()
+                    && options.expected_source_mtime != modified_epoch_secs);
+
+            let local_part = local_part_path_for(local_path);
+            if options.resume_existing_target {
+                if total_bytes > options.part_threshold_bytes
+                    && let Ok(part_meta) = fs::metadata(&local_part)
+                {
+                    let part_len = part_meta.len();
+                    if !source_changed && part_len > 0 && part_len <= total_bytes {
+                        return Ok(DownloadTargetPlan {
+                            write_path: local_part,
+                            final_path: local_path.to_path_buf(),
+                            total_bytes,
+                            resume_offset: part_len,
+                            truncate: false,
+                            using_part_file: true,
+                            permissions,
+                            modified_epoch_secs,
+                            overwrite_authorized: true,
+                            status_notice: None,
+                            notice: None,
+                        });
+                    }
+                }
+                let (resume_offset, truncate) = match fs::metadata(local_path) {
+                    Ok(local_meta) if !source_changed => {
+                        let local_len = local_meta.len().min(total_bytes);
+                        (local_len, local_len == 0)
+                    }
+                    _ => (0, true),
+                };
+                return Ok(DownloadTargetPlan {
+                    write_path: local_path.to_path_buf(),
+                    final_path: local_path.to_path_buf(),
+                    total_bytes,
+                    resume_offset,
+                    truncate,
+                    using_part_file: false,
+                    permissions,
+                    modified_epoch_secs,
+                    overwrite_authorized: options.overwrite_authorized,
+                    status_notice: None,
+                    notice: None,
+                });
+            }
+
+            if total_bytes > options.part_threshold_bytes {
+                let (resume_offset, truncate) = match fs::metadata(&local_part) {
+                    Ok(part_meta) if !source_changed => {
+                        let part_len = part_meta.len();
+                        if part_len > 0 && part_len <= total_bytes {
+                            (part_len, false)
+                        } else {
+                            (0, true)
+                        }
+                    }
+                    _ => (0, true),
+                };
+                return Ok(DownloadTargetPlan {
+                    write_path: local_part,
+                    final_path: local_path.to_path_buf(),
+                    total_bytes,
+                    resume_offset,
+                    truncate,
+                    using_part_file: true,
+                    permissions,
+                    modified_epoch_secs,
+                    overwrite_authorized: options.overwrite_authorized,
+                    status_notice: None,
+                    notice: None,
+                });
+            }
+
+            let (resume_offset, truncate) = if options.resume_hint > 0 && !source_changed {
+                match fs::metadata(local_path) {
+                    Ok(local_meta) => {
+                        let local_len = local_meta.len().min(total_bytes);
+                        (local_len, local_len == 0)
+                    }
+                    Err(_) => (0, true),
+                }
+            } else {
+                (0, true)
+            };
+            Ok(DownloadTargetPlan {
+                write_path: local_path.to_path_buf(),
+                final_path: local_path.to_path_buf(),
+                total_bytes,
+                resume_offset,
+                truncate,
+                using_part_file: false,
+                permissions,
+                modified_epoch_secs,
+                overwrite_authorized: options.overwrite_authorized,
+                status_notice: None,
+                notice: None,
+            })
+        })
+    }
 }
 
 async fn rename_with_optional_overwrite(
@@ -898,6 +1061,8 @@ struct TransferEntry {
     endpoint: Option<SftpEndpoint>,
     generation: u64,
     resume_hint: u64,
+    expected_source_size: Option<u64>,
+    expected_source_mtime: Option<u32>,
     failed_on_transport_drop: bool,
     was_reconnecting: bool,
     force_direct_fallback: bool,
@@ -1197,12 +1362,40 @@ impl TransferQueue {
         local_path: PathBuf,
         remote_path: String,
     ) -> TransferId {
+        self.enqueue_upload_with_conflict(endpoint, local_path, remote_path, None, false)
+    }
+
+    /// Enqueues a file upload `Transfer` from `local_path` to `remote_path` that
+    /// overwrites any existing remote target without pausing on a conflict prompt.
+    pub fn enqueue_upload_overwrite(
+        &self,
+        endpoint: SftpEndpoint,
+        local_path: PathBuf,
+        remote_path: String,
+    ) -> TransferId {
+        self.enqueue_upload_with_conflict(
+            endpoint,
+            local_path,
+            remote_path,
+            Some(ResolvedConflict::Overwrite),
+            true,
+        )
+    }
+
+    fn enqueue_upload_with_conflict(
+        &self,
+        endpoint: SftpEndpoint,
+        local_path: PathBuf,
+        remote_path: String,
+        resolved_conflict: Option<ResolvedConflict>,
+        overwrite_authorized: bool,
+    ) -> TransferId {
         let total_bytes = fs::metadata(&local_path).map(|m| m.len()).unwrap_or(0);
         let file_name = local_path
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| remote_path.clone());
-        self.enqueue_entry(
+        self.enqueue_entry_with_conflict(
             Some(endpoint),
             TransferDirection::Upload,
             local_path,
@@ -1210,6 +1403,8 @@ impl TransferQueue {
             file_name,
             total_bytes,
             TransferStatus::Queued,
+            resolved_conflict,
+            overwrite_authorized,
         )
     }
 
@@ -1332,6 +1527,8 @@ impl TransferQueue {
                 resume_hint: 0,
                 failed_on_transport_drop: false,
                 was_reconnecting: false,
+                expected_source_size: None,
+                expected_source_mtime: None,
                 force_direct_fallback: false,
                 resolved_conflict: None,
                 overwrite_authorized: false,
@@ -1459,6 +1656,8 @@ impl TransferQueue {
                 resume_hint: 0,
                 failed_on_transport_drop: false,
                 was_reconnecting: false,
+                expected_source_size: None,
+                expected_source_mtime: None,
                 force_direct_fallback: false,
                 resolved_conflict: None,
                 overwrite_authorized: false,
@@ -1534,6 +1733,8 @@ impl TransferQueue {
             resume_hint: 0,
             failed_on_transport_drop: false,
             was_reconnecting: false,
+            expected_source_size: None,
+            expected_source_mtime: None,
             force_direct_fallback: false,
             resolved_conflict: None,
             overwrite_authorized: false,
@@ -1555,6 +1756,32 @@ impl TransferQueue {
         file_name: String,
         total_bytes: u64,
         status: TransferStatus,
+    ) -> TransferId {
+        self.enqueue_entry_with_conflict(
+            endpoint,
+            direction,
+            local_path,
+            remote_path,
+            file_name,
+            total_bytes,
+            status,
+            None,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_entry_with_conflict(
+        &self,
+        endpoint: Option<SftpEndpoint>,
+        direction: TransferDirection,
+        local_path: PathBuf,
+        remote_path: String,
+        file_name: String,
+        total_bytes: u64,
+        status: TransferStatus,
+        resolved_conflict: Option<ResolvedConflict>,
+        overwrite_authorized: bool,
     ) -> TransferId {
         let id = self.alloc_id();
         let (control_tx, _) = watch::channel(ControlSignal::Run);
@@ -1587,9 +1814,11 @@ impl TransferQueue {
             resume_hint: 0,
             failed_on_transport_drop: false,
             was_reconnecting: false,
+            expected_source_size: None,
+            expected_source_mtime: None,
             force_direct_fallback: false,
-            resolved_conflict: None,
-            overwrite_authorized: false,
+            resolved_conflict,
+            overwrite_authorized,
             upload_dir_batch: None,
             download_dir_batch: None,
             control_tx,
@@ -1701,8 +1930,20 @@ impl TransferQueue {
         to_spawn.len()
     }
 
+    /// Returns `true` when at least one `Failed` transfer is eligible for automatic recovery
+    /// because it terminated on a transient transport drop.
+    pub fn has_reconnectable_failures(&self) -> bool {
+        let entries = self.inner.entries.lock().expect("entries mutex poisoned");
+        entries.iter().any(|e| {
+            e.failed_on_transport_drop
+                && matches!(e.snapshot.status, TransferStatus::Failed { .. })
+                && e.endpoint.is_some()
+        })
+    }
+
     /// Cancels a `Queued`, `InProgress`, or `Paused` `Transfer`.
     pub fn cancel(&self, id: TransferId) -> bool {
+        let mut part_to_remove: Option<PathBuf> = None;
         let snap = {
             let mut entries = self.inner.entries.lock().expect("entries mutex poisoned");
             let Some(entry) = entries.iter_mut().find(|e| e.snapshot.id == id) else {
@@ -1711,12 +1952,19 @@ impl TransferQueue {
             if entry.snapshot.status.is_terminal() {
                 return false;
             }
+            if entry.snapshot.direction == TransferDirection::Download && entry.snapshot.using_part_file
+            {
+                part_to_remove = Some(local_part_path_for(&entry.snapshot.local_path));
+            }
             let _ = entry.control_tx.send(ControlSignal::Cancel);
             entry.snapshot.status = TransferStatus::Cancelled;
             entry.snapshot.pending_conflict = None;
             entry.snapshot.throughput_bytes_per_sec = 0;
             build_queue_snapshot(&entries)
         };
+        if let Some(part) = part_to_remove {
+            let _ = fs::remove_file(part);
+        }
         self.publish_snapshot(snap);
         true
     }
@@ -1748,6 +1996,8 @@ impl TransferQueue {
                             entry.resume_hint = 0;
                             entry.snapshot.bytes_transferred = 0;
                             entry.snapshot.resume_offset = 0;
+                            entry.expected_source_size = None;
+                            entry.expected_source_mtime = None;
                         }
                         entry.failed_on_transport_drop = false;
                         entry.was_reconnecting = false;
@@ -1768,6 +2018,8 @@ impl TransferQueue {
                         entry.snapshot.resume_offset = 0;
                         entry.failed_on_transport_drop = false;
                         entry.was_reconnecting = false;
+                        entry.expected_source_size = None;
+                        entry.expected_source_mtime = None;
                         entry.snapshot.reconnect_state = TransferReconnectState::None;
                         entry.snapshot.status_notice = None;
                         entry.resolved_conflict = None;
@@ -1952,7 +2204,6 @@ impl TransferQueue {
                         transport_retries += 1;
                         current_resume_hint =
                             self.current_bytes_transferred(id, generation).max(1);
-                        self.inner.sftp.pool().invalidate(&endpoint.key);
                         self.set_reconnecting_notice(
                             id,
                             generation,
@@ -2066,7 +2317,10 @@ impl TransferQueue {
                     }
                     let drop_err = err.is_connection_error();
                     if drop_err {
-                        self.inner.sftp.pool().invalidate(&endpoint.key);
+                        self.inner
+                            .sftp
+                            .pool()
+                            .invalidate_session(&endpoint.key, &acquired.session);
                     }
                     if drop_err && transport_retries < self.inner.config.max_transport_retries {
                         transport_retries += 1;
@@ -2135,11 +2389,22 @@ impl TransferQueue {
         control_rx: &mut watch::Receiver<ControlSignal>,
         reconnect_notifier: &Arc<Notify>,
     ) -> Option<ControlSignal> {
-        let delay = self
+        let factor = 1u32
+            .checked_shl(attempt.saturating_sub(1).min(5))
+            .unwrap_or(32);
+        let base = self
             .inner
             .config
             .reconnect_retry_delay
-            .saturating_mul(attempt.max(1));
+            .saturating_mul(factor)
+            .min(MAX_RECONNECT_BACKOFF_DELAY);
+        let jitter_cap_ms = (base.as_millis() / 4).min(u128::from(u64::MAX)) as u64;
+        let jitter = if jitter_cap_ms > 0 {
+            Duration::from_millis(rand::rng().random_range(0..=jitter_cap_ms))
+        } else {
+            Duration::ZERO
+        };
+        let delay = base.saturating_add(jitter);
         tokio::select! {
             biased;
             _ = control_rx.changed() => current_interrupt(control_rx),
@@ -2161,9 +2426,25 @@ impl TransferQueue {
     ) -> Result<TransferOutcome, SshError> {
         let local_meta = tokio::fs::metadata(local_path).await?;
         let total_bytes = local_meta.len();
+        let local_mtime = local_meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().min(u32::MAX as u64) as u32);
+        let source_changed = self.check_or_record_source_meta(id, generation, total_bytes, local_mtime);
         self.update_total_bytes(id, generation, total_bytes);
 
         let transfer_cfg = self.transfer_config();
+        let effective_resume_hint = if source_changed {
+            if total_bytes > transfer_cfg.part_threshold_bytes {
+                let _ = sftp
+                    .remove_file(part_path_for(initial_remote_path).as_str())
+                    .await;
+            }
+            0
+        } else {
+            resume_hint
+        };
         let (resolved_conflict, mut overwrite_authorized, force_direct) =
             self.entry_conflict_flags(id, generation);
         let mut remote_path = initial_remote_path.to_string();
@@ -2174,7 +2455,7 @@ impl TransferQueue {
                 ResolvedConflict::Overwrite => overwrite_authorized = true,
                 ResolvedConflict::Resume => {
                     overwrite_authorized = true;
-                    resume_existing_target = true;
+                    resume_existing_target = !source_changed;
                 }
                 ResolvedConflict::AutoRename => {
                     let check = self
@@ -2201,7 +2482,7 @@ impl TransferQueue {
                     }
                 }
             }
-        } else if resume_hint == 0 {
+        } else if effective_resume_hint == 0 {
             let policy = self.effective_conflict_policy();
             match self
                 .inner
@@ -2222,7 +2503,7 @@ impl TransferQueue {
                     resume_existing,
                 } => {
                     overwrite_authorized = ow;
-                    resume_existing_target = resume_existing;
+                    resume_existing_target = resume_existing && !source_changed;
                     if ow {
                         self.record_resolved_conflict(id, generation, ResolvedConflict::Overwrite, true);
                     } else if resume_existing {
@@ -2254,7 +2535,7 @@ impl TransferQueue {
                 total_bytes,
                 UploadPlanOptions {
                     part_threshold_bytes: transfer_cfg.part_threshold_bytes,
-                    resume_hint,
+                    resume_hint: effective_resume_hint,
                     force_direct_fallback: force_direct,
                     overwrite_authorized,
                     resume_existing_target,
@@ -2339,10 +2620,14 @@ impl TransferQueue {
         let mut session_bytes = 0u64;
         let started_at = Instant::now();
         let mut last_rate = 0u64;
+        let mut last_progress_emit: Option<Instant> = None;
         let mut buf = vec![0u8; self.inner.config.chunk_size];
 
         loop {
             if let Some(signal) = current_interrupt(control_rx) {
+                if signal == ControlSignal::Pause {
+                    self.update_progress(id, generation, transferred, last_rate);
+                }
                 return Ok(cleanup_upload_interrupt(signal, sftp, remote_file, plan).await);
             }
 
@@ -2350,6 +2635,9 @@ impl TransferQueue {
                 biased;
                 _ = control_rx.changed() => {
                     if let Some(signal) = current_interrupt(control_rx) {
+                        if signal == ControlSignal::Pause {
+                            self.update_progress(id, generation, transferred, last_rate);
+                        }
                         return Ok(cleanup_upload_interrupt(signal, sftp, remote_file, plan).await);
                     }
                     continue;
@@ -2365,6 +2653,9 @@ impl TransferQueue {
                 biased;
                 _ = control_rx.changed() => {
                     if let Some(signal) = current_interrupt(control_rx) {
+                        if signal == ControlSignal::Pause {
+                            self.update_progress(id, generation, transferred, last_rate);
+                        }
                         return Ok(cleanup_upload_interrupt(signal, sftp, remote_file, plan).await);
                     }
                 }
@@ -2374,7 +2665,10 @@ impl TransferQueue {
             transferred += read_n as u64;
             session_bytes += read_n as u64;
             last_rate = compute_throughput(session_bytes, started_at);
-            self.update_progress(id, generation, transferred, last_rate);
+            if last_progress_emit.is_none_or(|ts| ts.elapsed() >= PROGRESS_EMIT_INTERVAL) {
+                last_progress_emit = Some(Instant::now());
+                self.update_progress(id, generation, transferred, last_rate);
+            }
         }
 
         tokio::select! {
@@ -2417,14 +2711,21 @@ impl TransferQueue {
         resume_hint: u64,
         control_rx: &mut watch::Receiver<ControlSignal>,
     ) -> Result<TransferOutcome, SshError> {
-        let (resolved_conflict, _, _) = self.entry_conflict_flags(id, generation);
+        let transfer_cfg = self.transfer_config();
+        let (resolved_conflict, mut overwrite_authorized, _) =
+            self.entry_conflict_flags(id, generation);
         let mut local_path = initial_local_path.to_path_buf();
         let mut effective_resume_hint = resume_hint;
+        let mut resume_existing_target = false;
 
         if let Some(decision) = resolved_conflict {
             match decision {
-                ResolvedConflict::Overwrite => {}
+                ResolvedConflict::Overwrite => {
+                    overwrite_authorized = true;
+                }
                 ResolvedConflict::Resume => {
+                    overwrite_authorized = true;
+                    resume_existing_target = true;
                     effective_resume_hint = effective_resume_hint.max(1);
                 }
                 ResolvedConflict::AutoRename => {
@@ -2463,10 +2764,11 @@ impl TransferQueue {
                 .await?
             {
                 ConflictCheck::Proceed {
-                    overwrite_authorized,
+                    overwrite_authorized: ow,
                     resume_existing,
                 } => {
-                    if overwrite_authorized {
+                    overwrite_authorized = ow;
+                    if ow {
                         self.record_resolved_conflict(
                             id,
                             generation,
@@ -2474,6 +2776,7 @@ impl TransferQueue {
                             true,
                         );
                     } else if resume_existing {
+                        resume_existing_target = true;
                         effective_resume_hint = 1;
                         self.record_resolved_conflict(
                             id,
@@ -2503,14 +2806,33 @@ impl TransferQueue {
             }
         }
 
+        let (expected_source_size, expected_source_mtime) = self.source_meta_snapshot(id, generation);
         let plan = self
             .inner
             .hook
-            .prepare_download(sftp, remote_path, &local_path, effective_resume_hint)
+            .prepare_download_with_options(
+                sftp,
+                remote_path,
+                &local_path,
+                DownloadPlanOptions {
+                    part_threshold_bytes: transfer_cfg.part_threshold_bytes,
+                    resume_hint: effective_resume_hint,
+                    overwrite_authorized,
+                    resume_existing_target,
+                    expected_source_size,
+                    expected_source_mtime,
+                },
+            )
             .await?;
-        self.update_total_bytes(id, generation, plan.total_bytes);
+        let _ = self.check_or_record_source_meta(
+            id,
+            generation,
+            plan.total_bytes,
+            plan.modified_epoch_secs,
+        );
+        self.update_download_plan(id, generation, &plan);
 
-        if let Some(parent) = local_path.parent()
+        if let Some(parent) = plan.write_path.parent()
             && !parent.as_os_str().is_empty()
         {
             tokio::fs::create_dir_all(parent).await?;
@@ -2521,7 +2843,7 @@ impl TransferQueue {
             .create(true)
             .write(true)
             .truncate(plan.truncate)
-            .open(&local_path)?;
+            .open(&plan.write_path)?;
         let mut local_file = tokio::fs::File::from_std(std_file);
 
         if plan.resume_offset > 0 {
@@ -2529,6 +2851,7 @@ impl TransferQueue {
                 .seek(SeekFrom::Start(plan.resume_offset))
                 .await
                 .map_err(map_remote_sftp_io_error)?;
+            local_file.set_len(plan.resume_offset).await?;
             local_file
                 .seek(SeekFrom::Start(plan.resume_offset))
                 .await?;
@@ -2538,20 +2861,25 @@ impl TransferQueue {
         let mut session_bytes = 0u64;
         let started_at = Instant::now();
         let mut last_rate = 0u64;
+        let mut last_progress_emit: Option<Instant> = None;
         let mut buf = vec![0u8; self.inner.config.chunk_size];
 
         loop {
             if let Some(signal) = current_interrupt(control_rx) {
-                let _ = local_file.flush().await;
-                return Ok(TransferOutcome::Interrupted(signal));
+                if signal == ControlSignal::Pause {
+                    self.update_progress(id, generation, transferred, last_rate);
+                }
+                return Ok(cleanup_download_interrupt(signal, local_file, &plan).await);
             }
 
             let read_n = tokio::select! {
                 biased;
                 _ = control_rx.changed() => {
                     if let Some(signal) = current_interrupt(control_rx) {
-                        let _ = local_file.flush().await;
-                        return Ok(TransferOutcome::Interrupted(signal));
+                        if signal == ControlSignal::Pause {
+                            self.update_progress(id, generation, transferred, last_rate);
+                        }
+                        return Ok(cleanup_download_interrupt(signal, local_file, &plan).await);
                     }
                     continue;
                 }
@@ -2566,13 +2894,23 @@ impl TransferQueue {
             transferred += read_n as u64;
             session_bytes += read_n as u64;
             last_rate = compute_throughput(session_bytes, started_at);
-            self.update_progress(id, generation, transferred, last_rate);
+            if last_progress_emit.is_none_or(|ts| ts.elapsed() >= PROGRESS_EMIT_INTERVAL) {
+                last_progress_emit = Some(Instant::now());
+                self.update_progress(id, generation, transferred, last_rate);
+            }
         }
 
         local_file.flush().await?;
+        if plan.using_part_file {
+            local_file.sync_data().await?;
+        }
         drop(local_file);
+        if plan.using_part_file && plan.write_path != plan.final_path {
+            rename_local_part_file(&plan.write_path, &plan.final_path, plan.overwrite_authorized)
+                .await?;
+        }
         if let Some(mode) = plan.permissions
-            && let Err(err) = apply_local_permissions(&local_path, mode).await
+            && let Err(err) = apply_local_permissions(&plan.final_path, mode).await
         {
             self.record_transfer_notice(
                 id,
@@ -2681,6 +3019,49 @@ impl TransferQueue {
         self.publish_snapshot(snap);
     }
 
+    fn source_meta_snapshot(&self, id: TransferId, generation: u64) -> (Option<u64>, Option<u32>) {
+        let entries = self.inner.entries.lock().expect("entries mutex poisoned");
+        entries
+            .iter()
+            .find(|e| e.snapshot.id == id && e.generation == generation)
+            .map(|e| (e.expected_source_size, e.expected_source_mtime))
+            .unwrap_or((None, None))
+    }
+
+    fn check_or_record_source_meta(
+        &self,
+        id: TransferId,
+        generation: u64,
+        size: u64,
+        mtime: Option<u32>,
+    ) -> bool {
+        let mut entries = self.inner.entries.lock().expect("entries mutex poisoned");
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|e| e.snapshot.id == id && e.generation == generation)
+        else {
+            return false;
+        };
+        if let Some(prev_size) = entry.expected_source_size {
+            let changed = prev_size != size
+                || (entry.expected_source_mtime.is_some()
+                    && mtime.is_some()
+                    && entry.expected_source_mtime != mtime);
+            if changed {
+                entry.expected_source_size = Some(size);
+                entry.expected_source_mtime = mtime;
+                entry.resume_hint = 0;
+                entry.snapshot.resume_offset = 0;
+                entry.snapshot.bytes_transferred = 0;
+            }
+            changed
+        } else {
+            entry.expected_source_size = Some(size);
+            entry.expected_source_mtime = mtime;
+            false
+        }
+    }
+
     fn update_upload_plan(&self, id: TransferId, generation: u64, plan: &UploadTargetPlan) {
         let snap = {
             let mut entries = self.inner.entries.lock().expect("entries mutex poisoned");
@@ -2690,6 +3071,30 @@ impl TransferQueue {
             else {
                 return;
             };
+            entry.snapshot.resume_offset = plan.resume_offset;
+            entry.snapshot.bytes_transferred = plan.resume_offset;
+            entry.snapshot.using_part_file = plan.using_part_file;
+            if let Some(notice) = &plan.notice {
+                entry.snapshot.notice = Some(notice.clone());
+            }
+            if let Some(notice) = &plan.status_notice {
+                entry.snapshot.status_notice = Some(notice.clone());
+            }
+            build_queue_snapshot(&entries)
+        };
+        self.publish_snapshot(snap);
+    }
+
+    fn update_download_plan(&self, id: TransferId, generation: u64, plan: &DownloadTargetPlan) {
+        let snap = {
+            let mut entries = self.inner.entries.lock().expect("entries mutex poisoned");
+            let Some(entry) = entries
+                .iter_mut()
+                .find(|e| e.snapshot.id == id && e.generation == generation)
+            else {
+                return;
+            };
+            entry.snapshot.total_bytes = plan.total_bytes;
             entry.snapshot.resume_offset = plan.resume_offset;
             entry.snapshot.bytes_transferred = plan.resume_offset;
             entry.snapshot.using_part_file = plan.using_part_file;
@@ -3100,6 +3505,40 @@ async fn cleanup_upload_interrupt(
         let _ = sftp.remove_file(plan.write_path.as_str()).await;
     }
     TransferOutcome::Interrupted(signal)
+}
+
+async fn cleanup_download_interrupt(
+    signal: ControlSignal,
+    mut local_file: tokio::fs::File,
+    plan: &DownloadTargetPlan,
+) -> TransferOutcome {
+    if signal == ControlSignal::Pause {
+        let _ = local_file.flush().await;
+    } else if signal == ControlSignal::Cancel && plan.using_part_file {
+        drop(local_file);
+        let _ = tokio::fs::remove_file(&plan.write_path).await;
+    }
+    TransferOutcome::Interrupted(signal)
+}
+
+async fn rename_local_part_file(
+    part_path: &Path,
+    final_path: &Path,
+    overwrite_authorized: bool,
+) -> Result<(), SshError> {
+    match tokio::fs::rename(part_path, final_path).await {
+        Ok(()) => Ok(()),
+        Err(err) if overwrite_authorized => {
+            if tokio::fs::metadata(final_path).await.is_ok() {
+                tokio::fs::remove_file(final_path).await?;
+                tokio::fs::rename(part_path, final_path).await?;
+                Ok(())
+            } else {
+                Err(err.into())
+            }
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn compute_throughput(session_bytes: u64, started_at: Instant) -> u64 {

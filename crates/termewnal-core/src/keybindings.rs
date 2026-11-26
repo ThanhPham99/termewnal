@@ -121,7 +121,7 @@ impl KeyAction {
             Self::TogglePaneZoom => "Toggle Pane Zoom",
             Self::ToggleBroadcastInput => "Toggle Broadcast Input",
             Self::ToggleSidebar => "Toggle Profiles Sidebar",
-            Self::ToggleSftpDrawer => "Toggle SFTP Drawer",
+            Self::ToggleSftpDrawer => "Toggle SFTP+ Panel",
             Self::ToggleCommandPalette => "Toggle Command Palette",
             Self::OpenQuickConnect => "Quick Connect SSH",
             Self::OpenSettings => "Open Settings",

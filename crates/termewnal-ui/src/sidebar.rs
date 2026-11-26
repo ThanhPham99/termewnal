@@ -1,24 +1,36 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::Instant;
 
 use iced::advanced::layout::{self, Layout};
+use iced::advanced::overlay;
 use iced::advanced::renderer::{self, Quad};
-use iced::advanced::widget::{Tree, tree};
-use iced::advanced::Widget;
+use iced::advanced::widget::{Operation, Tree, tree};
+use iced::advanced::{Clipboard, Shell, Widget};
 use iced::widget::{Id, button, column, container, row, scrollable, space, text, text_input};
-use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Rectangle, Shadow, Size, Theme, mouse};
-use termewnal_core::{OpenSshHost, Profile, ProfileTarget, ThemePalette, TunnelDirection};
+use iced::{
+    Alignment, Background, Border, Color, Element, Event, Length, Padding, Point, Rectangle,
+    Shadow, Size, Theme, Vector, mouse,
+};
+use termewnal_core::{
+    MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, OpenSshHost, Profile, ProfileTarget, ThemePalette,
+    TunnelDirection,
+};
 
-use crate::app::{LaunchDisposition, Message, SessionId};
+use crate::app::{Message, SessionId};
 use crate::context_menu::{SidebarRightClickCapture, TunnelRightClickCapture};
 use crate::drag_drop::{DragDropState, DragPayload, DragSource, DropTarget, DropTargetZone, DropZoneKind};
 use crate::ui_theme::{
-    ChromePalette, FONT_BODY, FONT_META, badge_pill, hairline_h, hairline_v,
-    list_row_button_style, mono_font, settings_nav_pill_style, sidebar_width_for_window,
-    status_dot, styled_input_style, tab_bar_button_style, tabby_scrollable_style, ui_font,
-    ui_font_medium, ui_font_semibold,
+    ChromePalette, DividerDragState, DividerPress, FONT_BODY, FONT_META, badge_pill,
+    clamp_sidebar_width, draw_interactive_divider, hairline_h, hairline_v, list_row_button_style,
+    mono_font, settings_nav_pill_style, sidebar_width_for_window, status_dot, styled_input_style,
+    tab_bar_button_style, tabby_scrollable_style, ui_font, ui_font_medium, ui_font_semibold,
 };
 use crate::workspace::TabId;
+
+const SIDEBAR_DIVIDER_THICKNESS: f32 = 1.0;
+const SIDEBAR_DIVIDER_HIT_PADDING: f32 = 5.0;
+const DOUBLE_CLICK_MAX_MS: u64 = 400;
 
 /// Group heading used when a saved `Profile` has no explicit group assigned.
 pub const UNGROUPED_LABEL: &str = "Ungrouped";
@@ -191,6 +203,15 @@ pub struct ActiveTunnelEntry {
     pub reconnected_notice: Option<String>,
 }
 
+/// Row currently selected in the Left Sidebar saved profile or `~/.ssh/config` list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarSelectedEntry {
+    /// Saved profile row identified by its profile ID.
+    Profile(String),
+    /// Imported `~/.ssh/config` host row identified by its SSH `Host` alias.
+    SystemSsh(String),
+}
+
 /// State backing the always-visible Left Sidebar.
 #[derive(Debug, Clone)]
 pub struct SidebarState {
@@ -202,6 +223,8 @@ pub struct SidebarState {
     collapsed_sections: BTreeSet<SidebarSection>,
     system_ssh_profiles: Vec<SystemSshProfile>,
     active_tunnels: Vec<ActiveTunnelEntry>,
+    selected_entry: Option<SidebarSelectedEntry>,
+    last_click: Option<(SidebarSelectedEntry, Instant)>,
 }
 
 impl Default for SidebarState {
@@ -215,6 +238,8 @@ impl Default for SidebarState {
             collapsed_sections: BTreeSet::new(),
             system_ssh_profiles: Vec::new(),
             active_tunnels: Vec::new(),
+            selected_entry: None,
+            last_click: None,
         }
     }
 }
@@ -413,6 +438,52 @@ impl SidebarState {
                 profiles: group_profiles,
             })
             .collect()
+    }
+
+    /// Returns the currently selected sidebar profile or `~/.ssh/config` host entry.
+    pub fn selected_entry(&self) -> Option<&SidebarSelectedEntry> {
+        self.selected_entry.as_ref()
+    }
+
+    /// Returns whether saved profile `profile_id` is currently selected in the sidebar.
+    pub fn is_profile_selected(&self, profile_id: &str) -> bool {
+        matches!(
+            self.selected_entry.as_ref(),
+            Some(SidebarSelectedEntry::Profile(id)) if id == profile_id
+        )
+    }
+
+    /// Returns whether `~/.ssh/config` host `alias` is currently selected in the sidebar.
+    pub fn is_system_ssh_selected(&self, alias: &str) -> bool {
+        matches!(
+            self.selected_entry.as_ref(),
+            Some(SidebarSelectedEntry::SystemSsh(entry_alias)) if entry_alias == alias
+        )
+    }
+
+    /// Records a click on saved profile `profile_id` and returns `true` on double-click.
+    pub fn handle_profile_click(&mut self, profile_id: &str, now: Instant) -> bool {
+        self.handle_entry_click(SidebarSelectedEntry::Profile(profile_id.to_string()), now)
+    }
+
+    /// Records a click on `~/.ssh/config` host `alias` and returns `true` on double-click.
+    pub fn handle_system_ssh_click(&mut self, alias: &str, now: Instant) -> bool {
+        self.handle_entry_click(SidebarSelectedEntry::SystemSsh(alias.to_string()), now)
+    }
+
+    fn handle_entry_click(&mut self, entry: SidebarSelectedEntry, now: Instant) -> bool {
+        self.selected_entry = Some(entry.clone());
+        let is_double = self.last_click.as_ref().is_some_and(|(prev_entry, prev_at)| {
+            *prev_entry == entry
+                && now.duration_since(*prev_at).as_millis() <= u128::from(DOUBLE_CLICK_MAX_MS)
+        });
+        if is_double {
+            self.last_click = None;
+            true
+        } else {
+            self.last_click = Some((entry, now));
+            false
+        }
     }
 }
 
@@ -663,8 +734,58 @@ pub fn render_sidebar_full<'a>(
     palette: &ThemePalette,
     window_width: f32,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
-    let chrome = ChromePalette::from_palette(palette);
     let sidebar_w = sidebar_width_for_window(window_width);
+    render_sidebar_full_inner(
+        state,
+        profiles,
+        saved_groups,
+        sessions,
+        drag_drop,
+        drag_enabled,
+        palette,
+        sidebar_w,
+        true,
+    )
+}
+
+/// Renders the Left Sidebar sized to an explicit user-resizable width (divider drawn by [`SidebarDock`]).
+#[allow(clippy::too_many_arguments)]
+pub fn render_sidebar_full_with_width<'a>(
+    state: &'a SidebarState,
+    profiles: &'a [Profile],
+    saved_groups: &'a [String],
+    sessions: &[SidebarSessionEntry],
+    drag_drop: Option<&'a DragDropState>,
+    drag_enabled: bool,
+    palette: &ThemePalette,
+    sidebar_width: f32,
+) -> Element<'a, Message, Theme, iced::Renderer> {
+    render_sidebar_full_inner(
+        state,
+        profiles,
+        saved_groups,
+        sessions,
+        drag_drop,
+        drag_enabled,
+        palette,
+        sidebar_width,
+        false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_sidebar_full_inner<'a>(
+    state: &'a SidebarState,
+    profiles: &'a [Profile],
+    saved_groups: &'a [String],
+    sessions: &[SidebarSessionEntry],
+    drag_drop: Option<&'a DragDropState>,
+    drag_enabled: bool,
+    palette: &ThemePalette,
+    sidebar_w: f32,
+    include_divider: bool,
+) -> Element<'a, Message, Theme, iced::Renderer> {
+    let chrome = ChromePalette::from_palette(palette);
 
     let mut content = column![]
         .spacing(0)
@@ -845,9 +966,292 @@ pub fn render_sidebar_full<'a>(
         });
 
     let body_with_menu = SidebarRightClickCapture::new(None, None, body.into());
-    row![body_with_menu, hairline_v(chrome)]
-        .height(Length::Fill)
-        .into()
+    if include_divider {
+        row![body_with_menu, hairline_v(chrome)]
+            .height(Length::Fill)
+            .into()
+    } else {
+        body_with_menu
+    }
+}
+
+/// Resizable container pairing the Left Sidebar on the left with the main workspace on the right.
+pub struct SidebarDock<'a> {
+    sidebar_width: f32,
+    children: [Element<'a, Message, Theme, iced::Renderer>; 2],
+}
+
+impl<'a> SidebarDock<'a> {
+    /// Wraps `sidebar` on the left and `main` on the right with a draggable divider.
+    pub fn new(
+        sidebar_width: f32,
+        sidebar: Element<'a, Message, Theme, iced::Renderer>,
+        main: Element<'a, Message, Theme, iced::Renderer>,
+    ) -> Element<'a, Message, Theme, iced::Renderer> {
+        Element::new(Self {
+            sidebar_width: sidebar_width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH),
+            children: [sidebar, main],
+        })
+    }
+
+    fn effective_sidebar_width(&self, total_width: f32) -> f32 {
+        clamp_sidebar_width(self.sidebar_width, total_width)
+    }
+
+    fn layout_rects(&self, bounds: Rectangle) -> (Rectangle, Rectangle, Rectangle) {
+        let sidebar_w = self.effective_sidebar_width(bounds.width);
+        let visual = Rectangle::new(
+            Point::new(bounds.x + sidebar_w, bounds.y),
+            Size::new(SIDEBAR_DIVIDER_THICKNESS, bounds.height),
+        );
+        let hit = Rectangle::new(
+            Point::new(visual.x - SIDEBAR_DIVIDER_HIT_PADDING, visual.y),
+            Size::new(visual.width + SIDEBAR_DIVIDER_HIT_PADDING * 2.0, visual.height),
+        );
+        let sidebar_rect = Rectangle::new(bounds.position(), Size::new(sidebar_w, bounds.height));
+        (sidebar_rect, visual, hit)
+    }
+}
+
+impl Widget<Message, Theme, iced::Renderer> for SidebarDock<'_> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<DividerDragState>()
+    }
+
+    fn state(&self) -> tree::State {
+        tree::State::new(DividerDragState::default())
+    }
+
+    fn children(&self) -> Vec<Tree> {
+        self.children.iter().map(Tree::new).collect()
+    }
+
+    fn diff(&self, tree: &mut Tree) {
+        tree.diff_children(&self.children);
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fill, Length::Fill)
+    }
+
+    fn layout(
+        &mut self,
+        tree: &mut Tree,
+        renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let total = limits.max();
+        let sidebar_w = self.effective_sidebar_width(total.width);
+        let main_w = (total.width - sidebar_w - SIDEBAR_DIVIDER_THICKNESS).max(1.0);
+        let sidebar_limits =
+            layout::Limits::new(Size::ZERO, Size::new(sidebar_w, total.height.max(1.0)));
+        let main_limits = layout::Limits::new(Size::ZERO, Size::new(main_w, total.height.max(1.0)));
+
+        let [sidebar, main] = &mut self.children;
+        let [sidebar_tree, main_tree] = &mut tree.children[..2] else {
+            unreachable!("SidebarDock always has two child trees");
+        };
+
+        let sidebar_node = sidebar
+            .as_widget_mut()
+            .layout(sidebar_tree, renderer, &sidebar_limits);
+        let main_node = main
+            .as_widget_mut()
+            .layout(main_tree, renderer, &main_limits)
+            .move_to(Point::new(sidebar_w + SIDEBAR_DIVIDER_THICKNESS, 0.0));
+
+        layout::Node::with_children(total, vec![sidebar_node, main_node])
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &iced::Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        operation.container(None, layout.bounds());
+        operation.traverse(&mut |op| {
+            for ((child, child_tree), child_layout) in self
+                .children
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+            {
+                child
+                    .as_widget_mut()
+                    .operate(child_tree, child_layout, renderer, op);
+            }
+        });
+    }
+
+    fn update(
+        &mut self,
+        tree: &mut Tree,
+        event: &Event,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        renderer: &iced::Renderer,
+        clipboard: &mut dyn Clipboard,
+        shell: &mut Shell<'_, Message>,
+        viewport: &Rectangle,
+    ) {
+        let state = tree.state.downcast_mut::<DividerDragState>();
+        let bounds = layout.bounds();
+        let (_sidebar_rect, _visual_rect, hit_rect) = self.layout_rects(bounds);
+
+        match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+                if cursor.is_over(hit_rect) =>
+            {
+                match state.on_left_press(Instant::now()) {
+                    DividerPress::DoubleClickReset => {
+                        shell.publish(Message::ResetSidebarWidth);
+                    }
+                    DividerPress::StartDrag => {}
+                }
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) if state.dragging => {
+                state.dragging = false;
+                shell.publish(Message::CommitSidebarWidth);
+                shell.capture_event();
+                shell.request_redraw();
+                return;
+            }
+            Event::Mouse(mouse::Event::CursorMoved { position }) => {
+                let is_hovered = cursor.is_over(hit_rect);
+                if state.hovered != is_hovered {
+                    state.hovered = is_hovered;
+                    shell.request_redraw();
+                }
+                if state.dragging {
+                    let raw_width = position.x - bounds.x;
+                    let new_width = clamp_sidebar_width(raw_width, bounds.width);
+                    shell.publish(Message::ResizeSidebar(new_width));
+                    shell.capture_event();
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        for ((child, child_tree), child_layout) in self
+            .children
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+        {
+            child.as_widget_mut().update(
+                child_tree,
+                event,
+                child_layout,
+                cursor,
+                renderer,
+                clipboard,
+                shell,
+                viewport,
+            );
+        }
+    }
+
+    fn mouse_interaction(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+        renderer: &iced::Renderer,
+    ) -> mouse::Interaction {
+        let state = tree.state.downcast_ref::<DividerDragState>();
+        let (_sidebar_rect, _visual_rect, hit_rect) = self.layout_rects(layout.bounds());
+        if state.dragging || cursor.is_over(hit_rect) {
+            return mouse::Interaction::ResizingHorizontally;
+        }
+
+        for ((child, child_tree), child_layout) in self
+            .children
+            .iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+        {
+            let interaction = child.as_widget().mouse_interaction(
+                child_tree,
+                child_layout,
+                cursor,
+                viewport,
+                renderer,
+            );
+            if interaction != mouse::Interaction::Idle {
+                return interaction;
+            }
+        }
+        mouse::Interaction::Idle
+    }
+
+    fn draw(
+        &self,
+        tree: &Tree,
+        renderer: &mut iced::Renderer,
+        theme: &Theme,
+        style: &renderer::Style,
+        layout: Layout<'_>,
+        cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        for ((child, child_tree), child_layout) in self
+            .children
+            .iter()
+            .zip(&tree.children)
+            .zip(layout.children())
+        {
+            child.as_widget().draw(
+                child_tree,
+                renderer,
+                theme,
+                style,
+                child_layout,
+                cursor,
+                viewport,
+            );
+        }
+
+        let state = tree.state.downcast_ref::<DividerDragState>();
+        let (_sidebar_rect, visual_rect, _hit_rect) = self.layout_rects(layout.bounds());
+        draw_interactive_divider(renderer, theme, visual_rect, state, 0.35);
+    }
+
+    fn overlay<'b>(
+        &'b mut self,
+        tree: &'b mut Tree,
+        layout: Layout<'b>,
+        renderer: &iced::Renderer,
+        viewport: &Rectangle,
+        translation: Vector,
+    ) -> Option<overlay::Element<'b, Message, Theme, iced::Renderer>> {
+        let overlays: Vec<_> = self
+            .children
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(layout.children())
+            .filter_map(|((child, child_tree), child_layout)| {
+                child.as_widget_mut().overlay(
+                    child_tree,
+                    child_layout,
+                    renderer,
+                    viewport,
+                    translation,
+                )
+            })
+            .collect();
+        if overlays.is_empty() {
+            None
+        } else {
+            Some(overlay::Group::with_children(overlays).overlay())
+        }
+    }
 }
 
 fn render_active_sessions_section<'a>(
@@ -1119,11 +1523,11 @@ fn render_saved_profiles_section<'a>(
                     let launch_btn = button(item_row)
                         .padding([4, 6])
                         .width(Length::Fill)
-                        .style(list_row_button_style(chrome, false))
-                        .on_press(Message::LaunchProfile {
-                            profile_id: profile.id.clone(),
-                            disposition: LaunchDisposition::NewTab,
-                        });
+                        .style(list_row_button_style(
+                            chrome,
+                            state.is_profile_selected(&profile.id),
+                        ))
+                        .on_press(Message::SidebarProfileClicked(profile.id.clone()));
                     let draggable_launch = DragSource::new(
                         DragPayload::SavedProfile {
                             profile_id: profile.id.clone(),
@@ -1352,11 +1756,11 @@ fn render_system_ssh_section<'a>(
         let launch_btn = button(item)
             .padding([4, 8])
             .width(Length::Fill)
-            .style(list_row_button_style(chrome, false))
-            .on_press(Message::LaunchSystemSsh {
-                alias: host.alias.clone(),
-                disposition: LaunchDisposition::NewTab,
-            });
+            .style(list_row_button_style(
+                chrome,
+                state.is_system_ssh_selected(&host.alias),
+            ))
+            .on_press(Message::SidebarSystemSshClicked(host.alias.clone()));
         let draggable_launch = DragSource::new(
             DragPayload::SystemSsh {
                 alias: host.alias.clone(),

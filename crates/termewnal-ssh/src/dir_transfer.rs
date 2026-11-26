@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::error::Error as SftpClientError;
 use russh_sftp::protocol::{FileAttributes, StatusCode};
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::warn;
 
 use crate::error::SshError;
@@ -61,7 +61,7 @@ pub(crate) struct RemoteDownloadWalkPlan {
 
 pub(crate) struct UploadDirBatch {
     dirs: Vec<RemoteDirModeSpec>,
-    dirs_ready: OnceCell<Result<(), String>>,
+    dirs_ready: AsyncMutex<bool>,
     pending_ids: Mutex<HashSet<TransferId>>,
 }
 
@@ -69,24 +69,21 @@ impl UploadDirBatch {
     pub fn new(dirs: Vec<RemoteDirModeSpec>, file_ids: &[TransferId]) -> Self {
         Self {
             dirs,
-            dirs_ready: OnceCell::new(),
+            dirs_ready: AsyncMutex::new(false),
             pending_ids: Mutex::new(file_ids.iter().copied().collect()),
         }
     }
 
     pub async fn ensure_dirs_created(&self, sftp: &SftpSession) -> Result<(), SshError> {
-        let res = self
-            .dirs_ready
-            .get_or_init(|| async {
-                for spec in &self.dirs {
-                    if let Err(err) = ensure_remote_dir_exists(sftp, &spec.remote_path).await {
-                        return Err(err.to_string());
-                    }
-                }
-                Ok(())
-            })
-            .await;
-        res.clone().map_err(SshError::Sftp)
+        let mut ready = self.dirs_ready.lock().await;
+        if *ready {
+            return Ok(());
+        }
+        for spec in &self.dirs {
+            ensure_remote_dir_exists(sftp, &spec.remote_path).await?;
+        }
+        *ready = true;
+        Ok(())
     }
 
     pub async fn finish_file_and_finalize_dirs(

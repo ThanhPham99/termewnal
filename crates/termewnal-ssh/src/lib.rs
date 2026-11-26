@@ -53,11 +53,11 @@ pub use supervisor::{
 pub use transfer::{
     ConflictCheck, ConflictResolution, DEFAULT_MAX_CONCURRENT_TRANSFERS,
     DEFAULT_MAX_TRANSPORT_RETRIES, DEFAULT_RECONNECT_RETRY_DELAY, DEFAULT_TRANSFER_CHUNK_SIZE,
-    DirectTransferHook, DirectoryTransferSummary, DownloadTargetPlan, ResilientTransferHook,
-    TransferConflict, TransferDirection, TransferExecutorHook, TransferId, TransferNotice,
-    TransferQueue, TransferQueueConfig, TransferQueueSnapshot, TransferReconnectState,
-    TransferSnapshot, TransferStatus, UploadPlanOptions, UploadTargetPlan, disambiguate_filename,
-    part_path_for,
+    DirectTransferHook, DirectoryTransferSummary, DownloadPlanOptions, DownloadTargetPlan,
+    ResilientTransferHook, TransferConflict, TransferDirection, TransferExecutorHook, TransferId,
+    TransferNotice, TransferQueue, TransferQueueConfig, TransferQueueSnapshot,
+    TransferReconnectState, TransferSnapshot, TransferStatus, UploadPlanOptions, UploadTargetPlan,
+    disambiguate_filename, local_part_path_for, part_path_for,
 };
 pub use tunnel::{
     DEFAULT_TUNNEL_HOLD_GRACE, RemoteForwardBackoffConfig, StandaloneTransportSpec, TunnelManager,

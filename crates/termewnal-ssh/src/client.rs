@@ -7,8 +7,8 @@ use russh::keys::PublicKeyOrCertificate;
 use russh::{Channel, ChannelMsg, ChannelOpenFailure, Disconnect};
 use socket2::{SockRef, TcpKeepalive};
 use termewnal_core::{
-    DEFAULT_KEEPALIVE_INTERVAL_SECS, LoginScriptStep, OpenSshHost, Profile, ProfileTarget,
-    SshAuthMethod, SshProxyConfig, vault::SecretStore,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_KEEPALIVE_MAX_MISSED, LoginScriptStep, OpenSshHost,
+    Profile, ProfileTarget, SshAuthMethod, SshProxyConfig, vault::SecretStore,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
@@ -21,7 +21,9 @@ use crate::known_hosts::{
     KnownHostStatus, default_known_hosts_path, record_known_host_path, verify_known_host_path,
 };
 use crate::proxy_cmd::ProxyCommandStream;
-use crate::proxy_jump::{JumpHopSpec, connect_chain_parts, resolve_proxy_jump_hops};
+use crate::proxy_jump::{
+    JumpHopSpec, connect_chain_parts_with_options, resolve_proxy_jump_hops,
+};
 use crate::proxy_net::dial_via_proxy;
 use crate::server_stats::{
     POSIX_SERVER_STATS_COMMAND, ServerStatsCollector, ServerStatsSnapshot, parse_raw_server_stats,
@@ -559,6 +561,38 @@ impl Default for TcpKeepaliveSettings {
     }
 }
 
+const DEFAULT_TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const DEFAULT_INTERACTIVE_WINDOW_SIZE: u32 = 2 * 1024 * 1024;
+const DEFAULT_TRANSFER_WINDOW_SIZE: u32 = 8 * 1024 * 1024;
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SshClientOptions {
+    pub window_size: u32,
+    pub keepalive_interval: Option<Duration>,
+    pub keepalive_max: usize,
+    pub silent_handshake_timeout: Option<Duration>,
+}
+
+impl SshClientOptions {
+    pub fn interactive() -> Self {
+        Self {
+            window_size: DEFAULT_INTERACTIVE_WINDOW_SIZE,
+            keepalive_interval: None,
+            keepalive_max: DEFAULT_KEEPALIVE_MAX_MISSED as usize,
+            silent_handshake_timeout: None,
+        }
+    }
+
+    pub fn transfer() -> Self {
+        Self {
+            window_size: DEFAULT_TRANSFER_WINDOW_SIZE,
+            keepalive_interval: Some(Duration::from_secs(DEFAULT_KEEPALIVE_INTERVAL_SECS.max(1))),
+            keepalive_max: DEFAULT_KEEPALIVE_MAX_MISSED.max(1) as usize,
+            silent_handshake_timeout: Some(DEFAULT_TCP_CONNECT_TIMEOUT * 2),
+        }
+    }
+}
+
 /// Authenticated SSH `Primary Transport` wrapping `russh::client::Handle`.
 pub struct SshTransport {
     host: String,
@@ -590,6 +624,25 @@ impl SshTransport {
         .await
     }
 
+    /// Opens an SSH connection for bulk `Transfer Transport` workloads with an expanded SSH
+    /// flow-control window (`8 MiB`), connect timeout, and SSH-level keepalive probing.
+    pub(crate) async fn connect_for_transfer(
+        config: &SshConnectConfig,
+        vault: Option<&dyn SecretStore>,
+        interaction: Arc<dyn SshInteractionHandler>,
+        agent_connector: Arc<dyn AgentConnector>,
+    ) -> Result<Self, SshError> {
+        Self::connect_with_options(
+            config,
+            Some(TcpKeepaliveSettings::default()),
+            SshClientOptions::transfer(),
+            vault,
+            interaction,
+            agent_connector,
+        )
+        .await
+    }
+
     /// Opens an SSH connection to `config.host:config.port` (direct or via `config.proxy_jump`)
     /// with explicit TCP keepalive settings, verifies host keys, and authenticates.
     pub async fn connect_with_keepalive(
@@ -599,10 +652,30 @@ impl SshTransport {
         interaction: Arc<dyn SshInteractionHandler>,
         agent_connector: Arc<dyn AgentConnector>,
     ) -> Result<Self, SshError> {
+        Self::connect_with_options(
+            config,
+            keepalive,
+            SshClientOptions::interactive(),
+            vault,
+            interaction,
+            agent_connector,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_with_options(
+        config: &SshConnectConfig,
+        keepalive: Option<TcpKeepaliveSettings>,
+        options: SshClientOptions,
+        vault: Option<&dyn SecretStore>,
+        interaction: Arc<dyn SshInteractionHandler>,
+        agent_connector: Arc<dyn AgentConnector>,
+    ) -> Result<Self, SshError> {
         if config.proxy_jump.is_empty() {
-            return Self::connect_direct_with_keepalive(
+            return Self::connect_direct_with_options(
                 config,
                 keepalive,
+                options,
                 vault,
                 interaction,
                 agent_connector,
@@ -610,8 +683,15 @@ impl SshTransport {
             .await;
         }
 
-        let (jump_hops, mut target) =
-            connect_chain_parts(config, keepalive, vault, interaction, agent_connector).await?;
+        let (jump_hops, mut target) = connect_chain_parts_with_options(
+            config,
+            keepalive,
+            options,
+            vault,
+            interaction,
+            agent_connector,
+        )
+        .await?;
         let any_interactive = jump_hops.iter().any(|h| h.used_interactive_auth());
         if any_interactive {
             target.mark_used_interactive_auth();
@@ -623,6 +703,25 @@ impl SshTransport {
     pub(crate) async fn connect_direct_with_keepalive(
         config: &SshConnectConfig,
         keepalive: Option<TcpKeepaliveSettings>,
+        vault: Option<&dyn SecretStore>,
+        interaction: Arc<dyn SshInteractionHandler>,
+        agent_connector: Arc<dyn AgentConnector>,
+    ) -> Result<Self, SshError> {
+        Self::connect_direct_with_options(
+            config,
+            keepalive,
+            SshClientOptions::interactive(),
+            vault,
+            interaction,
+            agent_connector,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_direct_with_options(
+        config: &SshConnectConfig,
+        keepalive: Option<TcpKeepaliveSettings>,
+        options: SshClientOptions,
         vault: Option<&dyn SecretStore>,
         interaction: Arc<dyn SshInteractionHandler>,
         agent_connector: Arc<dyn AgentConnector>,
@@ -639,8 +738,15 @@ impl SshTransport {
                 config.port,
                 &config.username,
             )?;
-            return Self::connect_over_stream(stream, config, vault, interaction, agent_connector)
-                .await;
+            return Self::connect_over_stream_with_options(
+                stream,
+                config,
+                options,
+                vault,
+                interaction,
+                agent_connector,
+            )
+            .await;
         }
 
         if let Some(proxy_cfg) = config
@@ -660,26 +766,55 @@ impl SshTransport {
                 }
                 _ => None,
             };
-            let stream = dial_via_proxy(
-                proxy_cfg,
-                proxy_secret.as_deref().map(String::as_str),
-                &config.host,
-                config.port,
-                config.nodelay,
-                keepalive,
+            let stream = tokio::time::timeout(
+                DEFAULT_TCP_CONNECT_TIMEOUT,
+                dial_via_proxy(
+                    proxy_cfg,
+                    proxy_secret.as_deref().map(String::as_str),
+                    &config.host,
+                    config.port,
+                    config.nodelay,
+                    keepalive,
+                ),
             )
-            .await?;
-            return Self::connect_over_stream(stream, config, vault, interaction, agent_connector)
-                .await;
-        }
-
-        let tcp = TcpStream::connect((config.host.as_str(), config.port))
             .await
-            .map_err(|err| SshError::Connection {
+            .map_err(|_| SshError::Connection {
                 host: config.host.clone(),
                 port: config.port,
-                reason: err.to_string(),
-            })?;
+                reason: format!(
+                    "proxy connection timed out after {}s",
+                    DEFAULT_TCP_CONNECT_TIMEOUT.as_secs()
+                ),
+            })??;
+            return Self::connect_over_stream_with_options(
+                stream,
+                config,
+                options,
+                vault,
+                interaction,
+                agent_connector,
+            )
+            .await;
+        }
+
+        let tcp = tokio::time::timeout(
+            DEFAULT_TCP_CONNECT_TIMEOUT,
+            TcpStream::connect((config.host.as_str(), config.port)),
+        )
+        .await
+        .map_err(|_| SshError::Connection {
+            host: config.host.clone(),
+            port: config.port,
+            reason: format!(
+                "TCP connection timed out after {}s",
+                DEFAULT_TCP_CONNECT_TIMEOUT.as_secs()
+            ),
+        })?
+        .map_err(|err| SshError::Connection {
+            host: config.host.clone(),
+            port: config.port,
+            reason: err.to_string(),
+        })?;
         let _ = tcp.set_nodelay(config.nodelay);
         if let Some(ka) = keepalive
             && !ka.interval.is_zero()
@@ -687,7 +822,15 @@ impl SshTransport {
             apply_tcp_keepalive(&tcp, ka);
         }
 
-        Self::connect_over_stream(tcp, config, vault, interaction, agent_connector).await
+        Self::connect_over_stream_with_options(
+            tcp,
+            config,
+            options,
+            vault,
+            interaction,
+            agent_connector,
+        )
+        .await
     }
 
     /// Performs SSH handshake, host key verification, and authentication over an existing stream
@@ -695,6 +838,28 @@ impl SshTransport {
     pub async fn connect_over_stream<S>(
         stream: S,
         config: &SshConnectConfig,
+        vault: Option<&dyn SecretStore>,
+        interaction: Arc<dyn SshInteractionHandler>,
+        agent_connector: Arc<dyn AgentConnector>,
+    ) -> Result<Self, SshError>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::connect_over_stream_with_options(
+            stream,
+            config,
+            SshClientOptions::interactive(),
+            vault,
+            interaction,
+            agent_connector,
+        )
+        .await
+    }
+
+    pub(crate) async fn connect_over_stream_with_options<S>(
+        stream: S,
+        config: &SshConnectConfig,
+        options: SshClientOptions,
         vault: Option<&dyn SecretStore>,
         interaction: Arc<dyn SshInteractionHandler>,
         agent_connector: Arc<dyn AgentConnector>,
@@ -715,6 +880,9 @@ impl SshTransport {
 
         let russh_cfg = Arc::new(client::Config {
             nodelay: config.nodelay,
+            window_size: options.window_size,
+            keepalive_interval: options.keepalive_interval,
+            keepalive_max: options.keepalive_max,
             ..client::Config::default()
         });
         let remote_forwards = Arc::new(Mutex::new(RemoteForwardRegistry::default()));
@@ -730,27 +898,45 @@ impl SshTransport {
         );
         let closed_rx = handler.subscribe_closed();
 
-        let mut handle = client::connect_stream(russh_cfg, stream, handler).await?;
+        let connect_and_auth = async move {
+            let mut handle = client::connect_stream(russh_cfg, stream, handler).await?;
 
-        let auth_res = authenticate_session(
-            &mut handle,
-            &config.host,
-            &config.username,
-            &config.auth,
-            vault,
-            interaction.as_ref(),
-            agent_connector.as_ref(),
-        )
-        .await;
+            let auth_res = authenticate_session(
+                &mut handle,
+                &config.host,
+                &config.username,
+                &config.auth,
+                vault,
+                interaction.as_ref(),
+                agent_connector.as_ref(),
+            )
+            .await;
 
-        let outcome = match auth_res {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                let _ = handle
-                    .disconnect(Disconnect::ByApplication, "", "en")
-                    .await;
-                return Err(err);
-            }
+            let outcome = match auth_res {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    let _ = handle
+                        .disconnect(Disconnect::ByApplication, "", "en")
+                        .await;
+                    return Err(err);
+                }
+            };
+            Ok::<_, SshError>((handle, outcome))
+        };
+
+        let (handle, outcome) = if let Some(deadline) = options.silent_handshake_timeout {
+            tokio::time::timeout(deadline, connect_and_auth)
+                .await
+                .map_err(|_| SshError::Connection {
+                    host: config.host.clone(),
+                    port: config.port,
+                    reason: format!(
+                        "SSH handshake/auth timed out after {}s",
+                        deadline.as_secs()
+                    ),
+                })??
+        } else {
+            connect_and_auth.await?
         };
 
         Ok(Self {

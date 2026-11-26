@@ -1,6 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -14,20 +17,22 @@ use iced::{
     Alignment, Background, Border, Color, Element, Event, Length, Padding, Point, Size,
     Subscription, Task, Theme, clipboard, event, window,
 };
+use notify::{RecommendedWatcher, RecursiveMode};
+use notify_debouncer_mini::{DebouncedEventBatch, new_debouncer_opt};
 use termewnal_core::{
     AppConfig, BellBehavior, BuiltinTheme, CURRENT_SCHEMA_VERSION, ConfigFileKind, ConfigPaths,
-    ConfigSyncService, ConfigWatchEvent, ConfigWatcher, CursorStyle, DockerRuntime, KeyAction,
-    KeyChord, KeybindingResolver, LayoutSplitAxis, LayoutSplitNode, LoginScriptStep, NewlineMode,
-    OpenSshHost, Profile, ProfileTarget, ProfilesConfig, QuickCommand, QuickCommandsConfig,
-    RightClickAction, SecretStore, SerialInputMode, SerialOutputMode,
-    SessionDescriptor, SftpState, SshAuthMethod, SshProxyConfig, SyncProviderKind, TabBarPosition,
-    TabLayout,
-    TerminalConfig, ThemePalette, TomlReloadError, TransferConflictPolicy, TunnelDirection,
-    TunnelRule, VaultBackend, VaultSession, WindowLayout, WorkspaceLayout, WorkspaceTemplate,
-    WorkspacesConfig, ensure_config_files, import_tabby_config_file_into_profiles, load_layout,
-    load_quick_commands, load_sftp_state, load_system_ssh_hosts, load_workspaces,
-    resolve_mux_attach_command, save_cloned_openssh_profile, save_config, save_layout,
-    save_profiles, save_quick_commands, save_sftp_state, save_workspaces,
+    ConfigSyncService, ConfigWatchEvent, ConfigWatcher, CursorStyle, DEFAULT_SIDEBAR_WIDTH,
+    DockerRuntime, KeyAction, KeyChord, KeybindingResolver, LayoutSplitAxis, LayoutSplitNode,
+    LoginScriptStep, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, NewlineMode, OpenSshHost, Profile,
+    ProfileTarget, ProfilesConfig, QuickCommand, QuickCommandsConfig, RightClickAction,
+    SecretStore, SerialInputMode, SerialOutputMode, SessionDescriptor, SftpState, SshAuthMethod,
+    SshProxyConfig, SyncProviderKind, TabBarPosition, TabLayout, TerminalConfig, ThemePalette,
+    TomlReloadError, TransferConflictPolicy, TunnelDirection, TunnelRule, VaultBackend,
+    VaultSession, WindowLayout, WorkspaceLayout, WorkspaceTemplate, WorkspacesConfig,
+    ensure_config_files, import_tabby_config_file_into_profiles, load_layout, load_quick_commands,
+    load_sftp_state, load_system_ssh_hosts, load_workspaces, resolve_mux_attach_command,
+    save_cloned_openssh_profile, save_config, save_layout, save_profiles, save_quick_commands,
+    save_sftp_state, save_workspaces,
 };
 use termewnal_protocols::{
     CommandOutputRunner, ContainerExecConfig, DockerDiscovery, OsCommandRunner, OsSerialPortOpener,
@@ -68,6 +73,11 @@ use crate::context_menu::{
     ContextMenuState, TabRightClickCapture, context_prompt_input_id, parse_hex_color,
     render_context_menu_overlay,
 };
+use crate::app_picker::{
+    AppCatalogProvider, InstalledApp, build_desktop_exec_argv, discover_installed_apps_for_target,
+    display_name_for_app_path, filter_installed_apps, parse_desktop_entry,
+};
+pub use crate::app_picker::parse_desktop_exec_tokens;
 use crate::drag_drop::{
     DragCoordinator, DragDropState, DragPayload, DragSource, DropTarget, DropTargetZone,
     DropZoneKind, render_drag_overlay,
@@ -86,19 +96,18 @@ use crate::quake_and_tray::{
 use crate::server_stats_bar::render_server_stats_bar;
 use crate::settings_ui::{SettingsTab, SettingsUiState, ThemeOverrideField};
 use crate::sftp_drawer::{
-    DEFAULT_SFTP_DRAWER_WIDTH, MIN_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH, SftpConnectionState,
-    SftpDrawerDock, SftpDrawerState, render_conflict_resolution_modal_responsive, render_sftp_drawer,
+    DEFAULT_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH, MIN_SFTP_DRAWER_WIDTH, SftpConnectionState,
+    SftpDrawerDock, SftpDrawerState, render_conflict_resolution_modal_responsive,
 };
 use crate::sftp_plus::{
-    FileBrowserEntry, SftpClipboard, SftpClipboardOp, SftpContextActionKind, SftpLayoutMode,
-    SftpModalState, SftpPaneSide, SftpSortColumn, copy_local_path_recursive, default_local_home_dir,
-    format_octal_mode, join_pane_path, pane_prefs, pane_prefs_mut, parent_pane_path,
-    remove_local_path, render_sftp_context_menu_overlay, render_sftp_plus_commander,
-    render_sftp_plus_modal, set_local_permissions, unique_local_copy_path, visible_pane_entries,
+    FileBrowserEntry, SftpClipboard, SftpClipboardOp, SftpContextActionKind, SftpModalState,
+    SftpSortColumn, WatchedRemoteFile, format_octal_mode, render_sftp_context_menu_overlay,
+    render_sftp_panel, render_sftp_plus_modal, visible_remote_entries,
 };
 use crate::sidebar::{
-    ActiveTunnelEntry, SidebarFilterScope, SidebarSection, SidebarSessionEntry, SidebarState,
-    SystemSshProfile, UNGROUPED_LABEL, profile_target_summary, render_sidebar_full,
+    ActiveTunnelEntry, SidebarDock, SidebarFilterScope, SidebarSection, SidebarSessionEntry,
+    SidebarState, SystemSshProfile, UNGROUPED_LABEL, profile_target_summary,
+    render_sidebar_full_with_width,
 };
 use crate::split_view::{CapturedEventGate, PaneFrame, ShortcutInterceptor, SplitView};
 use crate::ssh_ui::{SshTargetSpec, SshUiEvent, SshUiState, connect_ssh_task};
@@ -121,9 +130,10 @@ use crate::tunnel_ui::{
 };
 use crate::ui_theme::{
     ChromePalette, FONT_BODY, FONT_META, FONT_SUBHEAD, TAB_BAR_HEIGHT, ViewportTier, badge_pill,
-    hairline_h, hairline_v, keycap_pill, list_row_button_style, mono_font, sidebar_width_for_window, status_dot, styled_input_style, tab_bar_button_style,
-    tab_bar_close_button_style, tab_button_style, tab_container_style_tinted,
-    tabby_scrollable_style, ui_font, ui_font_medium, ui_font_semibold,
+    clamp_sidebar_width, hairline_h, hairline_v, keycap_pill, list_row_button_style, mono_font,
+    status_dot, styled_input_style, tab_bar_button_style, tab_bar_close_button_style,
+    tab_button_style, tab_container_style_tinted, tabby_scrollable_style, ui_font,
+    ui_font_medium, ui_font_semibold,
 };
 use crate::v2_modals::{
     ProtocolLauncherState, ProtocolLauncherTab, QuickCommandsUiState, WorkspacesUiState,
@@ -143,6 +153,19 @@ pub type UrlOpener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
 
 /// Injectable OS local-file opener boundary for `Ctrl+Click` file paths (`path:line:col`).
 pub type FileOpener = Arc<dyn Fn(&Path, Option<u32>, Option<u32>) -> Result<(), String> + Send + Sync>;
+
+/// Injectable OS custom-application launcher boundary for SFTP+ `Open with...` `(app_path, target_path)`.
+pub type AppOpener = Arc<dyn Fn(&Path, &Path) -> Result<(), String> + Send + Sync>;
+
+#[derive(Debug, Clone)]
+struct PendingOpenWithLaunch {
+    session_id: SessionId,
+    entry: FileBrowserEntry,
+    app_path: PathBuf,
+    local_target: PathBuf,
+    transfer_ids: Vec<TransferId>,
+    completed_ids: BTreeSet<TransferId>,
+}
 
 /// Unique identifier for a runtime terminal `Session`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -979,11 +1002,16 @@ pub enum Message {
     SaveWorkspaceLayout,
     ToggleSidebar,
     SetSidebarOpen(bool),
+    ResizeSidebar(f32),
+    CommitSidebarWidth,
+    ResetSidebarWidth,
     SetSidebarFilterScope(SidebarFilterScope),
     SidebarFilterChanged(String),
     SidebarToggleTagFilter(String),
     SidebarToggleGroup(String),
     SidebarToggleSection(SidebarSection),
+    SidebarProfileClicked(String),
+    SidebarSystemSshClicked(String),
     SetSystemSshProfiles(Vec<SystemSshProfile>),
     ReloadSystemSshConfig,
     CloneSystemSshToProfile(String),
@@ -1052,45 +1080,96 @@ pub enum Message {
     ToggleSftpDrawerForSession(SessionId),
     SetSftpDrawerOpen(bool),
     ResizeSftpDrawer(f32),
-    SftpSetLayoutMode(SftpLayoutMode),
-    SftpToggleTransfersPanel,
-    SftpSetActivePane(SftpPaneSide),
+    CommitSftpDrawerWidth,
+    ResetSftpDrawerWidth,
+    FocusSftpPanel(SessionId),
+    SftpSessionClose(SessionId),
+    SftpSessionToggleTransfersPanel(SessionId),
     SftpShortcut(SftpContextActionKind),
-    SftpPanePathInputChanged(SftpPaneSide, String),
-    SftpPaneNavigateSubmitted(SftpPaneSide),
-    SftpPaneNavigateTo {
-        side: SftpPaneSide,
+    SftpSessionPathInputChanged(SessionId, String),
+    SftpSessionNavigateSubmitted(SessionId),
+    SftpSessionNavigateTo {
+        session_id: SessionId,
         path: String,
     },
-    SftpPaneBack(SftpPaneSide),
-    SftpPaneForward(SftpPaneSide),
-    SftpPaneUp(SftpPaneSide),
-    SftpPaneRefresh(SftpPaneSide),
-    SftpPaneHome(SftpPaneSide),
-    SftpPaneToggleHidden(SftpPaneSide),
-    SftpPaneToggleFilter(SftpPaneSide),
-    SftpPaneFilterChanged(SftpPaneSide, String),
-    SftpPaneToggleBookmarks(SftpPaneSide),
-    SftpPaneDismissBookmarks(SftpPaneSide),
-    SftpPaneToggleBookmarkCurrent(SftpPaneSide),
-    SftpPaneSelectBookmark {
-        side: SftpPaneSide,
+    SftpSessionBack(SessionId),
+    SftpSessionForward(SessionId),
+    SftpSessionUp(SessionId),
+    SftpSessionRefresh(SessionId),
+    SftpSessionHome(SessionId),
+    SftpSessionToggleHidden(SessionId),
+    SftpSessionToggleFilter(SessionId),
+    SftpSessionFilterChanged(SessionId, String),
+    SftpSessionToggleBookmarks(SessionId),
+    SftpSessionDismissBookmarks(SessionId),
+    SftpSessionToggleBookmarkCurrent(SessionId),
+    SftpSessionSelectBookmark {
+        session_id: SessionId,
         path: String,
     },
-    SftpPaneRemoveBookmark {
-        side: SftpPaneSide,
+    SftpSessionRemoveBookmark {
+        session_id: SessionId,
         path: String,
     },
-    SftpPaneSortBy(SftpPaneSide, SftpSortColumn),
-    SftpPaneRowClicked {
-        side: SftpPaneSide,
+    SftpSessionSortBy(SessionId, SftpSortColumn),
+    SftpSessionRowClicked {
+        session_id: SessionId,
         path: String,
         ctrl_held: bool,
     },
-    SftpOpenContextMenu {
-        side: SftpPaneSide,
+    SftpSessionOpenContextMenu {
+        session_id: SessionId,
         target_path: Option<String>,
         position: Point,
+    },
+    SftpSessionUploadFiles(SessionId),
+    SftpSessionUploadFolder(SessionId),
+    SftpSessionUploadPicked {
+        session_id: SessionId,
+        paths: Vec<PathBuf>,
+    },
+    SftpSessionDownloadToPicked {
+        session_id: SessionId,
+        entries: Vec<FileBrowserEntry>,
+        dest_dir: Option<PathBuf>,
+    },
+    SftpSessionOpenWithAppPicked {
+        session_id: SessionId,
+        entry: FileBrowserEntry,
+        app_path: Option<PathBuf>,
+    },
+    SftpOpenWithAppsLoaded {
+        session_id: SessionId,
+        remote_path: String,
+        apps: Vec<InstalledApp>,
+    },
+    SftpOpenWithSearchChanged(String),
+    SftpOpenWithSelectApp(PathBuf),
+    SftpOpenWithConfirm,
+    SftpOpenWithBrowseCustom,
+    SftpSessionOpenWithDirEnqueued {
+        session_id: SessionId,
+        entry: FileBrowserEntry,
+        app_path: PathBuf,
+        local_target: PathBuf,
+        result: Result<DirectoryTransferSummary, String>,
+    },
+    SftpOpenWithCheckWatchedFiles,
+    SftpOpenWithUploadNow {
+        session_id: SessionId,
+        watch_id: u64,
+    },
+    SftpOpenWithToggleAutoSync {
+        session_id: SessionId,
+        watch_id: u64,
+    },
+    SftpOpenWithIgnoreChange {
+        session_id: SessionId,
+        watch_id: u64,
+    },
+    SftpOpenWithStopWatch {
+        session_id: SessionId,
+        watch_id: u64,
     },
     SftpDismissContextMenu,
     SftpContextAction(SftpContextActionKind),
@@ -1116,25 +1195,8 @@ pub enum Message {
         path: String,
         result: Result<(), String>,
     },
-    SftpPathInputChanged(String),
-    SftpNavigateTo(String),
-    SftpNavigateUp,
-    SftpRefresh,
-    SftpNewFolderInputChanged(String),
-    SftpCreateFolder,
-    SftpDeleteEntry {
-        path: String,
-        is_dir: bool,
-    },
-    SftpDownloadFile {
-        remote_path: String,
-        file_name: String,
-    },
-    SftpDownloadDir {
-        remote_path: String,
-        dir_name: String,
-    },
-    SftpDrawerFileDropped {
+    SftpSessionFileDropped {
+        session_id: SessionId,
         path: PathBuf,
     },
     SftpBrowseResult {
@@ -1145,9 +1207,6 @@ pub enum Message {
     SftpMutationResult {
         session_id: SessionId,
         result: Result<(), String>,
-    },
-    SftpDirEnqueueResult {
-        result: Result<DirectoryTransferSummary, String>,
     },
     SftpSessionDirEnqueueResult {
         session_id: SessionId,
@@ -1360,6 +1419,11 @@ pub enum Message {
     SettingsWordSeparatorsChanged(String),
     SettingsAutoLogToggled(bool),
     SettingsLogDirectoryChanged(String),
+    SettingsAutoOpenSftpToggled(bool),
+    SettingsSftpDownloadDirChanged(String),
+    SettingsBrowseSftpDownloadDir,
+    SettingsSftpDownloadDirPicked(Option<PathBuf>),
+    SettingsResetSftpDownloadDir,
     SettingsKeybindingFilterChanged(String),
     SettingsKeybindingChanged {
         action: KeyAction,
@@ -1504,6 +1568,7 @@ pub enum Message {
         session_id: SessionId,
         retry_generation: u64,
     },
+    ProbeTransferRecovery,
     ClearExpiredReconnectNotices,
     WindowUnfocused(window::Id),
     WindowDragStart(window::Id),
@@ -1545,6 +1610,7 @@ pub struct AppState {
     pending_remote_connects: Vec<RemoteConnectIntent>,
     openssh_hosts: Vec<OpenSshHost>,
     sidebar: SidebarState,
+    sidebar_width: f32,
     command_palette: CommandPaletteState,
     tabby_import: TabbyImportUiState,
     settings_ui: SettingsUiState,
@@ -1559,6 +1625,7 @@ pub struct AppState {
     sftp_fallback_drawer: SftpDrawerState,
     sftp_drawer_width: f32,
     sftp_download_dir: PathBuf,
+    sftp_download_dir_overridden: bool,
     transfer_sessions: BTreeMap<TransferId, SessionId>,
     tunnel_manager: TunnelManager,
     tunnel_ui: TunnelUiState,
@@ -1577,6 +1644,12 @@ pub struct AppState {
     last_copied: Option<String>,
     url_opener: UrlOpener,
     file_opener: FileOpener,
+    app_opener: AppOpener,
+    app_catalog_provider: AppCatalogProvider,
+    sftp_open_temp_dir: PathBuf,
+    next_open_with_seq: u64,
+    pending_open_with: Vec<PendingOpenWithLaunch>,
+    transfer_recovery_probes: u8,
     notifier: Arc<dyn DesktopNotifier>,
     keybinding_resolver: Arc<KeybindingResolver>,
     pending_key_chords: Vec<KeyChord>,
@@ -1743,7 +1816,19 @@ impl AppState {
             },
         );
         let tunnel_manager = TunnelManager::new();
-        let download_dir = paths.cache_dir().join("downloads");
+        let download_dir = config
+            .terminal
+            .sftp_download_dir
+            .clone()
+            .unwrap_or_else(|| paths.sftp_download_dir().to_path_buf());
+        let sidebar_width = config
+            .terminal
+            .sidebar_width
+            .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+        let sftp_drawer_width = config
+            .terminal
+            .sftp_panel_width
+            .clamp(MIN_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH);
         let keybinding_resolver = Arc::new(config.keybindings.resolver());
         let compiled_highlights = Arc::from(compile_highlight_rules(&config.terminal.highlight_rules));
         let mut init_err: Option<String> = None;
@@ -1791,6 +1876,7 @@ impl AppState {
             pending_remote_connects: Vec::new(),
             openssh_hosts: Vec::new(),
             sidebar,
+            sidebar_width,
             command_palette: CommandPaletteState::new(),
             tabby_import: TabbyImportUiState::default(),
             status_bar: StatusBarState::new(),
@@ -1800,8 +1886,9 @@ impl AppState {
             sftp_state,
             sftp_drawers: BTreeMap::new(),
             sftp_fallback_drawer: SftpDrawerState::with_download_dir(download_dir.clone()),
-            sftp_drawer_width: DEFAULT_SFTP_DRAWER_WIDTH,
+            sftp_drawer_width,
             sftp_download_dir: download_dir,
+            sftp_download_dir_overridden: false,
             transfer_sessions: BTreeMap::new(),
             tunnel_manager,
             tunnel_ui: TunnelUiState::default(),
@@ -1823,6 +1910,12 @@ impl AppState {
             last_copied: None,
             url_opener: Arc::new(open_url_with_system),
             file_opener: Arc::new(open_local_file_with_system),
+            app_opener: Arc::new(open_local_path_with_app),
+            app_catalog_provider: Arc::new(discover_installed_apps_for_target),
+            sftp_open_temp_dir: std::env::temp_dir().join("termewnal-sftp-open"),
+            next_open_with_seq: 1,
+            pending_open_with: Vec::new(),
+            transfer_recovery_probes: 0,
             notifier: default_desktop_notifier(),
             keybinding_resolver,
             pending_key_chords: Vec::new(),
@@ -1885,6 +1978,24 @@ impl AppState {
     /// Overrides the OS local-file opener boundary for `Ctrl+Click` file paths (used by tests).
     pub fn with_file_opener(mut self, opener: FileOpener) -> Self {
         self.file_opener = opener;
+        self
+    }
+
+    /// Overrides the OS custom-application launcher boundary for SFTP+ `Open with...` (used by tests).
+    pub fn with_app_opener(mut self, opener: AppOpener) -> Self {
+        self.app_opener = opener;
+        self
+    }
+
+    /// Overrides installed-application catalog discovery for SFTP+ `Open with...` (used by tests).
+    pub fn with_app_catalog_provider(mut self, provider: AppCatalogProvider) -> Self {
+        self.app_catalog_provider = provider;
+        self
+    }
+
+    /// Overrides the local staging directory used by SFTP+ `Open with...` (used by tests).
+    pub fn with_sftp_open_temp_dir(mut self, dir: PathBuf) -> Self {
+        self.sftp_open_temp_dir = dir;
         self
     }
 
@@ -2796,6 +2907,26 @@ impl AppState {
         opened
     }
 
+    fn launch_profile_by_id(
+        &mut self,
+        window_scope: Option<window::Id>,
+        profile_id: &str,
+        disposition: LaunchDisposition,
+    ) -> Task<Message> {
+        if let Some(profile) = self
+            .profiles
+            .profiles
+            .iter()
+            .find(|p| p.id == profile_id)
+            .cloned()
+        {
+            self.launch_profile_entry(window_scope, &profile, disposition)
+        } else {
+            self.last_error = Some(format!("unknown profile id: {profile_id}"));
+            Task::none()
+        }
+    }
+
     fn launch_profile_entry(
         &mut self,
         window_scope: Option<window::Id>,
@@ -3500,6 +3631,7 @@ impl AppState {
         self.visual_bell_active.remove(&session_id);
         self.zmodem_controllers.remove(&session_id);
         self.sftp_drawers.remove(&session_id);
+        self.pending_open_with.retain(|p| p.session_id != session_id);
         if let Some(entry) = self.sessions.get(&session_id)
             && let Some(buf) = entry.buffer()
         {
@@ -4252,6 +4384,7 @@ impl AppState {
                         self.sync_tray_state();
                     }
                 }
+                self.check_watched_open_with_files();
                 Task::none()
             }
             Message::WindowUnfocused(id) => {
@@ -4645,6 +4778,7 @@ impl AppState {
             }
             Message::ApplyTerminalConfig(cfg) => {
                 self.config.terminal = cfg;
+                self.sync_ui_from_terminal_config();
                 if self.settings_ui.is_open() {
                     self.settings_origin_config = Some(self.config.clone());
                     self.settings_ui.sync_from_config(&self.config);
@@ -4695,12 +4829,16 @@ impl AppState {
                     self.context_menu.close();
                     return Task::none();
                 }
-                if self.sftp_drawer().plus.context_menu.open {
-                    self.active_sftp_drawer_mut().plus.context_menu.close();
+                if let Some(sid) = self.sftp_session_for_context_menu()
+                    && let Some(drawer) = self.sftp_drawers.get_mut(&sid)
+                {
+                    drawer.plus.context_menu.close();
                     return Task::none();
                 }
-                if self.sftp_drawer().plus.modal.is_open() {
-                    self.active_sftp_drawer_mut().plus.modal = SftpModalState::None;
+                if let Some(sid) = self.sftp_session_for_modal()
+                    && let Some(drawer) = self.sftp_drawers.get_mut(&sid)
+                {
+                    drawer.plus.modal = SftpModalState::None;
                     return Task::none();
                 }
                 if self.settings_ui.is_open() {
@@ -4753,6 +4891,11 @@ impl AppState {
             }
             Message::TerminalFocused => {
                 self.search.input_focused = false;
+                if let Some(sid) = self.active_ssh_session_id()
+                    && let Some(drawer) = self.sftp_drawers.get_mut(&sid)
+                {
+                    drawer.set_panel_focused(false);
+                }
                 Task::none()
             }
             Message::ScrollViewport {
@@ -4934,6 +5077,7 @@ impl AppState {
                             );
                             if matches!(reloaded, Ok(true)) {
                                 self.rebuild_runtime_config_caches();
+                                self.sync_ui_from_terminal_config();
                                 self.sync_terminal_options_to_sessions();
                                 self.transfer_queue
                                     .set_transfer_config(self.config.transfer.clone());
@@ -4973,6 +5117,7 @@ impl AppState {
                         self.last_error = None;
                         if kind == ConfigFileKind::AppConfig {
                             self.rebuild_runtime_config_caches();
+                            self.sync_ui_from_terminal_config();
                             self.sync_terminal_options_to_sessions();
                             self.transfer_queue
                                 .set_transfer_config(self.config.transfer.clone());
@@ -5284,6 +5429,19 @@ impl AppState {
                 self.sidebar.set_open(open);
                 Task::none()
             }
+            Message::ResizeSidebar(width) => {
+                self.set_sidebar_width(width);
+                Task::none()
+            }
+            Message::CommitSidebarWidth => {
+                self.persist_sidebar_width();
+                Task::none()
+            }
+            Message::ResetSidebarWidth => {
+                self.set_sidebar_width(DEFAULT_SIDEBAR_WIDTH);
+                self.persist_sidebar_width();
+                Task::none()
+            }
             Message::SetSidebarFilterScope(scope) => {
                 self.sidebar.set_filter_scope(scope);
                 Task::none()
@@ -5326,23 +5484,32 @@ impl AppState {
                 self.sidebar.set_active_tunnels(entries);
                 Task::none()
             }
+            Message::SidebarProfileClicked(profile_id) => {
+                if self.sidebar.handle_profile_click(&profile_id, Instant::now()) {
+                    return self.launch_profile_by_id(
+                        window_scope,
+                        &profile_id,
+                        LaunchDisposition::NewTab,
+                    );
+                }
+                Task::none()
+            }
+            Message::SidebarSystemSshClicked(alias) => {
+                if self.sidebar.handle_system_ssh_click(&alias, Instant::now()) {
+                    return self.launch_system_ssh_entry(
+                        window_scope,
+                        &alias,
+                        LaunchDisposition::NewTab,
+                    );
+                }
+                Task::none()
+            }
             Message::LaunchProfile {
                 profile_id,
                 disposition,
             } => {
                 self.command_palette.close();
-                if let Some(profile) = self
-                    .profiles
-                    .profiles
-                    .iter()
-                    .find(|p| p.id == profile_id)
-                    .cloned()
-                {
-                    self.launch_profile_entry(window_scope, &profile, disposition)
-                } else {
-                    self.last_error = Some(format!("unknown profile id: {profile_id}"));
-                    Task::none()
-                }
+                self.launch_profile_by_id(window_scope, &profile_id, disposition)
             }
             Message::LaunchSystemSsh { alias, disposition } => {
                 self.command_palette.close();
@@ -5462,29 +5629,57 @@ impl AppState {
                 self.set_sftp_drawer_width(width);
                 Task::none()
             }
-            msg @ (Message::SftpSetLayoutMode(_)
-            | Message::SftpToggleTransfersPanel
-            | Message::SftpSetActivePane(_)
+            Message::CommitSftpDrawerWidth => {
+                self.persist_sftp_panel_width();
+                Task::none()
+            }
+            Message::ResetSftpDrawerWidth => {
+                self.set_sftp_drawer_width(DEFAULT_SFTP_DRAWER_WIDTH);
+                self.persist_sftp_panel_width();
+                Task::none()
+            }
+            Message::FocusSftpPanel(session_id) => {
+                self.focus_sftp_session(session_id);
+                Task::none()
+            }
+            msg @ (Message::SftpSessionClose(_)
+            | Message::SftpSessionToggleTransfersPanel(_)
             | Message::SftpShortcut(_)
-            | Message::SftpPanePathInputChanged(_, _)
-            | Message::SftpPaneNavigateSubmitted(_)
-            | Message::SftpPaneNavigateTo { .. }
-            | Message::SftpPaneBack(_)
-            | Message::SftpPaneForward(_)
-            | Message::SftpPaneUp(_)
-            | Message::SftpPaneRefresh(_)
-            | Message::SftpPaneHome(_)
-            | Message::SftpPaneToggleHidden(_)
-            | Message::SftpPaneToggleFilter(_)
-            | Message::SftpPaneFilterChanged(_, _)
-            | Message::SftpPaneToggleBookmarks(_)
-            | Message::SftpPaneDismissBookmarks(_)
-            | Message::SftpPaneToggleBookmarkCurrent(_)
-            | Message::SftpPaneSelectBookmark { .. }
-            | Message::SftpPaneRemoveBookmark { .. }
-            | Message::SftpPaneSortBy(_, _)
-            | Message::SftpPaneRowClicked { .. }
-            | Message::SftpOpenContextMenu { .. }
+            | Message::SftpSessionPathInputChanged(_, _)
+            | Message::SftpSessionNavigateSubmitted(_)
+            | Message::SftpSessionNavigateTo { .. }
+            | Message::SftpSessionBack(_)
+            | Message::SftpSessionForward(_)
+            | Message::SftpSessionUp(_)
+            | Message::SftpSessionRefresh(_)
+            | Message::SftpSessionHome(_)
+            | Message::SftpSessionToggleHidden(_)
+            | Message::SftpSessionToggleFilter(_)
+            | Message::SftpSessionFilterChanged(_, _)
+            | Message::SftpSessionToggleBookmarks(_)
+            | Message::SftpSessionDismissBookmarks(_)
+            | Message::SftpSessionToggleBookmarkCurrent(_)
+            | Message::SftpSessionSelectBookmark { .. }
+            | Message::SftpSessionRemoveBookmark { .. }
+            | Message::SftpSessionSortBy(_, _)
+            | Message::SftpSessionRowClicked { .. }
+            | Message::SftpSessionOpenContextMenu { .. }
+            | Message::SftpSessionUploadFiles(_)
+            | Message::SftpSessionUploadFolder(_)
+            | Message::SftpSessionUploadPicked { .. }
+            | Message::SftpSessionDownloadToPicked { .. }
+            | Message::SftpSessionOpenWithAppPicked { .. }
+            | Message::SftpOpenWithAppsLoaded { .. }
+            | Message::SftpOpenWithSearchChanged(_)
+            | Message::SftpOpenWithSelectApp(_)
+            | Message::SftpOpenWithConfirm
+            | Message::SftpOpenWithBrowseCustom
+            | Message::SftpSessionOpenWithDirEnqueued { .. }
+            | Message::SftpOpenWithCheckWatchedFiles
+            | Message::SftpOpenWithUploadNow { .. }
+            | Message::SftpOpenWithToggleAutoSync { .. }
+            | Message::SftpOpenWithIgnoreChange { .. }
+            | Message::SftpOpenWithStopWatch { .. }
             | Message::SftpDismissContextMenu
             | Message::SftpContextAction(_)
             | Message::SftpDismissModal
@@ -5497,49 +5692,19 @@ impl AppState {
             | Message::SftpModalSaveFile
             | Message::SftpRemoteFileReadResult { .. }
             | Message::SftpRemoteFileSaveResult { .. }) => self.handle_sftp_plus_message(msg),
-            Message::SftpPathInputChanged(path) => {
-                self.active_sftp_drawer_mut().set_path_input(path);
-                Task::none()
-            }
-            Message::SftpNavigateTo(path) => self.navigate_sftp_to(path),
-            Message::SftpNavigateUp => {
-                let parent = parent_remote_path(self.sftp_drawer().current_path());
-                self.navigate_sftp_to(parent)
-            }
-            Message::SftpRefresh => {
-                let path = self.sftp_drawer().current_path().to_string();
-                self.navigate_sftp_to(path)
-            }
-            Message::SftpNewFolderInputChanged(name) => {
-                self.active_sftp_drawer_mut().set_new_folder_name(name);
-                Task::none()
-            }
-            Message::SftpCreateFolder => self.create_sftp_folder(),
-            Message::SftpDeleteEntry { path, is_dir } => self.delete_sftp_entry(path, is_dir),
-            Message::SftpDownloadFile {
-                remote_path,
-                file_name,
-            } => {
-                self.enqueue_sftp_download(remote_path, file_name);
-                Task::none()
-            }
-            Message::SftpDownloadDir {
-                remote_path,
-                dir_name,
-            } => self.enqueue_sftp_download_dir(remote_path, dir_name),
-            Message::SftpDrawerFileDropped { path } => {
+            Message::SftpSessionFileDropped { session_id, path } => {
                 self.drag_drop.clear_external_file_hover();
-                if let Some(session_id) = self.active_ssh_session_id() {
-                    let action =
-                        classify_file_drop(session_id, &path, true, false, true);
+                if self
+                    .sessions
+                    .get(&session_id)
+                    .and_then(SessionEntry::as_ssh)
+                    .is_some()
+                {
+                    self.focus_sftp_session(session_id);
+                    let action = classify_file_drop(session_id, &path, true, false, true);
                     if let FileDropAction::UploadToSftp { session_id, path } = action {
                         self.enqueue_sftp_upload(session_id, path);
                     }
-                } else {
-                    self.active_sftp_drawer_mut().set_browser_error(Some(
-                        "Connect an SSH Session before dropping files into the SFTP Drawer."
-                            .to_string(),
-                    ));
                 }
                 Task::none()
             }
@@ -5589,7 +5754,7 @@ impl AppState {
             },
             Message::SftpManagerStatusUpdated(entries) => {
                 let now = Instant::now();
-                let matching_sessions: Vec<(SessionId, SftpTransportStatus)> = self
+                let matching_sessions: Vec<(SessionId, ProfileTransportKey, SftpTransportStatus)> = self
                     .sessions
                     .iter()
                     .filter_map(|(&sid, entry)| {
@@ -5598,10 +5763,11 @@ impl AppState {
                         entries
                             .iter()
                             .find(|(k, _)| *k == key)
-                            .map(|(_, st)| (sid, st.clone()))
+                            .map(|(_, st)| (sid, key, st.clone()))
                     })
                     .collect();
-                for (sid, status) in matching_sessions {
+                let mut resumed = 0usize;
+                for (sid, key, status) in matching_sessions {
                     if let Some(drawer) = self.sftp_drawers.get_mut(&sid) {
                         match status {
                             SftpTransportStatus::AutoReconnecting { attempt, reason } => {
@@ -5609,15 +5775,43 @@ impl AppState {
                             }
                             SftpTransportStatus::Reconnected { .. } => {
                                 drawer.mark_reconnected_now(now);
+                                resumed += self.transfer_queue.resume_reconnected(&key);
                             }
                             SftpTransportStatus::Connected { .. } => {
                                 drawer.mark_connected_or_recovered(now);
+                                resumed += self.transfer_queue.resume_reconnected(&key);
                             }
                             SftpTransportStatus::Idle | SftpTransportStatus::Error { .. } => {}
                         }
                     }
                 }
                 self.sync_sftp_status_notice();
+                if resumed > 0 {
+                    self.transfer_recovery_probes = 0;
+                    self.sync_transfer_telemetry();
+                }
+                Task::none()
+            }
+            Message::ProbeTransferRecovery => {
+                if !self.transfer_queue.has_reconnectable_failures() {
+                    self.transfer_recovery_probes = 0;
+                    return Task::none();
+                }
+                self.transfer_recovery_probes = self.transfer_recovery_probes.saturating_add(1);
+                let connected_keys: Vec<ProfileTransportKey> = self
+                    .sessions
+                    .values()
+                    .filter_map(SessionEntry::as_ssh)
+                    .filter(|slot| matches!(slot.transport_status, TransportStatus::Connected { .. }))
+                    .map(SshSessionSlot::sftp_key)
+                    .collect();
+                let mut resumed = 0usize;
+                for key in connected_keys {
+                    resumed += self.transfer_queue.resume_reconnected(&key);
+                }
+                if resumed > 0 {
+                    self.sync_transfer_telemetry();
+                }
                 Task::none()
             }
             Message::SftpAutoReconnectTick {
@@ -5655,22 +5849,43 @@ impl AppState {
                 }
                 Task::none()
             }
-            Message::SftpDirEnqueueResult { result } => {
-                self.handle_dir_enqueue_result(None, result);
-                Task::none()
-            }
             Message::SftpSessionDirEnqueueResult { session_id, result } => {
-                self.handle_dir_enqueue_result(Some(session_id), result);
+                self.handle_dir_enqueue_result(session_id, result);
                 Task::none()
             }
             Message::TransferQueueUpdated(snap) => {
                 let prev_done = self.sftp_drawer().queue_snapshot().completed_count;
+                let new_done = snap.completed_count;
+                let snap_ref = snap.clone();
                 self.sync_transfer_telemetry_from(snap);
-                let new_done = self.sftp_drawer().queue_snapshot().completed_count;
-                if new_done > prev_done && self.sftp_drawer().is_open() {
-                    return self.refresh_open_sftp_after_transfer();
+                if !self.transfer_queue.has_reconnectable_failures() {
+                    self.transfer_recovery_probes = 0;
                 }
-                Task::none()
+                let completed_upload_sessions = self.process_open_with_transfer_updates(&snap_ref);
+                let mut tasks = Vec::new();
+                let mut refreshed_sessions = BTreeSet::new();
+                if new_done > prev_done
+                    && self.sftp_drawer().is_open()
+                    && let Some(active_sid) = self.active_ssh_session_id()
+                {
+                    refreshed_sessions.insert(active_sid);
+                    tasks.push(self.refresh_open_sftp_after_transfer());
+                }
+                for sid in completed_upload_sessions {
+                    if refreshed_sessions.insert(sid)
+                        && let Some(drawer) = self.sftp_drawers.get(&sid)
+                        && drawer.is_open()
+                        && !drawer.is_loading()
+                    {
+                        let path = drawer.current_path().to_string();
+                        tasks.push(self.sftp_refresh_task(sid, path));
+                    }
+                }
+                if tasks.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(tasks)
+                }
             }
             Message::TransferConflictRenameInputChanged(input) => {
                 self.conflict_drawer_mut().set_conflict_rename_input(input);
@@ -6613,6 +6828,46 @@ impl AppState {
             }
             Message::SettingsLogDirectoryChanged(val) => {
                 self.settings_ui.set_log_directory_text(val);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsAutoOpenSftpToggled(enabled) => {
+                self.settings_ui.set_auto_open_sftp(enabled);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsSftpDownloadDirChanged(val) => {
+                self.sftp_download_dir_overridden = false;
+                self.settings_ui.set_sftp_download_dir_text(val);
+                self.apply_live_settings_preview();
+                Task::none()
+            }
+            Message::SettingsBrowseSftpDownloadDir => {
+                let initial = self.sftp_download_dir.clone();
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Select SFTP Download Folder")
+                            .set_directory(initial)
+                            .pick_folder()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    Message::SettingsSftpDownloadDirPicked,
+                )
+            }
+            Message::SettingsSftpDownloadDirPicked(opt) => {
+                if let Some(path) = opt {
+                    self.sftp_download_dir_overridden = false;
+                    self.settings_ui
+                        .set_sftp_download_dir_text(path.to_string_lossy().into_owned());
+                    self.apply_live_settings_preview();
+                }
+                Task::none()
+            }
+            Message::SettingsResetSftpDownloadDir => {
+                self.sftp_download_dir_overridden = false;
+                self.settings_ui.set_sftp_download_dir_text(String::new());
                 self.apply_live_settings_preview();
                 Task::none()
             }
@@ -8038,6 +8293,7 @@ impl AppState {
         }
         self.config.keybindings = draft.keybindings;
         self.rebuild_runtime_config_caches();
+        self.sync_ui_from_terminal_config();
         self.sync_terminal_options_to_sessions();
     }
 
@@ -8049,6 +8305,7 @@ impl AppState {
                 self.sidebar.set_open(self.config.terminal.show_profile_sidebar);
             }
             self.rebuild_runtime_config_caches();
+            self.sync_ui_from_terminal_config();
             self.sync_terminal_options_to_sessions();
             self.transfer_queue
                 .set_transfer_config(self.config.transfer.clone());
@@ -8081,7 +8338,9 @@ impl AppState {
         let prev_tray_enabled = self.config.tray.enabled;
         self.config = next_cfg;
         self.settings_origin_config = None;
+        self.sftp_download_dir_overridden = false;
         self.rebuild_runtime_config_caches();
+        self.sync_ui_from_terminal_config();
         self.sync_terminal_options_to_sessions();
         self.transfer_queue
             .set_transfer_config(self.config.transfer.clone());
@@ -8341,15 +8600,25 @@ impl AppState {
                 slot.transport_status = connected_status;
                 slot.status_message = format_ssh_slot_message(&slot.target, &slot.transport_status);
                 slot.snapshot = Arc::new(slot.buffer.snapshot());
+                let is_reconnected = slot.reconnected_at.is_some();
+                let profile_id = slot.target.profile_id.clone();
+                let supervisor_handle = slot.supervisor.clone();
+                let auto_opened = if self.config.terminal.auto_open_sftp {
+                    self.ensure_session_sftp_drawer(session_id)
+                        .auto_open_if_allowed()
+                } else {
+                    false
+                };
                 if let Some(drawer) = self.sftp_drawers.get_mut(&session_id) {
-                    if slot.reconnected_at.is_some() {
+                    if is_reconnected {
                         drawer.mark_reconnected_now(now);
                     } else {
                         drawer.mark_connected_or_recovered(now);
                     }
                 }
-                let profile_id = slot.target.profile_id.clone();
-                let supervisor_handle = slot.supervisor.clone();
+                if auto_opened {
+                    self.sync_status_bar_drawer_open();
+                }
                 self.sync_sftp_status_notice();
                 if self.transfer_queue.resume_reconnected(&sftp_key) > 0 {
                     self.sync_transfer_telemetry();
@@ -8771,7 +9040,7 @@ impl AppState {
 
         let tab_pos = self.config.terminal.tab_bar_position;
         let vertical_tabs = matches!(tab_pos, TabBarPosition::Left | TabBarPosition::Right);
-        let sidebar_w = sidebar_width_for_window(win_w);
+        let sidebar_w = clamp_sidebar_width(self.sidebar_width, win_w);
         let vertical_rail_w = if vertical_tabs {
             if ViewportTier::from_width(win_w) == ViewportTier::Compact {
                 148.0
@@ -8781,52 +9050,16 @@ impl AppState {
         } else {
             0.0
         };
-        let active_ssh_sid = Self::active_ssh_session_in(&self.sessions, ws);
-        let active_sftp_drawer = self.sftp_drawer_for_workspace(ws);
-        let sftp_est_w = if active_sftp_drawer.is_open() {
-            active_sftp_drawer
-                .width()
-                .min((win_w - sidebar_w).max(200.0) * 0.50)
-        } else {
-            0.0
-        };
-        let workspace_w = (win_w - sidebar_w - vertical_rail_w - sftp_est_w).max(200.0);
-        let strip_w = (win_w - sidebar_w - sftp_est_w).max(200.0);
+        let workspace_w = (win_w - sidebar_w - vertical_rail_w).max(200.0);
+        let strip_w = (win_w - sidebar_w).max(200.0);
 
-        let has_connected_ssh = active_ssh_sid.is_some_and(|sid| {
-            self.sessions
-                .get(&sid)
-                .and_then(SessionEntry::as_ssh)
-                .is_some_and(|slot| slot.active.is_some())
-        });
-        let dual_sftp_open = active_sftp_drawer.is_open()
-            && active_sftp_drawer.plus.layout_mode != SftpLayoutMode::SideDock;
-        let active_sftp_bookmark_key = active_ssh_sid
-            .and_then(|sid| {
-                self.sessions
-                    .get(&sid)
-                    .and_then(SessionEntry::as_ssh)
-                    .and_then(|slot| slot.target.profile_id.as_deref())
-            })
-            .or_else(|| active_sftp_drawer.session_label());
-        let body = if dual_sftp_open {
-            render_sftp_plus_commander(
-                active_sftp_drawer,
-                &self.sftp_state,
-                active_sftp_bookmark_key,
-                has_connected_ssh,
-                workspace_w,
-                &palette,
-            )
-        } else {
-            match ws.and_then(|w| w.active_tab()) {
-                Some(tab) => self.render_tab_body(tab),
-                None => self.render_empty_workspace(&palette, workspace_w, win_h),
-            }
+        let body = match ws.and_then(|w| w.active_tab()) {
+            Some(tab) => self.render_tab_body(tab, workspace_w),
+            None => self.render_empty_workspace(&palette, workspace_w, win_h),
         };
         content_col = content_col.push(body);
 
-        let tab_strip = self.render_tab_strip(ws, &palette, vertical_tabs, win_w, strip_w);
+        let tab_strip = self.render_tab_strip(ws, &palette, vertical_tabs, win_w, strip_w, sidebar_w);
 
         let top_system_bar = render_top_system_title_bar(
             window_id,
@@ -8856,23 +9089,11 @@ impl AppState {
 
         let gated_workspace: Element<'_, Message, Theme, iced::Renderer> =
             CapturedEventGate::new(docked_workspace);
-        let right_of_sidebar: Element<'_, Message, Theme, iced::Renderer> =
-            if active_sftp_drawer.is_open()
-                && active_sftp_drawer.plus.layout_mode == SftpLayoutMode::SideDock
-            {
-                SftpDrawerDock::new(
-                    active_sftp_drawer.width(),
-                    gated_workspace,
-                    render_sftp_drawer(active_sftp_drawer, has_connected_ssh, &palette),
-                )
-            } else {
-                gated_workspace
-            };
-
         let sidebar_sessions = self.sidebar_sessions(ws);
 
-        let workspace_row: Element<'_, Message, Theme, iced::Renderer> = row![
-            render_sidebar_full(
+        let workspace_row: Element<'_, Message, Theme, iced::Renderer> = SidebarDock::new(
+            self.sidebar_width,
+            render_sidebar_full_with_width(
                 &self.sidebar,
                 &self.profiles.profiles,
                 &self.profiles.groups,
@@ -8880,13 +9101,10 @@ impl AppState {
                 Some(&self.drag_drop),
                 !self.has_modal_open(),
                 &palette,
-                win_w,
+                sidebar_w,
             ),
-            right_of_sidebar,
-        ]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into();
+            gated_workspace,
+        );
 
         let mut base_col = column![top_system_bar, hairline_h(chrome), workspace_row]
             .width(Length::Fill)
@@ -8933,18 +9151,21 @@ impl AppState {
         {
             layers = layers.push(conflict_modal);
         }
-        if let Some(sftp_modal) =
-            render_sftp_plus_modal(active_sftp_drawer, win_w, win_h, &palette)
+        if let Some(modal_drawer) = self.sftp_modal_drawer(ws)
+            && let Some(sftp_modal) =
+                render_sftp_plus_modal(modal_drawer, win_w, win_h, &palette)
         {
             layers = layers.push(sftp_modal);
         }
-        if let Some(sftp_menu) = render_sftp_context_menu_overlay(
-            active_sftp_drawer,
-            has_connected_ssh,
-            win_w,
-            win_h,
-            &palette,
-        ) {
+        if let Some((menu_drawer, menu_has_connected_ssh)) = self.sftp_context_menu_drawer(ws)
+            && let Some(sftp_menu) = render_sftp_context_menu_overlay(
+                menu_drawer,
+                menu_has_connected_ssh,
+                win_w,
+                win_h,
+                &palette,
+            )
+        {
             layers = layers.push(sftp_menu);
         }
         let adhoc_ssh_sessions: Vec<(SessionId, String)> = self
@@ -9064,10 +9285,10 @@ impl AppState {
         vertical: bool,
         window_width: f32,
         strip_width: f32,
+        sidebar_w: f32,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
         let chrome = ChromePalette::from_palette(palette);
         let tier = ViewportTier::from_width(window_width);
-        let sidebar_w = sidebar_width_for_window(window_width);
         let active_tab_id = ws.and_then(|w| w.active_tab_id());
         let hide_index = self.config.terminal.hide_tab_index;
         let flex_tabs = self.config.terminal.flex_tabs;
@@ -9531,7 +9752,11 @@ impl AppState {
         controls.into()
     }
 
-    fn render_tab_body(&self, tab: &WorkspaceTab) -> Element<'_, Message, Theme, iced::Renderer> {
+    fn render_tab_body(
+        &self,
+        tab: &WorkspaceTab,
+        avail_width: f32,
+    ) -> Element<'_, Message, Theme, iced::Renderer> {
         if let Some(zoomed_pane) = tab.zoomed_pane
             && let Some(session_id) = tab.root.session_for_pane(zoomed_pane)
         {
@@ -9541,6 +9766,7 @@ impl AppState {
                 true,
                 tab.broadcast_input,
                 false,
+                avail_width,
             );
         }
 
@@ -9550,6 +9776,7 @@ impl AppState {
             tab.focused_pane,
             tab.broadcast_input,
             show_border,
+            avail_width,
         )
     }
 
@@ -9559,6 +9786,7 @@ impl AppState {
         focused_pane: PaneId,
         broadcast: bool,
         show_border: bool,
+        avail_width: f32,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
         match node {
             SplitNode::Leaf {
@@ -9570,6 +9798,7 @@ impl AppState {
                 *pane_id == focused_pane,
                 broadcast,
                 show_border,
+                avail_width,
             ),
             SplitNode::Split {
                 split_id,
@@ -9577,13 +9806,22 @@ impl AppState {
                 ratio,
                 first,
                 second,
-            } => SplitView::new(
-                *split_id,
-                *axis,
-                *ratio,
-                self.render_split_node(first, focused_pane, broadcast, show_border),
-                self.render_split_node(second, focused_pane, broadcast, show_border),
-            ),
+            } => {
+                let (w1, w2) = match axis {
+                    SplitAxis::Vertical => (
+                        (avail_width * *ratio).max(120.0),
+                        (avail_width * (1.0 - *ratio)).max(120.0),
+                    ),
+                    SplitAxis::Horizontal => (avail_width, avail_width),
+                };
+                SplitView::new(
+                    *split_id,
+                    *axis,
+                    *ratio,
+                    self.render_split_node(first, focused_pane, broadcast, show_border, w1),
+                    self.render_split_node(second, focused_pane, broadcast, show_border, w2),
+                )
+            }
         }
     }
 
@@ -9594,9 +9832,14 @@ impl AppState {
         focused: bool,
         broadcast: bool,
         show_border: bool,
+        pane_avail_w: f32,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
         let modal_open = self.has_modal_open();
-        let terminal_focused = focused && !modal_open;
+        let sftp_panel_focused = self
+            .sftp_drawers
+            .get(&session_id)
+            .is_some_and(|d| d.is_open() && d.is_panel_focused());
+        let terminal_focused = focused && !modal_open && !sftp_panel_focused;
         let ime_enabled = !modal_open && !(self.search.open && self.search.input_focused);
         let options = TerminalViewOptions::from_config_with_runtime(
             &self.config.terminal,
@@ -9638,7 +9881,10 @@ impl AppState {
                     &self.config.terminal.theme,
                     &self.config.terminal.theme_overrides,
                 );
-                if slot.transport_status == TransportStatus::Disconnected {
+                let (bar, term_body): (
+                    Element<'_, Message, Theme, iced::Renderer>,
+                    Element<'_, Message, Theme, iced::Renderer>,
+                ) = if slot.transport_status == TransportStatus::Disconnected {
                     let bar = SshUiState::view_disconnected_ssh_bar(
                         slot.id,
                         &slot.target.host,
@@ -9647,10 +9893,7 @@ impl AppState {
                         slot.last_error.as_deref(),
                         &palette,
                     );
-                    column![bar, viewport]
-                        .width(Length::Fill)
-                        .height(Length::Fill)
-                        .into()
+                    (bar, viewport)
                 } else {
                     let chrome = ChromePalette::from_palette(&palette);
                     let dot_color = if slot.is_auto_reconnecting() {
@@ -9781,17 +10024,60 @@ impl AppState {
                         border: Border::default(),
                         text_color: Some(chrome.text_primary),
                         ..Default::default()
-                    });
-                    let mut col = column![bar, viewport];
-                    if self.config.terminal.show_server_stats && !slot.server_stats_unsupported {
-                        col = col.push(render_server_stats_bar(
-                            slot.server_stats.as_ref(),
-                            &slot.transport_status,
+                    })
+                    .into();
+                    let term_body: Element<'_, Message, Theme, iced::Renderer> =
+                        if self.config.terminal.show_server_stats
+                            && !slot.server_stats_unsupported
+                        {
+                            column![
+                                viewport,
+                                render_server_stats_bar(
+                                    slot.server_stats.as_ref(),
+                                    &slot.transport_status,
+                                    &palette,
+                                ),
+                            ]
+                            .width(Length::Fill)
+                            .height(Length::Fill)
+                            .into()
+                        } else {
+                            viewport
+                        };
+                    (bar, term_body)
+                };
+
+                let below_bar: Element<'_, Message, Theme, iced::Renderer> =
+                    if let Some(drawer) = self.sftp_drawers.get(&slot.id)
+                        && drawer.is_open()
+                    {
+                        let panel_w = SftpDrawerDock::clamped_panel_width(
+                            drawer.width(),
+                            pane_avail_w,
+                        );
+                        let has_connected_ssh = slot.active.is_some();
+                        let bookmark_key = slot
+                            .target
+                            .profile_id
+                            .as_deref()
+                            .or_else(|| drawer.session_label());
+                        let panel = render_sftp_panel(
+                            slot.id,
+                            drawer,
+                            &self.sftp_state,
+                            bookmark_key,
+                            has_connected_ssh,
+                            panel_w,
                             &palette,
-                        ));
-                    }
-                    col.width(Length::Fill).height(Length::Fill).into()
-                }
+                        );
+                        SftpDrawerDock::new(slot.id, drawer.width(), term_body, panel)
+                    } else {
+                        term_body
+                    };
+                column![bar, below_bar]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into()
             }
             Some(SessionEntry::Serial(slot)) => {
                 let viewport = TerminalViewport::with_focus(
@@ -10517,6 +10803,29 @@ impl AppState {
         let reconnect_notice_tick = self.has_active_reconnect_notices().then(|| {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::ClearExpiredReconnectNotices)
         });
+        let transfer_recovery_tick = (self.transfer_queue.has_reconnectable_failures()
+            && self.transfer_recovery_probes < 3)
+            .then(|| {
+                iced::time::every(Duration::from_secs(5)).map(|_| Message::ProbeTransferRecovery)
+            });
+        let watched_sftp_targets: Vec<(PathBuf, String)> = self
+            .sftp_drawers
+            .values()
+            .flat_map(|d| d.plus.watched_files.iter())
+            .filter_map(|w| {
+                let parent = w.local_path.parent()?.to_path_buf();
+                let name = w.local_path.file_name()?.to_string_lossy().into_owned();
+                Some((parent, name))
+            })
+            .collect();
+        let watched_sftp_sub = (!watched_sftp_targets.is_empty()).then(|| {
+            Subscription::run_with(
+                WatchedSftpFilesSubKey {
+                    targets: watched_sftp_targets,
+                },
+                watched_sftp_files_stream,
+            )
+        });
 
         Subscription::batch(
             [
@@ -10533,6 +10842,8 @@ impl AppState {
             .chain(vault_tick)
             .chain(blink_tick)
             .chain(reconnect_notice_tick)
+            .chain(transfer_recovery_tick)
+            .chain(watched_sftp_sub)
             .chain(ipc_sub)
             .chain(tray_sub)
             .chain(hotkey_sub)
@@ -10642,8 +10953,10 @@ impl AppState {
             || self.ssh_ui.active_host_key_prompt().is_some()
             || self.ssh_ui.active_auth_prompt().is_some()
             || self.context_menu.is_open()
-            || self.sftp_drawer().plus.modal.is_open()
-            || self.sftp_drawer().plus.context_menu.open
+            || self
+                .sftp_drawers
+                .values()
+                .any(|d| d.plus.modal.is_open() || d.plus.context_menu.open)
             || self.quick_commands_ui.open
             || self.workspaces_ui.open
             || self.protocol_launcher.open
@@ -11192,8 +11505,14 @@ impl AppState {
         self.sftp_state.last_dir(profile_id)
     }
 
+    /// Returns the preferred Left Sidebar width in logical pixels.
+    pub fn sidebar_width(&self) -> f32 {
+        self.sidebar_width
+    }
+
     /// Overrides the local destination directory for SFTP downloads (useful in tests).
     pub fn set_sftp_download_dir(&mut self, dir: PathBuf) {
+        self.sftp_download_dir_overridden = true;
         self.sftp_download_dir = dir.clone();
         self.sftp_fallback_drawer.set_download_dir(dir.clone());
         for drawer in self.sftp_drawers.values_mut() {
@@ -11571,6 +11890,163 @@ impl AppState {
         }
     }
 
+    fn set_sidebar_width(&mut self, width: f32) {
+        self.sidebar_width = width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+    }
+
+    fn persist_sidebar_width(&mut self) {
+        self.config.terminal.sidebar_width = self.sidebar_width;
+        if self.settings_ui.is_open() {
+            if let Some(orig) = &mut self.settings_origin_config {
+                orig.terminal.sidebar_width = self.sidebar_width;
+            }
+            self.settings_ui.sync_from_config(&self.config);
+        }
+        if let Err(err) = save_config(&self.paths, &self.config) {
+            warn!(error = %err, "failed to save sidebar_width to config.toml");
+        }
+    }
+
+    fn persist_sftp_panel_width(&mut self) {
+        self.config.terminal.sftp_panel_width = self.sftp_drawer_width;
+        if self.settings_ui.is_open() {
+            if let Some(orig) = &mut self.settings_origin_config {
+                orig.terminal.sftp_panel_width = self.sftp_drawer_width;
+            }
+            self.settings_ui.sync_from_config(&self.config);
+        }
+        if let Err(err) = save_config(&self.paths, &self.config) {
+            warn!(error = %err, "failed to save sftp_panel_width to config.toml");
+        }
+    }
+
+    fn sync_ui_from_terminal_config(&mut self) {
+        self.sidebar_width = self
+            .config
+            .terminal
+            .sidebar_width
+            .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
+        self.set_sftp_drawer_width(self.config.terminal.sftp_panel_width);
+        if !self.sftp_download_dir_overridden {
+            let dir = self
+                .config
+                .terminal
+                .sftp_download_dir
+                .clone()
+                .unwrap_or_else(|| self.paths.sftp_download_dir().to_path_buf());
+            self.sftp_download_dir = dir.clone();
+            self.sftp_fallback_drawer.set_download_dir(dir.clone());
+            for drawer in self.sftp_drawers.values_mut() {
+                drawer.set_download_dir(dir.clone());
+            }
+        }
+    }
+
+    fn focus_sftp_session(&mut self, session_id: SessionId) {
+        if let Some(wid) = self
+            .window_workspaces
+            .iter()
+            .find_map(|(&wid, w)| w.workspace.contains_session(session_id).then_some(wid))
+        {
+            self.active_window = Some(wid);
+        }
+        if let Some(ws) = self.workspace_for_session_mut(session_id) {
+            ws.focus_session(session_id);
+        }
+        if self
+            .sessions
+            .get(&session_id)
+            .and_then(SessionEntry::as_ssh)
+            .is_some()
+        {
+            self.ensure_session_sftp_drawer(session_id)
+                .set_panel_focused(true);
+        }
+        self.sync_status_bar_drawer_open();
+    }
+
+    fn ssh_endpoint_for(&self, session_id: SessionId) -> Option<SftpEndpoint> {
+        let SessionEntry::Ssh(slot) = self.sessions.get(&session_id)? else {
+            return None;
+        };
+        slot.active.as_ref()?;
+        Some(slot.sftp_endpoint(&self.vault))
+    }
+
+    fn active_sftp_bookmark_key_for(&self, session_id: SessionId) -> Option<String> {
+        let profile_id = self
+            .sessions
+            .get(&session_id)
+            .and_then(SessionEntry::as_ssh)
+            .and_then(|slot| slot.target.profile_id.clone());
+        profile_id.or_else(|| {
+            self.sftp_drawers
+                .get(&session_id)
+                .and_then(|d| d.session_label().map(str::to_string))
+        })
+    }
+
+    fn sftp_session_for_context_menu(&self) -> Option<SessionId> {
+        if let Some(sid) = self.active_ssh_session_id()
+            && self
+                .sftp_drawers
+                .get(&sid)
+                .is_some_and(|d| d.plus.context_menu.open)
+        {
+            return Some(sid);
+        }
+        self.sftp_drawers
+            .iter()
+            .find_map(|(&sid, d)| d.plus.context_menu.open.then_some(sid))
+    }
+
+    fn sftp_session_for_modal(&self) -> Option<SessionId> {
+        if let Some(sid) = self.active_ssh_session_id()
+            && self
+                .sftp_drawers
+                .get(&sid)
+                .is_some_and(|d| d.plus.modal.is_open())
+        {
+            return Some(sid);
+        }
+        self.sftp_drawers
+            .iter()
+            .find_map(|(&sid, d)| d.plus.modal.is_open().then_some(sid))
+    }
+
+    fn sftp_modal_drawer(&self, ws: Option<&Workspace>) -> Option<&SftpDrawerState> {
+        if let Some(sid) = Self::active_ssh_session_in(&self.sessions, ws)
+            && let Some(drawer) = self.sftp_drawers.get(&sid)
+            && drawer.plus.modal.is_open()
+        {
+            return Some(drawer);
+        }
+        self.sftp_drawers
+            .values()
+            .find(|d| d.plus.modal.is_open())
+    }
+
+    fn sftp_context_menu_drawer(&self, ws: Option<&Workspace>) -> Option<(&SftpDrawerState, bool)> {
+        let sid = Self::active_ssh_session_in(&self.sessions, ws)
+            .filter(|sid| {
+                self.sftp_drawers
+                    .get(sid)
+                    .is_some_and(|d| d.plus.context_menu.open)
+            })
+            .or_else(|| {
+                self.sftp_drawers
+                    .iter()
+                    .find_map(|(&sid, d)| d.plus.context_menu.open.then_some(sid))
+            })?;
+        let drawer = self.sftp_drawers.get(&sid)?;
+        let connected = self
+            .sessions
+            .get(&sid)
+            .and_then(SessionEntry::as_ssh)
+            .is_some_and(|slot| slot.active.is_some());
+        Some((drawer, connected))
+    }
+
     fn sync_status_bar_drawer_open(&mut self) {
         let open = self.sftp_drawer().is_open();
         let mut transfers = self.status_bar.transfers().clone();
@@ -11586,6 +12062,14 @@ impl AppState {
     }
 
     fn toggle_sftp_drawer_for_session(&mut self, session_id: SessionId) -> Task<Message> {
+        if self
+            .sessions
+            .get(&session_id)
+            .and_then(SessionEntry::as_ssh)
+            .is_none()
+        {
+            return Task::none();
+        }
         if let Some(wid) = self
             .window_workspaces
             .iter()
@@ -11610,56 +12094,37 @@ impl AppState {
         ssh_sid: Option<SessionId>,
         open: bool,
     ) -> Task<Message> {
-        let home_dir = self.paths.home_dir().map(Path::to_path_buf);
-        if let Some(sid) = ssh_sid {
-            let drawer = self.ensure_session_sftp_drawer(sid);
-            drawer.set_open(open);
-            if open {
-                drawer.plus.ensure_local_initialized(home_dir.as_deref());
-            }
-            self.sync_status_bar_drawer_open();
-            if open {
-                let path = self.ensure_session_sftp_drawer(sid).current_path().to_string();
-                return self.sftp_refresh_task(sid, path);
-            }
-        } else {
-            self.sftp_fallback_drawer.set_open(open);
-            if open {
-                self.sftp_fallback_drawer
-                    .plus
-                    .ensure_local_initialized(home_dir.as_deref());
-            }
-            self.sync_status_bar_drawer_open();
+        let Some(sid) = ssh_sid else {
+            return Task::none();
+        };
+        if self
+            .sessions
+            .get(&sid)
+            .and_then(SessionEntry::as_ssh)
+            .is_none()
+        {
+            return Task::none();
+        }
+        let drawer = self.ensure_session_sftp_drawer(sid);
+        drawer.set_open(open);
+        self.sync_status_bar_drawer_open();
+        if open {
+            let path = self
+                .ensure_session_sftp_drawer(sid)
+                .current_path()
+                .to_string();
+            return self.sftp_refresh_task(sid, path);
         }
         Task::none()
     }
 
-    fn active_sftp_bookmark_key(&self) -> Option<String> {
-        let profile_id = self.active_ssh_session_id().and_then(|sid| {
-            self.sessions
-                .get(&sid)
-                .and_then(SessionEntry::as_ssh)
-                .and_then(|slot| slot.target.profile_id.clone())
-        });
-        profile_id.or_else(|| self.sftp_drawer().session_label().map(str::to_string))
-    }
-
     fn active_ssh_endpoint(&self) -> Option<(SessionId, SftpEndpoint)> {
         let sid = self.active_ssh_session_id()?;
-        let SessionEntry::Ssh(slot) = self.sessions.get(&sid)? else {
-            return None;
-        };
-        if slot.active.is_none() {
-            return None;
-        }
-        Some((sid, slot.sftp_endpoint(&self.vault)))
+        let endpoint = self.ssh_endpoint_for(sid)?;
+        Some((sid, endpoint))
     }
 
     fn refresh_open_sftp_after_transfer(&mut self) -> Task<Message> {
-        let home_dir = self.paths.home_dir().map(Path::to_path_buf);
-        self.active_sftp_drawer_mut()
-            .plus
-            .refresh_local(home_dir.as_deref());
         if let Some((sid, _)) = self.active_ssh_endpoint()
             && !self.sftp_drawer().is_loading()
         {
@@ -11669,31 +12134,31 @@ impl AppState {
         Task::none()
     }
 
-    fn enqueue_sftp_download_to_dir(
+    fn enqueue_sftp_download_to_dir_for(
         &mut self,
+        session_id: SessionId,
         remote_path: String,
         entry_name: String,
         is_dir: bool,
         dest_dir: PathBuf,
     ) -> Task<Message> {
         if let Err(err) = validate_remote_entry_name(&entry_name) {
-            self.active_sftp_drawer_mut()
+            self.ensure_session_sftp_drawer(session_id)
                 .set_browser_error(Some(err.to_string()));
             return Task::none();
         }
-        let Some(session_id) = self.active_ssh_session_id() else {
-            self.active_sftp_drawer_mut().set_browser_error(Some(
-                "Connect an SSH Session before downloading.".to_string(),
-            ));
+        let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
+            self.ensure_session_sftp_drawer(session_id)
+                .set_browser_error(Some(
+                    "Connect an SSH Session before downloading.".to_string(),
+                ));
             return Task::none();
         };
-        let endpoint = {
-            let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
-                return Task::none();
-            };
-            slot.sftp_endpoint(&self.vault)
-        };
+        let endpoint = slot.sftp_endpoint(&self.vault);
         self.reset_transfer_conflict_override_if_idle();
+        self.ensure_session_sftp_drawer(session_id)
+            .plus
+            .transfers_panel_open = true;
         let local_target = dest_dir.join(&entry_name);
         if is_dir {
             let queue = self.transfer_queue.clone();
@@ -11715,265 +12180,630 @@ impl AppState {
         Task::none()
     }
 
-    fn sftp_navigate_pane(&mut self, side: SftpPaneSide, path: String) -> Task<Message> {
-        let home_dir = self.paths.home_dir().map(Path::to_path_buf);
-        self.active_sftp_drawer_mut().plus.active_pane = side;
-        self.active_sftp_drawer_mut().plus.context_menu.close();
-        match side {
-            SftpPaneSide::Local => {
-                let drawer = self.active_sftp_drawer_mut();
-                if path.trim().is_empty() {
-                    drawer.plus.refresh_local(home_dir.as_deref());
-                } else {
-                    drawer.plus.navigate_local(&path);
-                }
-                Task::none()
-            }
-            SftpPaneSide::Remote => {
-                let target = if path.trim().is_empty() {
-                    ".".to_string()
-                } else {
-                    path
-                };
-                self.navigate_sftp_to(target)
+    fn sftp_navigate_remote(&mut self, session_id: SessionId, path: String) -> Task<Message> {
+        let target = if path.trim().is_empty() {
+            ".".to_string()
+        } else {
+            path
+        };
+        let drawer = self.ensure_session_sftp_drawer(session_id);
+        drawer.plus.context_menu.close();
+        let offline = self
+            .sessions
+            .get(&session_id)
+            .and_then(SessionEntry::as_ssh)
+            .is_none_or(|slot| slot.active.is_none());
+        let task = self.sftp_refresh_task(session_id, target);
+        if offline {
+            let cur = self
+                .sftp_drawers
+                .get(&session_id)
+                .map(|d| d.current_path().to_string());
+            if let Some(dir) = cur
+                && dir != "."
+            {
+                self.record_profile_sftp_dir(session_id, &dir);
             }
         }
+        task
+    }
+
+    fn upload_files_dialog_task(&self, session_id: SessionId) -> Task<Message> {
+        Task::perform(
+            async move {
+                rfd::AsyncFileDialog::new()
+                    .set_title("Upload Files to Remote")
+                    .pick_files()
+                    .await
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|h| h.path().to_path_buf())
+                    .collect()
+            },
+            move |paths| Message::SftpSessionUploadPicked { session_id, paths },
+        )
+    }
+
+    fn upload_folder_dialog_task(&self, session_id: SessionId) -> Task<Message> {
+        Task::perform(
+            async move {
+                rfd::AsyncFileDialog::new()
+                    .set_title("Upload Folder to Remote")
+                    .pick_folder()
+                    .await
+                    .into_iter()
+                    .map(|h| h.path().to_path_buf())
+                    .collect()
+            },
+            move |paths| Message::SftpSessionUploadPicked { session_id, paths },
+        )
     }
 
     fn handle_sftp_plus_message(&mut self, msg: Message) -> Task<Message> {
-        let home_dir = self.paths.home_dir().map(Path::to_path_buf);
         match msg {
-            Message::SftpSetLayoutMode(mode) => {
-                let was_open = self.sftp_drawer().is_open();
-                self.active_sftp_drawer_mut().plus.layout_mode = mode;
-                self.active_sftp_drawer_mut().plus.context_menu.close();
-                if !was_open {
-                    return self.set_sftp_drawer_open(true);
-                }
-                self.active_sftp_drawer_mut()
-                    .plus
-                    .ensure_local_initialized(home_dir.as_deref());
-                Task::none()
+            Message::SftpSessionClose(session_id) => {
+                self.set_sftp_drawer_open_for_session(Some(session_id), false)
             }
-            Message::SftpToggleTransfersPanel => {
-                let drawer = self.active_sftp_drawer_mut();
+            Message::SftpSessionToggleTransfersPanel(session_id) => {
+                self.focus_sftp_session(session_id);
+                let drawer = self.ensure_session_sftp_drawer(session_id);
                 drawer.plus.transfers_panel_open = !drawer.plus.transfers_panel_open;
                 Task::none()
             }
-            Message::SftpSetActivePane(side) => {
-                let drawer = self.active_sftp_drawer_mut();
-                drawer.plus.active_pane = side;
-                drawer.plus.context_menu.close();
-                Task::none()
-            }
             Message::SftpShortcut(action) => {
-                let drawer = self.sftp_drawer();
-                if !drawer.is_open()
-                    || drawer.plus.layout_mode == SftpLayoutMode::SideDock
-                    || self.has_modal_open()
+                let Some(session_id) = self.active_ssh_session_id() else {
+                    return Task::none();
+                };
+                let Some(drawer) = self.sftp_drawers.get(&session_id) else {
+                    return Task::none();
+                };
+                if !drawer.is_open() || !drawer.is_panel_focused() || self.has_modal_open() {
+                    return Task::none();
+                }
+                self.execute_sftp_action(session_id, action)
+            }
+            Message::SftpSessionPathInputChanged(session_id, value) => {
+                self.focus_sftp_session(session_id);
+                self.ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .path_input = value;
+                Task::none()
+            }
+            Message::SftpSessionNavigateSubmitted(session_id) => {
+                self.focus_sftp_session(session_id);
+                let target = self
+                    .ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .path_input
+                    .clone();
+                self.sftp_navigate_remote(session_id, target)
+            }
+            Message::SftpSessionNavigateTo { session_id, path } => {
+                self.focus_sftp_session(session_id);
+                self.sftp_navigate_remote(session_id, path)
+            }
+            Message::SftpSessionBack(session_id) => {
+                self.focus_sftp_session(session_id);
+                let Some(path) = self
+                    .ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .step_back()
+                else {
+                    return Task::none();
+                };
+                self.sftp_navigate_remote(session_id, path)
+            }
+            Message::SftpSessionForward(session_id) => {
+                self.focus_sftp_session(session_id);
+                let Some(path) = self
+                    .ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .step_forward()
+                else {
+                    return Task::none();
+                };
+                self.sftp_navigate_remote(session_id, path)
+            }
+            Message::SftpSessionUp(session_id) => {
+                self.focus_sftp_session(session_id);
+                let drawer = self.ensure_session_sftp_drawer(session_id);
+                drawer.plus.remote.navigating_history = false;
+                let parent = parent_remote_path(drawer.current_path());
+                self.sftp_navigate_remote(session_id, parent)
+            }
+            Message::SftpSessionRefresh(session_id) => {
+                self.focus_sftp_session(session_id);
+                let current = self
+                    .ensure_session_sftp_drawer(session_id)
+                    .current_path()
+                    .to_string();
+                self.sftp_navigate_remote(session_id, current)
+            }
+            Message::SftpSessionHome(session_id) => {
+                self.focus_sftp_session(session_id);
+                let target = self
+                    .ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .home_path
+                    .clone()
+                    .unwrap_or_else(|| ".".to_string());
+                self.sftp_navigate_remote(session_id, target)
+            }
+            Message::SftpSessionToggleHidden(session_id) => {
+                self.focus_sftp_session(session_id);
+                let remote = &mut self.ensure_session_sftp_drawer(session_id).plus.remote;
+                remote.show_hidden = !remote.show_hidden;
+                Task::none()
+            }
+            Message::SftpSessionToggleFilter(session_id) => {
+                self.focus_sftp_session(session_id);
+                let remote = &mut self.ensure_session_sftp_drawer(session_id).plus.remote;
+                remote.filter_open = !remote.filter_open;
+                if !remote.filter_open {
+                    remote.filter_query.clear();
+                }
+                Task::none()
+            }
+            Message::SftpSessionFilterChanged(session_id, q) => {
+                self.focus_sftp_session(session_id);
+                self.ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .filter_query = q;
+                Task::none()
+            }
+            Message::SftpSessionToggleBookmarks(session_id) => {
+                self.focus_sftp_session(session_id);
+                let remote = &mut self.ensure_session_sftp_drawer(session_id).plus.remote;
+                remote.bookmarks_open = !remote.bookmarks_open;
+                Task::none()
+            }
+            Message::SftpSessionDismissBookmarks(session_id) => {
+                self.ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .bookmarks_open = false;
+                Task::none()
+            }
+            Message::SftpSessionToggleBookmarkCurrent(session_id) => {
+                self.focus_sftp_session(session_id);
+                let current = self
+                    .ensure_session_sftp_drawer(session_id)
+                    .current_path()
+                    .to_string();
+                if let Some(key) = self.active_sftp_bookmark_key_for(session_id) {
+                    self.sftp_state.toggle_remote_bookmark(key, &current);
+                    if let Err(err) = save_sftp_state(&self.paths, &self.sftp_state) {
+                        warn!(error = %err, "failed saving SFTP bookmarks");
+                    }
+                }
+                Task::none()
+            }
+            Message::SftpSessionSelectBookmark { session_id, path } => {
+                self.focus_sftp_session(session_id);
+                self.ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .bookmarks_open = false;
+                self.sftp_navigate_remote(session_id, path)
+            }
+            Message::SftpSessionRemoveBookmark { session_id, path } => {
+                self.focus_sftp_session(session_id);
+                if let Some(key) = self.active_sftp_bookmark_key_for(session_id)
+                    && self
+                        .sftp_state
+                        .remote_bookmarks(&key)
+                        .iter()
+                        .any(|b| b == &path)
                 {
-                    return Task::none();
-                }
-                self.execute_sftp_action(action)
-            }
-            Message::SftpPanePathInputChanged(side, value) => {
-                pane_prefs_mut(self.active_sftp_drawer_mut(), side).path_input = value;
-                Task::none()
-            }
-            Message::SftpPaneNavigateSubmitted(side) => {
-                let target = pane_prefs(self.sftp_drawer(), side).path_input.clone();
-                self.sftp_navigate_pane(side, target)
-            }
-            Message::SftpPaneNavigateTo { side, path } => self.sftp_navigate_pane(side, path),
-            Message::SftpPaneBack(side) => {
-                let Some(path) = pane_prefs_mut(self.active_sftp_drawer_mut(), side).step_back()
-                else {
-                    return Task::none();
-                };
-                self.sftp_navigate_pane(side, path)
-            }
-            Message::SftpPaneForward(side) => {
-                let Some(path) =
-                    pane_prefs_mut(self.active_sftp_drawer_mut(), side).step_forward()
-                else {
-                    return Task::none();
-                };
-                self.sftp_navigate_pane(side, path)
-            }
-            Message::SftpPaneUp(side) => {
-                pane_prefs_mut(self.active_sftp_drawer_mut(), side).navigating_history = false;
-                let current = match side {
-                    SftpPaneSide::Local => self.sftp_drawer().plus.local.current_path.clone(),
-                    SftpPaneSide::Remote => self.sftp_drawer().current_path().to_string(),
-                };
-                let parent = parent_pane_path(side, &current);
-                self.sftp_navigate_pane(side, parent)
-            }
-            Message::SftpPaneRefresh(side) => {
-                let current = match side {
-                    SftpPaneSide::Local => self.sftp_drawer().plus.local.current_path.clone(),
-                    SftpPaneSide::Remote => self.sftp_drawer().current_path().to_string(),
-                };
-                self.sftp_navigate_pane(side, current)
-            }
-            Message::SftpPaneHome(side) => {
-                let target = match side {
-                    SftpPaneSide::Local => self
-                        .sftp_drawer()
-                        .plus
-                        .local
-                        .home_path
-                        .clone()
-                        .or_else(|| {
-                            home_dir
-                                .as_ref()
-                                .map(|p| p.to_string_lossy().into_owned())
-                        })
-                        .unwrap_or_else(|| default_local_home_dir().to_string_lossy().into_owned()),
-                    SftpPaneSide::Remote => self
-                        .sftp_drawer()
-                        .plus
-                        .remote_prefs
-                        .home_path
-                        .clone()
-                        .unwrap_or_else(|| ".".to_string()),
-                };
-                self.sftp_navigate_pane(side, target)
-            }
-            Message::SftpPaneToggleHidden(side) => {
-                let prefs = pane_prefs_mut(self.active_sftp_drawer_mut(), side);
-                prefs.show_hidden = !prefs.show_hidden;
-                Task::none()
-            }
-            Message::SftpPaneToggleFilter(side) => {
-                let prefs = pane_prefs_mut(self.active_sftp_drawer_mut(), side);
-                prefs.filter_open = !prefs.filter_open;
-                if !prefs.filter_open {
-                    prefs.filter_query.clear();
-                }
-                Task::none()
-            }
-            Message::SftpPaneFilterChanged(side, q) => {
-                pane_prefs_mut(self.active_sftp_drawer_mut(), side).filter_query = q;
-                Task::none()
-            }
-            Message::SftpPaneToggleBookmarks(side) => {
-                let other = side.other();
-                pane_prefs_mut(self.active_sftp_drawer_mut(), other).bookmarks_open = false;
-                let prefs = pane_prefs_mut(self.active_sftp_drawer_mut(), side);
-                prefs.bookmarks_open = !prefs.bookmarks_open;
-                Task::none()
-            }
-            Message::SftpPaneDismissBookmarks(side) => {
-                pane_prefs_mut(self.active_sftp_drawer_mut(), side).bookmarks_open = false;
-                Task::none()
-            }
-            Message::SftpPaneToggleBookmarkCurrent(side) => {
-                match side {
-                    SftpPaneSide::Local => {
-                        let current = self.sftp_drawer().plus.local.current_path.clone();
-                        self.sftp_state.toggle_local_bookmark(&current);
-                    }
-                    SftpPaneSide::Remote => {
-                        let current = self.sftp_drawer().current_path().to_string();
-                        if let Some(key) = self.active_sftp_bookmark_key() {
-                            self.sftp_state.toggle_remote_bookmark(key, &current);
-                        }
+                    self.sftp_state.toggle_remote_bookmark(key, &path);
+                    if let Err(err) = save_sftp_state(&self.paths, &self.sftp_state) {
+                        warn!(error = %err, "failed saving SFTP bookmarks");
                     }
                 }
-                if let Err(err) = save_sftp_state(&self.paths, &self.sftp_state) {
-                    warn!(error = %err, "failed saving SFTP bookmarks");
-                }
                 Task::none()
             }
-            Message::SftpPaneSelectBookmark { side, path } => {
-                pane_prefs_mut(self.active_sftp_drawer_mut(), side).bookmarks_open = false;
-                self.sftp_navigate_pane(side, path)
-            }
-            Message::SftpPaneRemoveBookmark { side, path } => {
-                match side {
-                    SftpPaneSide::Local => {
-                        if self
-                            .sftp_state
-                            .local_bookmarks()
-                            .iter()
-                            .any(|b| b == &path)
-                        {
-                            self.sftp_state.toggle_local_bookmark(&path);
-                        }
-                    }
-                    SftpPaneSide::Remote => {
-                        if let Some(key) = self.active_sftp_bookmark_key()
-                            && self
-                                .sftp_state
-                                .remote_bookmarks(&key)
-                                .iter()
-                                .any(|b| b == &path)
-                        {
-                            self.sftp_state.toggle_remote_bookmark(key, &path);
-                        }
-                    }
-                }
-                if let Err(err) = save_sftp_state(&self.paths, &self.sftp_state) {
-                    warn!(error = %err, "failed saving SFTP bookmarks");
-                }
+            Message::SftpSessionSortBy(session_id, col) => {
+                self.focus_sftp_session(session_id);
+                self.ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .toggle_sort(col);
                 Task::none()
             }
-            Message::SftpPaneSortBy(side, col) => {
-                pane_prefs_mut(self.active_sftp_drawer_mut(), side).toggle_sort(col);
-                Task::none()
-            }
-            Message::SftpPaneRowClicked {
-                side,
+            Message::SftpSessionRowClicked {
+                session_id,
                 path,
                 ctrl_held,
             } => {
+                self.focus_sftp_session(session_id);
                 let double_click = self
-                    .active_sftp_drawer_mut()
+                    .ensure_session_sftp_drawer(session_id)
                     .plus
-                    .handle_row_click(side, &path, ctrl_held);
+                    .handle_row_click(&path, ctrl_held);
                 if !double_click {
                     return Task::none();
                 }
-                let clicked_entry = visible_pane_entries(self.sftp_drawer(), side)
-                    .into_iter()
-                    .find(|e| e.full_path == path);
+                let clicked_entry = self
+                    .sftp_drawers
+                    .get(&session_id)
+                    .and_then(|d| {
+                        visible_remote_entries(d)
+                            .into_iter()
+                            .find(|e| e.full_path == path)
+                    });
                 let Some(entry) = clicked_entry else {
                     return Task::none();
                 };
                 if entry.is_dir {
-                    return self.sftp_navigate_pane(side, entry.full_path);
+                    return self.sftp_navigate_remote(session_id, entry.full_path);
                 }
-                self.execute_sftp_action(SftpContextActionKind::Transfer)
+                self.execute_sftp_action(session_id, SftpContextActionKind::Download)
             }
-            Message::SftpOpenContextMenu {
-                side,
+            Message::SftpSessionOpenContextMenu {
+                session_id,
                 target_path,
                 position,
             } => {
-                let drawer = self.active_sftp_drawer_mut();
-                drawer.plus.active_pane = side;
-                if let Some(ref p) = target_path {
-                    let prefs = pane_prefs_mut(drawer, side);
-                    if !prefs.selected_paths.contains(p) {
-                        prefs.selected_paths.clear();
-                        prefs.selected_paths.insert(p.clone());
+                for (&other_sid, other_drawer) in &mut self.sftp_drawers {
+                    if other_sid != session_id {
+                        other_drawer.plus.context_menu.close();
                     }
                 }
-                drawer.plus.context_menu.show(side, target_path, position);
+                self.focus_sftp_session(session_id);
+                let drawer = self.ensure_session_sftp_drawer(session_id);
+                if let Some(ref p) = target_path
+                    && !drawer.plus.remote.selected_paths.contains(p)
+                {
+                    drawer.plus.remote.selected_paths.clear();
+                    drawer.plus.remote.selected_paths.insert(p.clone());
+                }
+                drawer.plus.context_menu.show(target_path, position);
+                Task::none()
+            }
+            Message::SftpSessionUploadFiles(session_id) => {
+                self.focus_sftp_session(session_id);
+                self.upload_files_dialog_task(session_id)
+            }
+            Message::SftpSessionUploadFolder(session_id) => {
+                self.focus_sftp_session(session_id);
+                self.upload_folder_dialog_task(session_id)
+            }
+            Message::SftpSessionUploadPicked { session_id, paths } => {
+                if paths.is_empty()
+                    || self
+                        .sessions
+                        .get(&session_id)
+                        .and_then(SessionEntry::as_ssh)
+                        .is_none()
+                {
+                    return Task::none();
+                }
+                self.focus_sftp_session(session_id);
+                self.ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .transfers_panel_open = true;
+                for path in paths {
+                    self.enqueue_sftp_upload(session_id, path);
+                }
+                Task::none()
+            }
+            Message::SftpSessionDownloadToPicked {
+                session_id,
+                entries,
+                dest_dir,
+            } => {
+                let Some(dest_dir) = dest_dir else {
+                    return Task::none();
+                };
+                if entries.is_empty() {
+                    return Task::none();
+                }
+                self.focus_sftp_session(session_id);
+                let mut tasks = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    tasks.push(self.enqueue_sftp_download_to_dir_for(
+                        session_id,
+                        entry.full_path,
+                        entry.name,
+                        entry.is_dir,
+                        dest_dir.clone(),
+                    ));
+                }
+                Task::batch(tasks)
+            }
+            Message::SftpSessionOpenWithAppPicked {
+                session_id,
+                entry,
+                app_path,
+            } => {
+                let Some(app_path) = app_path else {
+                    return Task::none();
+                };
+                if matches!(
+                    self.ensure_session_sftp_drawer(session_id).plus.modal,
+                    SftpModalState::OpenWith { .. }
+                ) {
+                    self.ensure_session_sftp_drawer(session_id).plus.modal = SftpModalState::None;
+                }
+                self.focus_sftp_session(session_id);
+                self.start_sftp_open_with(session_id, entry, app_path)
+            }
+            Message::SftpOpenWithAppsLoaded {
+                session_id,
+                remote_path,
+                apps,
+            } => {
+                let drawer = self.ensure_session_sftp_drawer(session_id);
+                if let SftpModalState::OpenWith {
+                    entry,
+                    loading,
+                    search_query,
+                    apps: modal_apps,
+                    selected_launch_path,
+                    error,
+                    ..
+                } = &mut drawer.plus.modal
+                    && entry.full_path == remote_path
+                {
+                    *loading = false;
+                    *error = None;
+                    *modal_apps = apps;
+                    let visible = filter_installed_apps(modal_apps, search_query);
+                    let still_valid = selected_launch_path
+                        .as_ref()
+                        .is_some_and(|sel| visible.iter().any(|app| &app.launch_path == sel));
+                    if !still_valid {
+                        *selected_launch_path = visible.first().map(|app| app.launch_path.clone());
+                    }
+                }
+                Task::none()
+            }
+            Message::SftpOpenWithSearchChanged(query) => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let drawer = self.ensure_session_sftp_drawer(session_id);
+                if let SftpModalState::OpenWith {
+                    search_query,
+                    apps,
+                    selected_launch_path,
+                    last_clicked,
+                    error,
+                    ..
+                } = &mut drawer.plus.modal
+                {
+                    *search_query = query;
+                    *last_clicked = None;
+                    *error = None;
+                    let visible = filter_installed_apps(apps, search_query);
+                    let still_valid = selected_launch_path
+                        .as_ref()
+                        .is_some_and(|sel| visible.iter().any(|app| &app.launch_path == sel));
+                    if !still_valid {
+                        *selected_launch_path = visible.first().map(|app| app.launch_path.clone());
+                    }
+                }
+                Task::none()
+            }
+            Message::SftpOpenWithSelectApp(path) => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let mut double_click_entry: Option<FileBrowserEntry> = None;
+                {
+                    let drawer = self.ensure_session_sftp_drawer(session_id);
+                    if let SftpModalState::OpenWith {
+                        entry,
+                        selected_launch_path,
+                        last_clicked,
+                        error,
+                        ..
+                    } = &mut drawer.plus.modal
+                    {
+                        *selected_launch_path = Some(path.clone());
+                        *error = None;
+                        let now = Instant::now();
+                        let is_double = last_clicked.as_ref().is_some_and(|(prev, at)| {
+                            prev == &path && now.duration_since(*at) <= Duration::from_millis(400)
+                        });
+                        if is_double {
+                            double_click_entry = Some(entry.clone());
+                            drawer.plus.modal = SftpModalState::None;
+                        } else {
+                            *last_clicked = Some((path.clone(), now));
+                        }
+                    }
+                }
+                if let Some(entry) = double_click_entry {
+                    self.focus_sftp_session(session_id);
+                    return self.start_sftp_open_with(session_id, entry, path);
+                }
+                Task::none()
+            }
+            Message::SftpOpenWithConfirm => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let chosen: Option<(FileBrowserEntry, PathBuf)> = {
+                    let drawer = self.ensure_session_sftp_drawer(session_id);
+                    if let SftpModalState::OpenWith {
+                        entry,
+                        search_query,
+                        apps,
+                        selected_launch_path,
+                        ..
+                    } = &drawer.plus.modal
+                    {
+                        let visible = filter_installed_apps(apps, search_query);
+                        selected_launch_path
+                            .as_ref()
+                            .filter(|sel| visible.iter().any(|app| &app.launch_path == *sel))
+                            .cloned()
+                            .or_else(|| visible.first().map(|app| app.launch_path.clone()))
+                            .map(|p| (entry.clone(), p))
+                    } else {
+                        None
+                    }
+                };
+                let Some((entry, app_path)) = chosen else {
+                    return Task::none();
+                };
+                self.ensure_session_sftp_drawer(session_id).plus.modal = SftpModalState::None;
+                self.focus_sftp_session(session_id);
+                self.start_sftp_open_with(session_id, entry, app_path)
+            }
+            Message::SftpOpenWithBrowseCustom => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let Some(entry) = ({
+                    let drawer = self.ensure_session_sftp_drawer(session_id);
+                    match &drawer.plus.modal {
+                        SftpModalState::OpenWith { entry, .. } => Some(entry.clone()),
+                        _ => None,
+                    }
+                }) else {
+                    return Task::none();
+                };
+                let title = format!("Select Application for \"{}\"", entry.name);
+                Task::perform(
+                    async move {
+                        let mut dialog = rfd::AsyncFileDialog::new().set_title(&title);
+                        #[cfg(target_os = "linux")]
+                        if Path::new("/usr/bin").is_dir() {
+                            dialog = dialog.set_directory("/usr/bin");
+                        }
+                        #[cfg(target_os = "macos")]
+                        if Path::new("/Applications").is_dir() {
+                            dialog = dialog.set_directory("/Applications");
+                        }
+                        dialog.pick_file().await.map(|h| h.path().to_path_buf())
+                    },
+                    move |app_path| Message::SftpSessionOpenWithAppPicked {
+                        session_id,
+                        entry,
+                        app_path,
+                    },
+                )
+            }
+            Message::SftpSessionOpenWithDirEnqueued {
+                session_id,
+                entry,
+                app_path,
+                local_target,
+                result,
+            } => {
+                match result {
+                    Ok(summary) => {
+                        for id in &summary.transfer_ids {
+                            self.transfer_sessions.insert(*id, session_id);
+                        }
+                        self.record_dir_transfer_notices_for(session_id, &summary);
+                        if summary.transfer_ids.is_empty() {
+                            self.finish_open_with_launch(session_id, &entry, &app_path, &local_target);
+                        } else {
+                            self.pending_open_with.push(PendingOpenWithLaunch {
+                                session_id,
+                                entry,
+                                app_path,
+                                local_target,
+                                transfer_ids: summary.transfer_ids,
+                                completed_ids: BTreeSet::new(),
+                            });
+                        }
+                        self.sync_transfer_telemetry();
+                    }
+                    Err(err) => {
+                        self.ensure_session_sftp_drawer(session_id)
+                            .set_browser_error(Some(err));
+                    }
+                }
+                Task::none()
+            }
+            Message::SftpOpenWithCheckWatchedFiles => {
+                self.check_watched_open_with_files();
+                Task::none()
+            }
+            Message::SftpOpenWithUploadNow {
+                session_id,
+                watch_id,
+            } => {
+                self.focus_sftp_session(session_id);
+                self.trigger_watched_file_upload(session_id, watch_id);
+                Task::none()
+            }
+            Message::SftpOpenWithToggleAutoSync {
+                session_id,
+                watch_id,
+            } => {
+                self.focus_sftp_session(session_id);
+                let mut should_upload = false;
+                if let Some(drawer) = self.sftp_drawers.get_mut(&session_id)
+                    && let Some(item) = drawer
+                        .plus
+                        .watched_files
+                        .iter_mut()
+                        .find(|w| w.id == watch_id)
+                {
+                    item.auto_upload = !item.auto_upload;
+                    should_upload = item.auto_upload
+                        && item.pending_local_change
+                        && item.pending_upload_id.is_none();
+                }
+                if should_upload {
+                    self.trigger_watched_file_upload(session_id, watch_id);
+                }
+                Task::none()
+            }
+            Message::SftpOpenWithIgnoreChange {
+                session_id,
+                watch_id,
+            } => {
+                self.focus_sftp_session(session_id);
+                self.ignore_watched_file_change(session_id, watch_id);
+                Task::none()
+            }
+            Message::SftpOpenWithStopWatch {
+                session_id,
+                watch_id,
+            } => {
+                if let Some(drawer) = self.sftp_drawers.get_mut(&session_id) {
+                    drawer.plus.watched_files.retain(|w| w.id != watch_id);
+                }
                 Task::none()
             }
             Message::SftpDismissContextMenu => {
-                self.active_sftp_drawer_mut().plus.context_menu.close();
+                for drawer in self.sftp_drawers.values_mut() {
+                    drawer.plus.context_menu.close();
+                }
                 Task::none()
             }
-            Message::SftpContextAction(action) => self.execute_sftp_action(action),
+            Message::SftpContextAction(action) => {
+                let Some(session_id) = self
+                    .sftp_session_for_context_menu()
+                    .or_else(|| self.active_ssh_session_id())
+                else {
+                    return Task::none();
+                };
+                self.execute_sftp_action(session_id, action)
+            }
             Message::SftpDismissModal => {
-                self.active_sftp_drawer_mut().plus.modal = SftpModalState::None;
+                for drawer in self.sftp_drawers.values_mut() {
+                    drawer.plus.modal = SftpModalState::None;
+                }
                 Task::none()
             }
             Message::SftpModalNameChanged(val) => {
-                match &mut self.active_sftp_drawer_mut().plus.modal {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                match &mut self.ensure_session_sftp_drawer(session_id).plus.modal {
                     SftpModalState::CreateEntry { name, error, .. } => {
                         *name = val;
                         *error = None;
@@ -11989,10 +12819,12 @@ impl AppState {
                 Task::none()
             }
             Message::SftpModalConfirmCreateOrRename => {
-                let modal_snapshot = self.sftp_drawer().plus.modal.clone();
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let modal_snapshot = self.ensure_session_sftp_drawer(session_id).plus.modal.clone();
                 match modal_snapshot {
                     SftpModalState::CreateEntry {
-                        side,
                         parent_dir,
                         is_dir,
                         name,
@@ -12001,166 +12833,89 @@ impl AppState {
                         let trimmed = name.trim().to_string();
                         if let Err(err) = validate_remote_entry_name(&trimmed) {
                             if let SftpModalState::CreateEntry { error, .. } =
-                                &mut self.active_sftp_drawer_mut().plus.modal
+                                &mut self.ensure_session_sftp_drawer(session_id).plus.modal
                             {
                                 *error = Some(err.to_string());
                             }
                             return Task::none();
                         }
-                        let target = join_pane_path(side, &parent_dir, &trimmed);
-                        match side {
-                            SftpPaneSide::Local => {
-                                let p = PathBuf::from(&target);
-                                if p.exists() {
-                                    if let SftpModalState::CreateEntry { error, .. } =
-                                        &mut self.active_sftp_drawer_mut().plus.modal
-                                    {
-                                        *error =
-                                            Some("An item with that name already exists".to_string());
-                                    }
-                                    return Task::none();
-                                }
-                                let res = if is_dir {
-                                    std::fs::create_dir(&p)
-                                        .map_err(|e| format!("mkdir failed: {e}"))
+                        let target = join_remote_path(&parent_dir, &trimmed);
+                        let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+                            if let SftpModalState::CreateEntry { error, .. } =
+                                &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                            {
+                                *error = Some("SSH session is disconnected".to_string());
+                            }
+                            return Task::none();
+                        };
+                        self.ensure_session_sftp_drawer(session_id).plus.modal =
+                            SftpModalState::None;
+                        let manager = self.sftp_manager.clone();
+                        Task::perform(
+                            async move {
+                                if is_dir {
+                                    manager
+                                        .mkdir(&endpoint, &target)
+                                        .await
+                                        .map_err(|e| e.to_string())
                                 } else {
-                                    std::fs::OpenOptions::new()
-                                        .write(true)
-                                        .create_new(true)
-                                        .open(&p)
-                                        .map(|_| ())
-                                        .map_err(|e| format!("touch failed: {e}"))
-                                };
-                                match res {
-                                    Ok(()) => {
-                                        self.active_sftp_drawer_mut().plus.modal =
-                                            SftpModalState::None;
-                                        self.active_sftp_drawer_mut()
-                                            .plus
-                                            .refresh_local(home_dir.as_deref());
-                                    }
-                                    Err(err) => {
-                                        if let SftpModalState::CreateEntry { error, .. } =
-                                            &mut self.active_sftp_drawer_mut().plus.modal
-                                        {
-                                            *error = Some(err);
-                                        }
-                                    }
+                                    manager
+                                        .create_empty_file(&endpoint, &target)
+                                        .await
+                                        .map_err(|e| e.to_string())
                                 }
-                                Task::none()
-                            }
-                            SftpPaneSide::Remote => {
-                                let Some((session_id, endpoint)) = self.active_ssh_endpoint()
-                                else {
-                                    if let SftpModalState::CreateEntry { error, .. } =
-                                        &mut self.active_sftp_drawer_mut().plus.modal
-                                    {
-                                        *error = Some("SSH session is disconnected".to_string());
-                                    }
-                                    return Task::none();
-                                };
-                                self.active_sftp_drawer_mut().plus.modal = SftpModalState::None;
-                                let manager = self.sftp_manager.clone();
-                                Task::perform(
-                                    async move {
-                                        if is_dir {
-                                            manager
-                                                .mkdir(&endpoint, &target)
-                                                .await
-                                                .map_err(|e| e.to_string())
-                                        } else {
-                                            manager
-                                                .create_empty_file(&endpoint, &target)
-                                                .await
-                                                .map_err(|e| e.to_string())
-                                        }
-                                    },
-                                    move |result| Message::SftpMutationResult { session_id, result },
-                                )
-                            }
-                        }
+                            },
+                            move |result| Message::SftpMutationResult { session_id, result },
+                        )
                     }
                     SftpModalState::Rename {
-                        side,
-                        old_path,
-                        new_name,
-                        ..
+                        old_path, new_name, ..
                     } => {
                         let trimmed = new_name.trim().to_string();
                         if let Err(err) = validate_remote_entry_name(&trimmed) {
                             if let SftpModalState::Rename { error, .. } =
-                                &mut self.active_sftp_drawer_mut().plus.modal
+                                &mut self.ensure_session_sftp_drawer(session_id).plus.modal
                             {
                                 *error = Some(err.to_string());
                             }
                             return Task::none();
                         }
-                        let parent = parent_pane_path(side, &old_path);
-                        let new_path = join_pane_path(side, &parent, &trimmed);
-                        match side {
-                            SftpPaneSide::Local => {
-                                let src = PathBuf::from(&old_path);
-                                let dst = PathBuf::from(&new_path);
-                                if src != dst && dst.exists() {
-                                    if let SftpModalState::Rename { error, .. } =
-                                        &mut self.active_sftp_drawer_mut().plus.modal
-                                    {
-                                        *error = Some("Destination already exists".to_string());
-                                    }
-                                    return Task::none();
-                                }
-                                match std::fs::rename(&src, &dst) {
-                                    Ok(()) => {
-                                        self.active_sftp_drawer_mut().plus.modal =
-                                            SftpModalState::None;
-                                        self.active_sftp_drawer_mut()
-                                            .plus
-                                            .refresh_local(home_dir.as_deref());
-                                    }
-                                    Err(err) => {
-                                        if let SftpModalState::Rename { error, .. } =
-                                            &mut self.active_sftp_drawer_mut().plus.modal
-                                        {
-                                            *error = Some(format!("rename failed: {err}"));
-                                        }
-                                    }
-                                }
-                                Task::none()
+                        let parent = parent_remote_path(&old_path);
+                        let new_path = join_remote_path(&parent, &trimmed);
+                        let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+                            if let SftpModalState::Rename { error, .. } =
+                                &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                            {
+                                *error = Some("SSH session is disconnected".to_string());
                             }
-                            SftpPaneSide::Remote => {
-                                let Some((session_id, endpoint)) = self.active_ssh_endpoint()
-                                else {
-                                    if let SftpModalState::Rename { error, .. } =
-                                        &mut self.active_sftp_drawer_mut().plus.modal
-                                    {
-                                        *error = Some("SSH session is disconnected".to_string());
-                                    }
-                                    return Task::none();
-                                };
-                                self.active_sftp_drawer_mut().plus.modal = SftpModalState::None;
-                                let manager = self.sftp_manager.clone();
-                                Task::perform(
-                                    async move {
-                                        manager
-                                            .rename(&endpoint, &old_path, &new_path)
-                                            .await
-                                            .map_err(|e| e.to_string())
-                                    },
-                                    move |result| Message::SftpMutationResult { session_id, result },
-                                )
-                            }
-                        }
+                            return Task::none();
+                        };
+                        self.ensure_session_sftp_drawer(session_id).plus.modal =
+                            SftpModalState::None;
+                        let manager = self.sftp_manager.clone();
+                        Task::perform(
+                            async move {
+                                manager
+                                    .rename(&endpoint, &old_path, &new_path)
+                                    .await
+                                    .map_err(|e| e.to_string())
+                            },
+                            move |result| Message::SftpMutationResult { session_id, result },
+                        )
                     }
                     _ => Task::none(),
                 }
             }
             Message::SftpModalOctalChanged(val) => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
                 if let SftpModalState::EditPermissions {
                     octal_input,
                     mode_bits,
                     error,
                     ..
-                } = &mut self.active_sftp_drawer_mut().plus.modal
+                } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
                 {
                     let filtered: String =
                         val.chars().filter(|c| ('0'..='7').contains(c)).take(3).collect();
@@ -12175,12 +12930,15 @@ impl AppState {
                 Task::none()
             }
             Message::SftpModalPermBitToggled { bit, enabled } => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
                 if let SftpModalState::EditPermissions {
                     octal_input,
                     mode_bits,
                     error,
                     ..
-                } = &mut self.active_sftp_drawer_mut().plus.modal
+                } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
                 {
                     if enabled {
                         *mode_bits |= bit;
@@ -12194,9 +12952,11 @@ impl AppState {
                 Task::none()
             }
             Message::SftpModalConfirmPermissions => {
-                let modal = self.sftp_drawer().plus.modal.clone();
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let modal = self.ensure_session_sftp_drawer(session_id).plus.modal.clone();
                 let SftpModalState::EditPermissions {
-                    side,
                     target_paths,
                     octal_input,
                     mode_bits,
@@ -12212,57 +12972,39 @@ impl AppState {
                 } else {
                     mode_bits & 0o777
                 };
-                match side {
-                    SftpPaneSide::Local => {
+                let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+                    if let SftpModalState::EditPermissions { error, .. } =
+                        &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                    {
+                        *error = Some("SSH session is disconnected".to_string());
+                    }
+                    return Task::none();
+                };
+                self.ensure_session_sftp_drawer(session_id).plus.modal = SftpModalState::None;
+                let manager = self.sftp_manager.clone();
+                Task::perform(
+                    async move {
                         for p in &target_paths {
-                            if let Err(err) = set_local_permissions(Path::new(p), final_bits) {
-                                if let SftpModalState::EditPermissions { error, .. } =
-                                    &mut self.active_sftp_drawer_mut().plus.modal
-                                {
-                                    *error = Some(err);
-                                }
-                                return Task::none();
-                            }
+                            manager
+                                .set_permissions(&endpoint, p, final_bits)
+                                .await
+                                .map_err(|e| e.to_string())?;
                         }
-                        self.active_sftp_drawer_mut().plus.modal = SftpModalState::None;
-                        self.active_sftp_drawer_mut()
-                            .plus
-                            .refresh_local(home_dir.as_deref());
-                        Task::none()
-                    }
-                    SftpPaneSide::Remote => {
-                        let Some((session_id, endpoint)) = self.active_ssh_endpoint() else {
-                            if let SftpModalState::EditPermissions { error, .. } =
-                                &mut self.active_sftp_drawer_mut().plus.modal
-                            {
-                                *error = Some("SSH session is disconnected".to_string());
-                            }
-                            return Task::none();
-                        };
-                        self.active_sftp_drawer_mut().plus.modal = SftpModalState::None;
-                        let manager = self.sftp_manager.clone();
-                        Task::perform(
-                            async move {
-                                for p in &target_paths {
-                                    manager
-                                        .set_permissions(&endpoint, p, final_bits)
-                                        .await
-                                        .map_err(|e| e.to_string())?;
-                                }
-                                Ok(())
-                            },
-                            move |result| Message::SftpMutationResult { session_id, result },
-                        )
-                    }
-                }
+                        Ok(())
+                    },
+                    move |result| Message::SftpMutationResult { session_id, result },
+                )
             }
             Message::SftpModalEditorAction(action) => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
                 if let SftpModalState::FileViewer {
                     editable,
                     dirty,
                     content,
                     ..
-                } = &mut self.active_sftp_drawer_mut().plus.modal
+                } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
                 {
                     let is_edit = matches!(action, iced::widget::text_editor::Action::Edit(_));
                     if !*editable && is_edit {
@@ -12276,83 +13018,56 @@ impl AppState {
                 Task::none()
             }
             Message::SftpModalSaveFile => {
-                let (side, path, text_to_save, editable, loading, saving) =
-                    match &self.sftp_drawer().plus.modal {
-                        SftpModalState::FileViewer {
-                            side,
-                            path,
-                            content,
-                            editable,
-                            loading,
-                            saving,
-                            ..
-                        } => (*side, path.clone(), content.text(), *editable, *loading, *saving),
-                        _ => return Task::none(),
-                    };
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let (path, text_to_save, editable, loading, saving) = match &self
+                    .ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .modal
+                {
+                    SftpModalState::FileViewer {
+                        path,
+                        content,
+                        editable,
+                        loading,
+                        saving,
+                        ..
+                    } => (path.clone(), content.text(), *editable, *loading, *saving),
+                    _ => return Task::none(),
+                };
                 if !editable || loading || saving {
                     return Task::none();
                 }
-                match side {
-                    SftpPaneSide::Local => {
-                        match std::fs::write(&path, text_to_save.as_bytes()) {
-                            Ok(()) => {
-                                if let SftpModalState::FileViewer {
-                                    dirty,
-                                    saving,
-                                    error,
-                                    ..
-                                } = &mut self.active_sftp_drawer_mut().plus.modal
-                                {
-                                    *dirty = false;
-                                    *saving = false;
-                                    *error = None;
-                                }
-                                self.active_sftp_drawer_mut()
-                                    .plus
-                                    .refresh_local(home_dir.as_deref());
-                            }
-                            Err(err) => {
-                                if let SftpModalState::FileViewer { error, .. } =
-                                    &mut self.active_sftp_drawer_mut().plus.modal
-                                {
-                                    *error = Some(format!("save failed: {err}"));
-                                }
-                            }
-                        }
-                        Task::none()
+                let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+                    if let SftpModalState::FileViewer { error, .. } =
+                        &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                    {
+                        *error = Some("SSH session is disconnected".to_string());
                     }
-                    SftpPaneSide::Remote => {
-                        let Some((session_id, endpoint)) = self.active_ssh_endpoint() else {
-                            if let SftpModalState::FileViewer { error, .. } =
-                                &mut self.active_sftp_drawer_mut().plus.modal
-                            {
-                                *error = Some("SSH session is disconnected".to_string());
-                            }
-                            return Task::none();
-                        };
-                        if let SftpModalState::FileViewer { saving, error, .. } =
-                            &mut self.active_sftp_drawer_mut().plus.modal
-                        {
-                            *saving = true;
-                            *error = None;
-                        }
-                        let manager = self.sftp_manager.clone();
-                        let save_path = path.clone();
-                        Task::perform(
-                            async move {
-                                manager
-                                    .write_text_file(&endpoint, &save_path, &text_to_save)
-                                    .await
-                                    .map_err(|e| e.to_string())
-                            },
-                            move |result| Message::SftpRemoteFileSaveResult {
-                                session_id,
-                                path,
-                                result,
-                            },
-                        )
-                    }
+                    return Task::none();
+                };
+                if let SftpModalState::FileViewer { saving, error, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    *saving = true;
+                    *error = None;
                 }
+                let manager = self.sftp_manager.clone();
+                let save_path = path.clone();
+                Task::perform(
+                    async move {
+                        manager
+                            .write_text_file(&endpoint, &save_path, &text_to_save)
+                            .await
+                            .map_err(|e| e.to_string())
+                    },
+                    move |result| Message::SftpRemoteFileSaveResult {
+                        session_id,
+                        path,
+                        result,
+                    },
+                )
             }
             Message::SftpRemoteFileReadResult {
                 session_id,
@@ -12366,7 +13081,6 @@ impl AppState {
                 let mut reconnect_err: Option<String> = None;
                 let mut recovered_ok = false;
                 if let SftpModalState::FileViewer {
-                    side: SftpPaneSide::Remote,
                     path,
                     loading,
                     dirty,
@@ -12410,7 +13124,6 @@ impl AppState {
                 };
                 let mut reconnect_err: Option<String> = None;
                 if let SftpModalState::FileViewer {
-                    side: SftpPaneSide::Remote,
                     path,
                     saving,
                     dirty,
@@ -12447,18 +13160,17 @@ impl AppState {
         }
     }
 
-    fn execute_sftp_action(&mut self, action: SftpContextActionKind) -> Task<Message> {
-        let home_dir = self.paths.home_dir().map(Path::to_path_buf);
-        let side = self
-            .sftp_drawer()
-            .plus
-            .context_menu
-            .side
-            .unwrap_or(self.sftp_drawer().plus.active_pane);
-        self.active_sftp_drawer_mut().plus.context_menu.close();
+    fn execute_sftp_action(
+        &mut self,
+        session_id: SessionId,
+        action: SftpContextActionKind,
+    ) -> Task<Message> {
+        self.focus_sftp_session(session_id);
+        let drawer = self.ensure_session_sftp_drawer(session_id);
+        drawer.plus.context_menu.close();
 
-        let visible = visible_pane_entries(self.sftp_drawer(), side);
-        let selected_paths = pane_prefs(self.sftp_drawer(), side).selected_paths.clone();
+        let visible = visible_remote_entries(drawer);
+        let selected_paths = drawer.plus.remote.selected_paths.clone();
         let selected: Vec<FileBrowserEntry> = visible
             .iter()
             .filter(|e| selected_paths.contains(&e.full_path))
@@ -12466,50 +13178,94 @@ impl AppState {
             .collect();
 
         match action {
-            SftpContextActionKind::Transfer => {
+            SftpContextActionKind::Download => {
                 if selected.is_empty() {
                     return Task::none();
                 }
-                match side {
-                    SftpPaneSide::Local => {
-                        let Some(session_id) = self.active_ssh_session_id() else {
-                            self.active_sftp_drawer_mut().set_browser_error(Some(
-                                "Connect an SSH Session before uploading.".to_string(),
-                            ));
-                            return Task::none();
-                        };
-                        self.active_sftp_drawer_mut().plus.transfers_panel_open = true;
-                        for entry in selected {
-                            self.enqueue_sftp_upload(session_id, PathBuf::from(&entry.full_path));
-                        }
-                        Task::none()
-                    }
-                    SftpPaneSide::Remote => {
-                        self.active_sftp_drawer_mut()
-                            .plus
-                            .ensure_local_initialized(home_dir.as_deref());
-                        let local_dir = PathBuf::from(&self.sftp_drawer().plus.local.current_path);
-                        self.active_sftp_drawer_mut().plus.transfers_panel_open = true;
-                        let mut tasks = Vec::new();
-                        for entry in selected {
-                            let t = self.enqueue_sftp_download_to_dir(
-                                entry.full_path,
-                                entry.name,
-                                entry.is_dir,
-                                local_dir.clone(),
-                            );
-                            tasks.push(t);
-                        }
-                        Task::batch(tasks)
-                    }
+                let local_dir = self.sftp_download_dir.clone();
+                let mut tasks = Vec::new();
+                for entry in selected {
+                    let t = self.enqueue_sftp_download_to_dir_for(
+                        session_id,
+                        entry.full_path,
+                        entry.name,
+                        entry.is_dir,
+                        local_dir.clone(),
+                    );
+                    tasks.push(t);
                 }
+                Task::batch(tasks)
             }
+            SftpContextActionKind::DownloadTo => {
+                if selected.is_empty() {
+                    return Task::none();
+                }
+                let initial = self.sftp_download_dir.clone();
+                Task::perform(
+                    async move {
+                        rfd::AsyncFileDialog::new()
+                            .set_title("Select Download Folder")
+                            .set_directory(initial)
+                            .pick_folder()
+                            .await
+                            .map(|h| h.path().to_path_buf())
+                    },
+                    move |dest_dir| Message::SftpSessionDownloadToPicked {
+                        session_id,
+                        entries: selected,
+                        dest_dir,
+                    },
+                )
+            }
+            SftpContextActionKind::UploadFiles => self.upload_files_dialog_task(session_id),
+            SftpContextActionKind::UploadFolder => self.upload_folder_dialog_task(session_id),
             SftpContextActionKind::View | SftpContextActionKind::Edit => {
                 let Some(entry) = selected.into_iter().find(|e| !e.is_dir) else {
                     return Task::none();
                 };
                 let editable = matches!(action, SftpContextActionKind::Edit);
-                self.open_sftp_file_viewer(side, entry, editable)
+                self.open_sftp_file_viewer(session_id, entry, editable)
+            }
+            SftpContextActionKind::OpenWith => {
+                if selected.len() != 1 {
+                    return Task::none();
+                }
+                if self.ssh_endpoint_for(session_id).is_none() {
+                    self.ensure_session_sftp_drawer(session_id)
+                        .set_browser_error(Some(
+                            "Connect an SSH Session before opening remote items.".to_string(),
+                        ));
+                    return Task::none();
+                }
+                let entry = selected.into_iter().next().unwrap();
+                let remote_path = entry.full_path.clone();
+                let entry_for_scan = entry.clone();
+                let provider = Arc::clone(&self.app_catalog_provider);
+                self.ensure_session_sftp_drawer(session_id).plus.modal = SftpModalState::OpenWith {
+                    entry,
+                    loading: true,
+                    search_query: String::new(),
+                    apps: Vec::new(),
+                    selected_launch_path: None,
+                    last_clicked: None,
+                    error: None,
+                };
+                let focus_task = iced::widget::operation::focus(iced::widget::Id::new(
+                    "sftp-plus-modal-input",
+                ));
+                let load_task = Task::perform(
+                    async move {
+                        tokio::task::spawn_blocking(move || (provider)(&entry_for_scan))
+                            .await
+                            .unwrap_or_default()
+                    },
+                    move |apps| Message::SftpOpenWithAppsLoaded {
+                        session_id,
+                        remote_path,
+                        apps,
+                    },
+                );
+                Task::batch([focus_task, load_task])
             }
             SftpContextActionKind::Copy | SftpContextActionKind::Cut => {
                 if selected.is_empty() {
@@ -12520,26 +13276,29 @@ impl AppState {
                 } else {
                     SftpClipboardOp::Copy
                 };
-                self.active_sftp_drawer_mut().plus.clipboard = Some(SftpClipboard {
+                self.ensure_session_sftp_drawer(session_id).plus.clipboard = Some(SftpClipboard {
                     op,
-                    source_side: side,
                     entries: selected,
                 });
                 Task::none()
             }
             SftpContextActionKind::Paste => {
-                let Some(clip) = self.sftp_drawer().plus.clipboard.clone() else {
+                let Some(clip) = self
+                    .ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .clipboard
+                    .clone()
+                else {
                     return Task::none();
                 };
-                self.handle_sftp_paste(side, clip)
+                self.handle_sftp_paste(session_id, clip)
             }
             SftpContextActionKind::Rename => {
                 if selected.len() != 1 {
                     return Task::none();
                 }
                 let entry = &selected[0];
-                self.active_sftp_drawer_mut().plus.modal = SftpModalState::Rename {
-                    side,
+                self.ensure_session_sftp_drawer(session_id).plus.modal = SftpModalState::Rename {
                     old_path: entry.full_path.clone(),
                     new_name: entry.name.clone(),
                     error: None,
@@ -12550,50 +13309,33 @@ impl AppState {
                 if selected.is_empty() {
                     return Task::none();
                 }
-                match side {
-                    SftpPaneSide::Local => {
+                let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+                    self.ensure_session_sftp_drawer(session_id)
+                        .set_browser_error(Some(
+                            "Connect an SSH Session before deleting remote items.".to_string(),
+                        ));
+                    return Task::none();
+                };
+                let manager = self.sftp_manager.clone();
+                Task::perform(
+                    async move {
                         for entry in &selected {
-                            if let Err(err) =
-                                remove_local_path(Path::new(&entry.full_path), entry.is_dir)
-                            {
-                                self.active_sftp_drawer_mut().plus.local.error = Some(err);
-                                break;
+                            if entry.is_dir && !entry.is_symlink {
+                                manager
+                                    .remove_dir_recursive(&endpoint, &entry.full_path)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
+                            } else {
+                                manager
+                                    .remove_file(&endpoint, &entry.full_path)
+                                    .await
+                                    .map_err(|e| e.to_string())?;
                             }
                         }
-                        self.active_sftp_drawer_mut()
-                            .plus
-                            .refresh_local(home_dir.as_deref());
-                        Task::none()
-                    }
-                    SftpPaneSide::Remote => {
-                        let Some((session_id, endpoint)) = self.active_ssh_endpoint() else {
-                            self.active_sftp_drawer_mut().set_browser_error(Some(
-                                "Connect an SSH Session before deleting remote items.".to_string(),
-                            ));
-                            return Task::none();
-                        };
-                        let manager = self.sftp_manager.clone();
-                        Task::perform(
-                            async move {
-                                for entry in &selected {
-                                    if entry.is_dir && !entry.is_symlink {
-                                        manager
-                                            .remove_dir_recursive(&endpoint, &entry.full_path)
-                                            .await
-                                            .map_err(|e| e.to_string())?;
-                                    } else {
-                                        manager
-                                            .remove_file(&endpoint, &entry.full_path)
-                                            .await
-                                            .map_err(|e| e.to_string())?;
-                                    }
-                                }
-                                Ok(())
-                            },
-                            move |result| Message::SftpMutationResult { session_id, result },
-                        )
-                    }
-                }
+                        Ok(())
+                    },
+                    move |result| Message::SftpMutationResult { session_id, result },
+                )
             }
             SftpContextActionKind::EditPermissions => {
                 if selected.is_empty() {
@@ -12605,13 +13347,13 @@ impl AppState {
                     0o644
                 }) & 0o777;
                 let target_paths = selected.into_iter().map(|e| e.full_path).collect();
-                self.active_sftp_drawer_mut().plus.modal = SftpModalState::EditPermissions {
-                    side,
-                    target_paths,
-                    octal_input: format_octal_mode(default_bits),
-                    mode_bits: default_bits,
-                    error: None,
-                };
+                self.ensure_session_sftp_drawer(session_id).plus.modal =
+                    SftpModalState::EditPermissions {
+                        target_paths,
+                        octal_input: format_octal_mode(default_bits),
+                        mode_bits: default_bits,
+                        error: None,
+                    };
                 Task::none()
             }
             SftpContextActionKind::Properties => {
@@ -12622,21 +13364,18 @@ impl AppState {
                     selected.iter().filter(|e| !e.is_dir).map(|e| e.size).sum();
                 let extra_selected = selected.len().saturating_sub(1);
                 let entry = selected.into_iter().next().unwrap();
-                self.active_sftp_drawer_mut().plus.modal = SftpModalState::Properties {
-                    side,
-                    entry,
-                    extra_selected,
-                    total_selected_bytes,
-                };
+                self.ensure_session_sftp_drawer(session_id).plus.modal =
+                    SftpModalState::Properties {
+                        entry,
+                        extra_selected,
+                        total_selected_bytes,
+                    };
                 Task::none()
             }
             SftpContextActionKind::NewFolder | SftpContextActionKind::NewFile => {
-                let parent_dir = match side {
-                    SftpPaneSide::Local => self.sftp_drawer().plus.local.current_path.clone(),
-                    SftpPaneSide::Remote => self.sftp_drawer().current_path().to_string(),
-                };
-                self.active_sftp_drawer_mut().plus.modal = SftpModalState::CreateEntry {
-                    side,
+                let drawer = self.ensure_session_sftp_drawer(session_id);
+                let parent_dir = drawer.current_path().to_string();
+                drawer.plus.modal = SftpModalState::CreateEntry {
                     parent_dir,
                     is_dir: matches!(action, SftpContextActionKind::NewFolder),
                     name: String::new(),
@@ -12645,34 +13384,40 @@ impl AppState {
                 iced::widget::operation::focus(iced::widget::Id::new("sftp-plus-modal-input"))
             }
             SftpContextActionKind::Refresh => {
-                let current = match side {
-                    SftpPaneSide::Local => self.sftp_drawer().plus.local.current_path.clone(),
-                    SftpPaneSide::Remote => self.sftp_drawer().current_path().to_string(),
-                };
-                self.sftp_navigate_pane(side, current)
+                let current = self
+                    .ensure_session_sftp_drawer(session_id)
+                    .current_path()
+                    .to_string();
+                self.sftp_navigate_remote(session_id, current)
             }
             SftpContextActionKind::SelectAll => {
                 let all_paths: Vec<String> = visible.into_iter().map(|e| e.full_path).collect();
-                let prefs = pane_prefs_mut(self.active_sftp_drawer_mut(), side);
-                prefs.selected_paths.extend(all_paths);
+                self.ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .selected_paths
+                    .extend(all_paths);
                 Task::none()
             }
             SftpContextActionKind::InvertSelection => {
                 let all_paths: Vec<String> = visible.into_iter().map(|e| e.full_path).collect();
-                let prefs = pane_prefs_mut(self.active_sftp_drawer_mut(), side);
+                let selected_set = &mut self
+                    .ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .remote
+                    .selected_paths;
                 for p in all_paths {
-                    if !prefs.selected_paths.insert(p.clone()) {
-                        prefs.selected_paths.remove(&p);
+                    if !selected_set.insert(p.clone()) {
+                        selected_set.remove(&p);
                     }
                 }
                 Task::none()
             }
             SftpContextActionKind::CopyPath => {
                 let text = if selected.is_empty() {
-                    match side {
-                        SftpPaneSide::Local => self.sftp_drawer().plus.local.current_path.clone(),
-                        SftpPaneSide::Remote => self.sftp_drawer().current_path().to_string(),
-                    }
+                    self.ensure_session_sftp_drawer(session_id)
+                        .current_path()
+                        .to_string()
                 } else {
                     selected
                         .into_iter()
@@ -12685,277 +13430,434 @@ impl AppState {
         }
     }
 
-    fn handle_sftp_paste(
-        &mut self,
-        target_side: SftpPaneSide,
-        clip: SftpClipboard,
-    ) -> Task<Message> {
-        let home_dir = self.paths.home_dir().map(Path::to_path_buf);
-        match (clip.source_side, target_side) {
-            (SftpPaneSide::Local, SftpPaneSide::Local) => {
-                let dst_dir = PathBuf::from(&self.sftp_drawer().plus.local.current_path);
-                for entry in &clip.entries {
-                    let src = Path::new(&entry.full_path);
-                    let dst = if clip.op == SftpClipboardOp::Copy
-                        && src.parent() == Some(dst_dir.as_path())
-                    {
-                        unique_local_copy_path(&dst_dir, &entry.name)
-                    } else {
-                        dst_dir.join(&entry.name)
-                    };
-                    let res = if clip.op == SftpClipboardOp::Cut {
-                        if src == dst {
-                            Ok(())
-                        } else if std::fs::rename(src, &dst).is_ok() {
-                            Ok(())
-                        } else {
-                            copy_local_path_recursive(src, &dst)
-                                .and_then(|()| remove_local_path(src, entry.is_dir))
-                        }
-                    } else {
-                        copy_local_path_recursive(src, &dst)
-                    };
-                    if let Err(err) = res {
-                        self.active_sftp_drawer_mut().plus.local.error = Some(err);
-                        break;
-                    }
-                }
-                if clip.op == SftpClipboardOp::Cut {
-                    self.active_sftp_drawer_mut().plus.clipboard = None;
-                }
-                self.active_sftp_drawer_mut()
-                    .plus
-                    .refresh_local(home_dir.as_deref());
-                Task::none()
-            }
-            (SftpPaneSide::Remote, SftpPaneSide::Remote) => {
-                let Some((session_id, endpoint)) = self.active_ssh_endpoint() else {
-                    self.active_sftp_drawer_mut().set_browser_error(Some(
-                        "Connect an SSH Session before pasting remote items.".to_string(),
-                    ));
-                    return Task::none();
-                };
-                let dst_dir = self.sftp_drawer().current_path().to_string();
-                let op = clip.op;
-                if op == SftpClipboardOp::Cut {
-                    self.active_sftp_drawer_mut().plus.clipboard = None;
-                }
-                let manager = self.sftp_manager.clone();
-                let entries = clip.entries;
-                Task::perform(
-                    async move {
-                        for entry in entries {
-                            let dst = join_remote_path(&dst_dir, &entry.name);
-                            if entry.full_path == dst {
-                                if op == SftpClipboardOp::Copy {
-                                    if entry.is_dir {
-                                        return Err(
-                                            "Remote directory duplication in the same folder is not supported over SFTP."
-                                                .to_string(),
-                                        );
-                                    }
-                                    let copy_dst = format!("{dst}.copy");
-                                    manager
-                                        .copy_file(&endpoint, &entry.full_path, &copy_dst)
-                                        .await
-                                        .map_err(|e| e.to_string())?;
-                                }
-                                continue;
-                            }
-                            if op == SftpClipboardOp::Cut {
-                                manager
-                                    .rename(&endpoint, &entry.full_path, &dst)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
-                            } else if entry.is_dir {
+    fn handle_sftp_paste(&mut self, session_id: SessionId, clip: SftpClipboard) -> Task<Message> {
+        let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+            self.ensure_session_sftp_drawer(session_id)
+                .set_browser_error(Some(
+                    "Connect an SSH Session before pasting remote items.".to_string(),
+                ));
+            return Task::none();
+        };
+        let dst_dir = self
+            .ensure_session_sftp_drawer(session_id)
+            .current_path()
+            .to_string();
+        let op = clip.op;
+        if op == SftpClipboardOp::Cut {
+            self.ensure_session_sftp_drawer(session_id).plus.clipboard = None;
+        }
+        let manager = self.sftp_manager.clone();
+        let entries = clip.entries;
+        Task::perform(
+            async move {
+                for entry in entries {
+                    let dst = join_remote_path(&dst_dir, &entry.name);
+                    if entry.full_path == dst {
+                        if op == SftpClipboardOp::Copy {
+                            if entry.is_dir {
                                 return Err(
-                                    "Remote directory copy over SFTP is not supported; use Cut/Move or transfer via Local."
+                                    "Remote directory duplication in the same folder is not supported over SFTP."
                                         .to_string(),
                                 );
-                            } else {
-                                manager
-                                    .copy_file(&endpoint, &entry.full_path, &dst)
-                                    .await
-                                    .map_err(|e| e.to_string())?;
                             }
+                            let copy_dst = format!("{dst}.copy");
+                            manager
+                                .copy_file(&endpoint, &entry.full_path, &copy_dst)
+                                .await
+                                .map_err(|e| e.to_string())?;
                         }
-                        Ok(())
-                    },
-                    move |result| Message::SftpMutationResult { session_id, result },
-                )
-            }
-            (SftpPaneSide::Local, SftpPaneSide::Remote) => {
-                let Some(session_id) = self.active_ssh_session_id() else {
-                    self.active_sftp_drawer_mut().set_browser_error(Some(
-                        "Connect an SSH Session before uploading.".to_string(),
-                    ));
-                    return Task::none();
-                };
-                self.active_sftp_drawer_mut().plus.transfers_panel_open = true;
-                for entry in clip.entries {
-                    self.enqueue_sftp_upload(session_id, PathBuf::from(&entry.full_path));
+                        continue;
+                    }
+                    if op == SftpClipboardOp::Cut {
+                        manager
+                            .rename(&endpoint, &entry.full_path, &dst)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    } else if entry.is_dir {
+                        return Err(
+                            "Remote directory copy over SFTP is not supported; use Cut/Move or Download."
+                                .to_string(),
+                        );
+                    } else {
+                        manager
+                            .copy_file(&endpoint, &entry.full_path, &dst)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                    }
                 }
-                if clip.op == SftpClipboardOp::Cut {
-                    self.active_sftp_drawer_mut().plus.clipboard = None;
-                }
-                Task::none()
-            }
-            (SftpPaneSide::Remote, SftpPaneSide::Local) => {
-                self.active_sftp_drawer_mut()
-                    .plus
-                    .ensure_local_initialized(home_dir.as_deref());
-                let local_dir = PathBuf::from(&self.sftp_drawer().plus.local.current_path);
-                self.active_sftp_drawer_mut().plus.transfers_panel_open = true;
-                if clip.op == SftpClipboardOp::Cut {
-                    self.active_sftp_drawer_mut().plus.clipboard = None;
-                }
-                let mut tasks = Vec::new();
-                for entry in clip.entries {
-                    tasks.push(self.enqueue_sftp_download_to_dir(
-                        entry.full_path,
-                        entry.name,
-                        entry.is_dir,
-                        local_dir.clone(),
-                    ));
-                }
-                Task::batch(tasks)
-            }
-        }
+                Ok(())
+            },
+            move |result| Message::SftpMutationResult { session_id, result },
+        )
     }
 
     fn open_sftp_file_viewer(
         &mut self,
-        side: SftpPaneSide,
+        session_id: SessionId,
         entry: FileBrowserEntry,
         editable: bool,
     ) -> Task<Message> {
-        match side {
-            SftpPaneSide::Local => {
-                const MAX_LOCAL_VIEW_BYTES: usize = 2 * 1024 * 1024;
-                let bytes = match std::fs::read(&entry.full_path) {
-                    Ok(b) => b,
-                    Err(err) => {
-                        self.active_sftp_drawer_mut().plus.modal = SftpModalState::FileViewer {
-                            side,
-                            path: entry.full_path,
-                            file_name: entry.name,
-                            editable,
-                            loading: false,
-                            saving: false,
-                            dirty: false,
-                            error: Some(format!("failed to read file: {err}")),
-                            content: iced::widget::text_editor::Content::new(),
-                        };
-                        return Task::none();
-                    }
-                };
-                if bytes.len() > MAX_LOCAL_VIEW_BYTES {
-                    self.active_sftp_drawer_mut().plus.modal = SftpModalState::FileViewer {
-                        side,
-                        path: entry.full_path,
-                        file_name: entry.name,
-                        editable,
-                        loading: false,
-                        saving: false,
-                        dirty: false,
-                        error: Some(format!(
-                            "File exceeds 2 MiB preview limit ({} bytes)",
-                            bytes.len()
-                        )),
-                        content: iced::widget::text_editor::Content::new(),
-                    };
-                    return Task::none();
-                }
-                if bytes.contains(&0) {
-                    self.active_sftp_drawer_mut().plus.modal = SftpModalState::FileViewer {
-                        side,
-                        path: entry.full_path,
-                        file_name: entry.name,
-                        editable,
-                        loading: false,
-                        saving: false,
-                        dirty: false,
-                        error: Some("Binary files cannot be opened in text view/edit".to_string()),
-                        content: iced::widget::text_editor::Content::new(),
-                    };
-                    return Task::none();
-                }
-                let text = String::from_utf8_lossy(&bytes).into_owned();
-                self.active_sftp_drawer_mut().plus.modal = SftpModalState::FileViewer {
-                    side,
-                    path: entry.full_path,
-                    file_name: entry.name,
-                    editable,
-                    loading: false,
-                    saving: false,
-                    dirty: false,
-                    error: None,
-                    content: iced::widget::text_editor::Content::with_text(&text),
-                };
-                Task::none()
-            }
-            SftpPaneSide::Remote => {
-                let Some((session_id, endpoint)) = self.active_ssh_endpoint() else {
-                    self.active_sftp_drawer_mut().set_browser_error(Some(
-                        "Connect an SSH Session before opening remote files.".to_string(),
-                    ));
-                    return Task::none();
-                };
-                let req_path = entry.full_path.clone();
-                self.active_sftp_drawer_mut().plus.modal = SftpModalState::FileViewer {
-                    side,
-                    path: entry.full_path,
-                    file_name: entry.name,
-                    editable,
-                    loading: true,
-                    saving: false,
-                    dirty: false,
-                    error: None,
-                    content: iced::widget::text_editor::Content::new(),
-                };
-                let manager = self.sftp_manager.clone();
-                let read_path = req_path.clone();
-                Task::perform(
-                    async move {
-                        manager
-                            .read_text_file(&endpoint, &read_path, 2 * 1024 * 1024)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    move |result| Message::SftpRemoteFileReadResult {
-                        session_id,
-                        request_path: req_path,
-                        editable,
-                        result,
-                    },
-                )
-            }
+        let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+            self.ensure_session_sftp_drawer(session_id)
+                .set_browser_error(Some(
+                    "Connect an SSH Session before opening remote files.".to_string(),
+                ));
+            return Task::none();
+        };
+        let req_path = entry.full_path.clone();
+        self.ensure_session_sftp_drawer(session_id).plus.modal = SftpModalState::FileViewer {
+            path: entry.full_path,
+            file_name: entry.name,
+            editable,
+            loading: true,
+            saving: false,
+            dirty: false,
+            error: None,
+            content: iced::widget::text_editor::Content::new(),
+        };
+        let manager = self.sftp_manager.clone();
+        let read_path = req_path.clone();
+        Task::perform(
+            async move {
+                manager
+                    .read_text_file(&endpoint, &read_path, 2 * 1024 * 1024)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            move |result| Message::SftpRemoteFileReadResult {
+                session_id,
+                request_path: req_path,
+                editable,
+                result,
+            },
+        )
+    }
+
+    fn start_sftp_open_with(
+        &mut self,
+        session_id: SessionId,
+        entry: FileBrowserEntry,
+        app_path: PathBuf,
+    ) -> Task<Message> {
+        if let Err(err) = validate_remote_entry_name(&entry.name) {
+            self.ensure_session_sftp_drawer(session_id)
+                .set_browser_error(Some(err.to_string()));
+            return Task::none();
+        }
+        let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+            self.ensure_session_sftp_drawer(session_id)
+                .set_browser_error(Some(
+                    "Connect an SSH Session before opening remote items.".to_string(),
+                ));
+            return Task::none();
+        };
+        let seq = self.next_open_with_seq;
+        self.next_open_with_seq = self.next_open_with_seq.wrapping_add(1);
+        let stage_dir = self
+            .sftp_open_temp_dir
+            .join(format!("s{}-{}", session_id.0, seq));
+        if let Err(err) = fs::create_dir_all(&stage_dir) {
+            self.ensure_session_sftp_drawer(session_id)
+                .set_browser_error(Some(format!(
+                    "Failed to create staging dir {}: {err}",
+                    stage_dir.display()
+                )));
+            return Task::none();
+        }
+        let local_target = stage_dir.join(&entry.name);
+        self.reset_transfer_conflict_override_if_idle();
+
+        if entry.is_dir {
+            let queue = self.transfer_queue.clone();
+            let remote_dir = entry.full_path.clone();
+            let local_for_task = local_target.clone();
+            return Task::perform(
+                async move {
+                    queue
+                        .enqueue_download_dir(endpoint, remote_dir, local_for_task)
+                        .await
+                        .map_err(|err| err.to_string())
+                },
+                move |result| Message::SftpSessionOpenWithDirEnqueued {
+                    session_id,
+                    entry,
+                    app_path,
+                    local_target,
+                    result,
+                },
+            );
+        }
+
+        let id = self.transfer_queue.enqueue_download(
+            endpoint,
+            entry.full_path.clone(),
+            local_target.clone(),
+        );
+        self.transfer_sessions.insert(id, session_id);
+        self.pending_open_with.push(PendingOpenWithLaunch {
+            session_id,
+            entry,
+            app_path,
+            local_target,
+            transfer_ids: vec![id],
+            completed_ids: BTreeSet::new(),
+        });
+        self.sync_transfer_telemetry();
+        Task::none()
+    }
+
+    fn finish_open_with_launch(
+        &mut self,
+        session_id: SessionId,
+        entry: &FileBrowserEntry,
+        app_path: &Path,
+        local_target: &Path,
+    ) {
+        if let Err(err) = (self.app_opener)(app_path, local_target) {
+            self.ensure_session_sftp_drawer(session_id)
+                .set_browser_error(Some(err));
+            return;
+        }
+        let watch_id = self.next_open_with_seq;
+        self.next_open_with_seq = self.next_open_with_seq.wrapping_add(1);
+        let drawer = self.ensure_session_sftp_drawer(session_id);
+        drawer.set_browser_error(None);
+
+        if !entry.is_dir {
+            let initial_hash = hash_file_bytes(local_target).unwrap_or(0);
+            let app_name = display_name_for_app_path(app_path);
+            drawer.plus.watched_files.push(WatchedRemoteFile {
+                id: watch_id,
+                session_id,
+                remote_path: entry.full_path.clone(),
+                file_name: entry.name.clone(),
+                local_path: local_target.to_path_buf(),
+                app_path: app_path.to_path_buf(),
+                app_name,
+                last_synced_hash: initial_hash,
+                in_flight_upload_hash: None,
+                pending_upload_id: None,
+                pending_local_change: false,
+                auto_upload: false,
+                upload_failed: false,
+                status_note: None,
+            });
         }
     }
 
-    fn navigate_sftp_to(&mut self, path: String) -> Task<Message> {
-        let Some(sid) = self.active_ssh_session_id() else {
-            self.sftp_fallback_drawer.set_current_path(path);
-            return Task::none();
-        };
-        let offline = self
-            .sessions
-            .get(&sid)
-            .and_then(SessionEntry::as_ssh)
-            .is_none_or(|slot| slot.active.is_none());
-        let task = self.sftp_refresh_task(sid, path);
-        if offline {
-            let cur = self
-                .sftp_drawers
-                .get(&sid)
-                .map(|d| d.current_path().to_string());
-            if let Some(dir) = cur
-                && dir != "."
-            {
-                self.record_profile_sftp_dir(sid, &dir);
+    fn process_open_with_transfer_updates(&mut self, snap: &TransferQueueSnapshot) -> Vec<SessionId> {
+        let mut ready_to_launch = Vec::new();
+        let mut failures: Vec<(SessionId, String)> = Vec::new();
+        let mut remaining = Vec::with_capacity(self.pending_open_with.len());
+
+        for mut pending in std::mem::take(&mut self.pending_open_with) {
+            let mut failed_reason: Option<String> = None;
+            for tid in &pending.transfer_ids {
+                if let Some(ts) = snap.transfers.iter().find(|t| t.id == *tid) {
+                    match &ts.status {
+                        TransferStatus::Completed => {
+                            pending.completed_ids.insert(*tid);
+                        }
+                        TransferStatus::Failed { error } => {
+                            failed_reason = Some(format!(
+                                "Open with failed downloading {}: {error}",
+                                pending.entry.name
+                            ));
+                            break;
+                        }
+                        TransferStatus::Cancelled | TransferStatus::Skipped => {
+                            failed_reason = Some(format!(
+                                "Open with cancelled while downloading {}",
+                                pending.entry.name
+                            ));
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if let Some(err) = failed_reason {
+                failures.push((pending.session_id, err));
+            } else if pending.completed_ids.len() == pending.transfer_ids.len() {
+                ready_to_launch.push(pending);
+            } else {
+                remaining.push(pending);
             }
         }
-        task
+        self.pending_open_with = remaining;
+
+        for (sid, err) in failures {
+            self.ensure_session_sftp_drawer(sid)
+                .set_browser_error(Some(err));
+        }
+        for pending in ready_to_launch {
+            self.finish_open_with_launch(
+                pending.session_id,
+                &pending.entry,
+                &pending.app_path,
+                &pending.local_target,
+            );
+        }
+
+        let mut completed_upload_sessions = Vec::new();
+        let mut followup_auto_uploads = Vec::new();
+        let drawer_ids: Vec<SessionId> = self.sftp_drawers.keys().copied().collect();
+        for sid in drawer_ids {
+            let Some(drawer) = self.sftp_drawers.get_mut(&sid) else {
+                continue;
+            };
+            for w in &mut drawer.plus.watched_files {
+                let Some(upload_id) = w.pending_upload_id else {
+                    continue;
+                };
+                let Some(ts) = snap.transfers.iter().find(|t| t.id == upload_id) else {
+                    continue;
+                };
+                match &ts.status {
+                    TransferStatus::Completed => {
+                        w.pending_upload_id = None;
+                        w.upload_failed = false;
+                        if let Some(uploaded_hash) = w.in_flight_upload_hash.take() {
+                            w.last_synced_hash = uploaded_hash;
+                        }
+                        if let Ok(cur_hash) = hash_file_bytes(&w.local_path)
+                            && cur_hash != w.last_synced_hash
+                        {
+                            w.pending_local_change = true;
+                            w.status_note = Some("Modified locally".to_string());
+                            if w.auto_upload {
+                                followup_auto_uploads.push((sid, w.id));
+                            }
+                        } else {
+                            w.pending_local_change = false;
+                            w.status_note = Some("Uploaded to remote".to_string());
+                        }
+                        completed_upload_sessions.push(sid);
+                    }
+                    TransferStatus::Failed { error } => {
+                        w.pending_upload_id = None;
+                        w.in_flight_upload_hash = None;
+                        w.pending_local_change = true;
+                        w.upload_failed = true;
+                        w.status_note = Some(format!("Upload failed: {error}"));
+                    }
+                    TransferStatus::Cancelled | TransferStatus::Skipped => {
+                        w.pending_upload_id = None;
+                        w.in_flight_upload_hash = None;
+                        w.pending_local_change = true;
+                        w.upload_failed = false;
+                        w.status_note = Some("Upload cancelled".to_string());
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for (sid, watch_id) in followup_auto_uploads {
+            self.trigger_watched_file_upload(sid, watch_id);
+        }
+        completed_upload_sessions
+    }
+
+    fn check_watched_open_with_files(&mut self) {
+        let mut to_auto_upload = Vec::new();
+        for (&sid, drawer) in &mut self.sftp_drawers {
+            for w in &mut drawer.plus.watched_files {
+                if w.pending_upload_id.is_some() {
+                    continue;
+                }
+                let Ok(cur_hash) = hash_file_bytes(&w.local_path) else {
+                    continue;
+                };
+                if cur_hash != w.last_synced_hash {
+                    w.pending_local_change = true;
+                    w.upload_failed = false;
+                    w.status_note = Some("Modified locally".to_string());
+                    if w.auto_upload {
+                        to_auto_upload.push((sid, w.id));
+                    }
+                }
+            }
+        }
+        for (sid, watch_id) in to_auto_upload {
+            self.trigger_watched_file_upload(sid, watch_id);
+        }
+    }
+
+    fn trigger_watched_file_upload(&mut self, session_id: SessionId, watch_id: u64) {
+        let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+            if let Some(drawer) = self.sftp_drawers.get_mut(&session_id)
+                && let Some(item) = drawer
+                    .plus
+                    .watched_files
+                    .iter_mut()
+                    .find(|w| w.id == watch_id)
+            {
+                item.pending_local_change = true;
+                item.upload_failed = true;
+                item.status_note = Some("SSH disconnected — reconnect to upload".to_string());
+            }
+            return;
+        };
+        let Some((local_path, remote_path)) = self
+            .sftp_drawers
+            .get(&session_id)
+            .and_then(|d| d.plus.watched_files.iter().find(|w| w.id == watch_id))
+            .map(|w| (w.local_path.clone(), w.remote_path.clone()))
+        else {
+            return;
+        };
+        let disk_hash = match hash_file_bytes(&local_path) {
+            Ok(h) => h,
+            Err(err) => {
+                if let Some(drawer) = self.sftp_drawers.get_mut(&session_id)
+                    && let Some(item) = drawer
+                        .plus
+                        .watched_files
+                        .iter_mut()
+                        .find(|w| w.id == watch_id)
+                {
+                    item.upload_failed = true;
+                    item.status_note = Some(format!("Cannot read local file: {err}"));
+                }
+                return;
+            }
+        };
+        self.reset_transfer_conflict_override_if_idle();
+        let transfer_id = self
+            .transfer_queue
+            .enqueue_upload_overwrite(endpoint, local_path, remote_path);
+        self.transfer_sessions.insert(transfer_id, session_id);
+        if let Some(drawer) = self.sftp_drawers.get_mut(&session_id)
+            && let Some(item) = drawer
+                .plus
+                .watched_files
+                .iter_mut()
+                .find(|w| w.id == watch_id)
+        {
+            item.pending_upload_id = Some(transfer_id);
+            item.in_flight_upload_hash = Some(disk_hash);
+            item.pending_local_change = false;
+            item.upload_failed = false;
+            item.status_note = Some("Uploading...".to_string());
+        }
+        self.sync_transfer_telemetry();
+    }
+
+    fn ignore_watched_file_change(&mut self, session_id: SessionId, watch_id: u64) {
+        if let Some(drawer) = self.sftp_drawers.get_mut(&session_id)
+            && let Some(item) = drawer
+                .plus
+                .watched_files
+                .iter_mut()
+                .find(|w| w.id == watch_id)
+        {
+            if let Ok(cur_hash) = hash_file_bytes(&item.local_path) {
+                item.last_synced_hash = cur_hash;
+            }
+            item.pending_local_change = false;
+            item.upload_failed = false;
+            item.status_note = Some("Local edit ignored".to_string());
+        }
     }
 
     fn sftp_refresh_task(&mut self, session_id: SessionId, path: String) -> Task<Message> {
@@ -12992,73 +13894,6 @@ impl AppState {
         )
     }
 
-    fn create_sftp_folder(&mut self) -> Task<Message> {
-        let folder = self.sftp_drawer().new_folder_name().trim().to_string();
-        if folder.is_empty() {
-            return Task::none();
-        }
-        let Some(session_id) = self.active_ssh_session_id() else {
-            self.active_sftp_drawer_mut().set_browser_error(Some(
-                "Connect an SSH Session before creating a remote folder.".to_string(),
-            ));
-            return Task::none();
-        };
-        let endpoint = {
-            let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
-                return Task::none();
-            };
-            if slot.active.is_none() {
-                self.ensure_session_sftp_drawer(session_id)
-                    .set_browser_error(Some(
-                        "Connect an SSH Session before creating a remote folder.".to_string(),
-                    ));
-                return Task::none();
-            }
-            slot.sftp_endpoint(&self.vault)
-        };
-        let target = {
-            let drawer = self.ensure_session_sftp_drawer(session_id);
-            let path = join_remote_path(drawer.current_path(), &folder);
-            drawer.set_new_folder_name(String::new());
-            path
-        };
-        let manager = self.sftp_manager.clone();
-        Task::perform(
-            async move {
-                manager
-                    .mkdir(&endpoint, &target)
-                    .await
-                    .map_err(|err| err.to_string())
-            },
-            move |result| Message::SftpMutationResult { session_id, result },
-        )
-    }
-
-    fn delete_sftp_entry(&mut self, path: String, is_dir: bool) -> Task<Message> {
-        let Some(session_id) = self.active_ssh_session_id() else {
-            return Task::none();
-        };
-        let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
-            return Task::none();
-        };
-        if slot.active.is_none() {
-            return Task::none();
-        }
-        let endpoint = slot.sftp_endpoint(&self.vault);
-        let manager = self.sftp_manager.clone();
-        Task::perform(
-            async move {
-                let res = if is_dir {
-                    manager.remove_dir(&endpoint, &path).await
-                } else {
-                    manager.remove_file(&endpoint, &path).await
-                };
-                res.map_err(|err| err.to_string())
-            },
-            move |result| Message::SftpMutationResult { session_id, result },
-        )
-    }
-
     fn reset_transfer_conflict_override_if_idle(&self) {
         let snap = self.transfer_queue.snapshot();
         if !snap.has_incomplete_work() && snap.awaiting_conflict_count == 0 {
@@ -13068,7 +13903,7 @@ impl AppState {
 
     fn record_dir_transfer_notices_for(
         &mut self,
-        session_id: Option<SessionId>,
+        session_id: SessionId,
         summary: &DirectoryTransferSummary,
     ) {
         let notice = if let Some(first_skipped) = summary.skipped_symlinks.first() {
@@ -13086,13 +13921,8 @@ impl AppState {
                 .map(TransferNotice::summary)
         };
         if let Some(msg) = notice {
-            if let Some(sid) = session_id {
-                self.ensure_session_sftp_drawer(sid)
-                    .set_last_transfer_notice(Some(msg));
-            } else {
-                self.active_sftp_drawer_mut()
-                    .set_last_transfer_notice(Some(msg));
-            }
+            self.ensure_session_sftp_drawer(session_id)
+                .set_last_transfer_notice(Some(msg));
         }
     }
 
@@ -13126,7 +13956,10 @@ impl AppState {
                 for id in &summary.transfer_ids {
                     self.transfer_sessions.insert(*id, session_id);
                 }
-                self.record_dir_transfer_notices_for(Some(session_id), &summary);
+                self.ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .transfers_panel_open = true;
+                self.record_dir_transfer_notices_for(session_id, &summary);
                 self.sync_transfer_telemetry();
             }
             Err(err) => {
@@ -13136,121 +13969,24 @@ impl AppState {
         }
     }
 
-    fn enqueue_sftp_download(&mut self, remote_path: String, file_name: String) {
-        if let Err(err) = validate_remote_entry_name(&file_name) {
-            self.active_sftp_drawer_mut()
-                .set_browser_error(Some(err.to_string()));
-            return;
-        }
-        let Some(session_id) = self.active_ssh_session_id() else {
-            self.active_sftp_drawer_mut().set_browser_error(Some(
-                "Connect an SSH Session before downloading files.".to_string(),
-            ));
-            return;
-        };
-        let endpoint = {
-            let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
-                return;
-            };
-            slot.sftp_endpoint(&self.vault)
-        };
-        self.reset_transfer_conflict_override_if_idle();
-        let local_path = self.sftp_download_dir.join(&file_name);
-        let id = self
-            .transfer_queue
-            .enqueue_download(endpoint, remote_path, local_path);
-        self.transfer_sessions.insert(id, session_id);
-        self.sync_transfer_telemetry();
-    }
-
-    fn enqueue_sftp_download_dir(&mut self, remote_path: String, dir_name: String) -> Task<Message> {
-        if let Err(err) = validate_remote_entry_name(&dir_name) {
-            self.active_sftp_drawer_mut()
-                .set_browser_error(Some(err.to_string()));
-            return Task::none();
-        }
-        let Some(session_id) = self.active_ssh_session_id() else {
-            self.active_sftp_drawer_mut().set_browser_error(Some(
-                "Connect an SSH Session before downloading folders.".to_string(),
-            ));
-            return Task::none();
-        };
-        let endpoint = {
-            let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id) else {
-                return Task::none();
-            };
-            slot.sftp_endpoint(&self.vault)
-        };
-        self.reset_transfer_conflict_override_if_idle();
-        let local_dir = self.sftp_download_dir.join(&dir_name);
-        let queue = self.transfer_queue.clone();
-        Task::perform(
-            async move {
-                queue
-                    .enqueue_download_dir(endpoint, remote_path, local_dir)
-                    .await
-                    .map_err(|err| err.to_string())
-            },
-            move |result| Message::SftpSessionDirEnqueueResult { session_id, result },
-        )
-    }
-
     fn handle_dir_enqueue_result(
         &mut self,
-        session_id: Option<SessionId>,
+        session_id: SessionId,
         result: Result<DirectoryTransferSummary, String>,
     ) {
         match result {
             Ok(summary) => {
-                if let Some(sid) = session_id {
-                    for id in &summary.transfer_ids {
-                        self.transfer_sessions.insert(*id, sid);
-                    }
-                } else if !summary.transfer_ids.is_empty() {
-                    let snap = self.transfer_queue.snapshot();
-                    for id in &summary.transfer_ids {
-                        if !self.transfer_sessions.contains_key(id)
-                            && let Some(item) = snap.transfers.iter().find(|t| t.id == *id)
-                            && let Some(sid) = self.infer_transfer_session_id(item)
-                        {
-                            self.transfer_sessions.insert(*id, sid);
-                        }
-                    }
+                for id in &summary.transfer_ids {
+                    self.transfer_sessions.insert(*id, session_id);
                 }
-                let target_sid = session_id.or_else(|| self.active_ssh_session_id());
-                self.record_dir_transfer_notices_for(target_sid, &summary);
+                self.record_dir_transfer_notices_for(session_id, &summary);
                 self.sync_transfer_telemetry();
             }
             Err(err) => {
-                if let Some(sid) = session_id {
-                    self.ensure_session_sftp_drawer(sid)
-                        .set_browser_error(Some(err));
-                } else {
-                    self.active_sftp_drawer_mut().set_browser_error(Some(err));
-                }
+                self.ensure_session_sftp_drawer(session_id)
+                    .set_browser_error(Some(err));
             }
         }
-    }
-
-    fn infer_transfer_session_id(&self, item: &TransferSnapshot) -> Option<SessionId> {
-        if let Some(&sid) = self.transfer_sessions.get(&item.id) {
-            return Some(sid);
-        }
-        if let Some(active_sid) = self.active_ssh_session_id()
-            && self
-                .sessions
-                .get(&active_sid)
-                .and_then(SessionEntry::as_ssh)
-                .is_some_and(|slot| slot.sftp_key() == item.profile_key)
-        {
-            return Some(active_sid);
-        }
-        self.sessions.iter().find_map(|(&sid, entry)| {
-            entry
-                .as_ssh()
-                .filter(|slot| slot.sftp_key() == item.profile_key)
-                .map(|_| sid)
-        })
     }
 
     fn transfer_belongs_to_session(
@@ -14119,6 +14855,185 @@ fn open_local_file_with_system(
     _col: Option<u32>,
 ) -> Result<(), String> {
     open::that_detached(path).map_err(|err| format!("failed to open {}: {err}", path.display()))
+}
+
+fn open_local_path_with_app(app_path: &Path, target_path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        if app_path.extension().and_then(|e| e.to_str()) == Some("app") {
+            return Command::new("open")
+                .arg("-a")
+                .arg(app_path)
+                .arg(target_path)
+                .spawn()
+                .map(|_| ())
+                .map_err(|err| {
+                    format!(
+                        "failed to open {} with {}: {err}",
+                        target_path.display(),
+                        app_path.display()
+                    )
+                });
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if app_path.extension().and_then(|e| e.to_str()) == Some("desktop") {
+            if let Some(parsed) = parse_desktop_entry(app_path) {
+                let argv = build_desktop_exec_argv(&parsed.exec, target_path);
+                if let Some((program, args)) = argv.split_first() {
+                    if parsed.terminal {
+                        for (term, prefix) in [
+                            ("x-terminal-emulator", &["-e"][..]),
+                            ("gnome-terminal", &["--"][..]),
+                            ("xfce4-terminal", &["-x"][..]),
+                            ("konsole", &["-e"][..]),
+                            ("kitty", &[][..]),
+                            ("alacritty", &["-e"][..]),
+                            ("xterm", &["-e"][..]),
+                        ] {
+                            if Command::new(term)
+                                .args(prefix)
+                                .arg(program)
+                                .args(args)
+                                .spawn()
+                                .is_ok()
+                            {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    return Command::new(program)
+                        .args(args)
+                        .spawn()
+                        .map(|_| ())
+                        .map_err(|err| {
+                            format!(
+                                "failed to open {} with {}: {err}",
+                                target_path.display(),
+                                app_path.display()
+                            )
+                        });
+                }
+            }
+            return Err(format!(
+                "desktop entry {} has no runnable Exec command",
+                app_path.display()
+            ));
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if app_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("lnk"))
+        {
+            return Command::new("cmd")
+                .args(["/C", "start", ""])
+                .arg(app_path)
+                .arg(target_path)
+                .spawn()
+                .map(|_| ())
+                .map_err(|err| {
+                    format!(
+                        "failed to open {} with {}: {err}",
+                        target_path.display(),
+                        app_path.display()
+                    )
+                });
+        }
+    }
+
+    Command::new(app_path)
+        .arg(target_path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| {
+            format!(
+                "failed to open {} with {}: {err}",
+                target_path.display(),
+                app_path.display()
+            )
+        })
+}
+
+fn hash_file_bytes(path: &Path) -> std::io::Result<u64> {
+    let mut file = fs::File::open(path)?;
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    let mut buf = [0u8; 32 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for &b in &buf[..n] {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    Ok(hash)
+}
+
+#[derive(Clone)]
+struct WatchedSftpFilesSubKey {
+    targets: Vec<(PathBuf, String)>,
+}
+
+impl Hash for WatchedSftpFilesSubKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.targets.hash(state);
+    }
+}
+
+fn watched_sftp_files_stream(
+    key: &WatchedSftpFilesSubKey,
+) -> std::pin::Pin<Box<dyn Stream<Item = Message> + Send>> {
+    let targets = key.targets.clone();
+    Box::pin(iced::stream::channel(16, async move |mut output| {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let watched_names: BTreeSet<String> = targets.iter().map(|(_, n)| n.clone()).collect();
+        let cfg = notify_debouncer_mini::Config::default()
+            .with_timeout(Duration::from_millis(180))
+            .with_batch_mode(false);
+        let Ok(mut debouncer) = new_debouncer_opt::<_, RecommendedWatcher>(cfg, move |res| {
+            match res {
+                Ok(DebouncedEventBatch::Events(events)) => {
+                    let matched = events.iter().any(|ev| {
+                        ev.path
+                            .file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| watched_names.contains(n))
+                    });
+                    if matched {
+                        let _ = tx.send(());
+                    }
+                }
+                Ok(DebouncedEventBatch::Rescan) | Ok(_) => {
+                    let _ = tx.send(());
+                }
+                Err(_) => {}
+            }
+        }) else {
+            return;
+        };
+        let unique_dirs: BTreeSet<PathBuf> = targets.into_iter().map(|(dir, _)| dir).collect();
+        for dir in unique_dirs {
+            let _ = debouncer.watcher().watch(&dir, RecursiveMode::NonRecursive);
+        }
+        let _debouncer = debouncer;
+        while rx.recv().await.is_some() {
+            if output
+                .send(Message::SftpOpenWithCheckWatchedFiles)
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    }))
 }
 
 #[derive(Clone)]

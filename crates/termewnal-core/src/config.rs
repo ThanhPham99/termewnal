@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use directories::{BaseDirs, ProjectDirs};
+use directories::{BaseDirs, ProjectDirs, UserDirs};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
@@ -11,6 +11,20 @@ use crate::theme::ThemeOverrides;
 
 /// Current schema version written to `config.toml` and `profiles.toml`.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// Default width in logical pixels for the Left Sidebar.
+pub const DEFAULT_SIDEBAR_WIDTH: f32 = 250.0;
+/// Minimum width in logical pixels when resizing the Left Sidebar.
+pub const MIN_SIDEBAR_WIDTH: f32 = 180.0;
+/// Maximum width in logical pixels when resizing the Left Sidebar.
+pub const MAX_SIDEBAR_WIDTH: f32 = 480.0;
+
+/// Default width in logical pixels for a docked SFTP Panel (`SFTP+`).
+pub const DEFAULT_SFTP_PANEL_WIDTH: f32 = 360.0;
+/// Minimum width in logical pixels when resizing an SFTP Panel (`SFTP+`).
+pub const MIN_SFTP_PANEL_WIDTH: f32 = 220.0;
+/// Maximum width in logical pixels when resizing an SFTP Panel (`SFTP+`).
+pub const MAX_SFTP_PANEL_WIDTH: f32 = 960.0;
 
 /// Default SSH keepalive probe interval in seconds (`15s`).
 pub const DEFAULT_KEEPALIVE_INTERVAL_SECS: u64 = 15;
@@ -38,6 +52,7 @@ pub struct ConfigPaths {
     cache_dir: PathBuf,
     runtime_dir: Option<PathBuf>,
     home_dir: Option<PathBuf>,
+    download_dir: PathBuf,
 }
 
 impl ConfigPaths {
@@ -52,12 +67,17 @@ impl ConfigPaths {
                     .filter(|v| !v.is_empty())
                     .map(PathBuf::from)
             });
+        let data_local_dir = proj.data_local_dir().to_path_buf();
+        let download_dir = UserDirs::new()
+            .and_then(|u| u.download_dir().map(Path::to_path_buf))
+            .unwrap_or_else(|| data_local_dir.join("downloads"));
         Ok(Self {
             config_dir: proj.config_dir().to_path_buf(),
-            data_local_dir: proj.data_local_dir().to_path_buf(),
+            data_local_dir,
             cache_dir: proj.cache_dir().to_path_buf(),
             runtime_dir: proj.runtime_dir().map(Path::to_path_buf),
             home_dir,
+            download_dir,
         })
     }
 
@@ -70,7 +90,13 @@ impl ConfigPaths {
             cache_dir: root.join("cache"),
             runtime_dir: Some(root.join("runtime")),
             home_dir: Some(root.to_path_buf()),
+            download_dir: root.join("downloads"),
         }
+    }
+
+    /// Default OS downloads directory (or isolated `downloads` directory under test/portable root).
+    pub fn sftp_download_dir(&self) -> &Path {
+        &self.download_dir
     }
 
     /// Optional user home directory used for read-only `~/.ssh/config` discovery.
@@ -363,6 +389,18 @@ pub struct TerminalConfig {
     /// Always show the profile tree sidebar on startup (non-collapsible).
     #[serde(default = "default_true")]
     pub show_profile_sidebar: bool,
+    /// Persisted width in logical pixels of the Left Sidebar (`[180, 480]`).
+    #[serde(default = "default_sidebar_width")]
+    pub sidebar_width: f32,
+    /// Persisted default width in logical pixels of the per-pane SFTP Panel (`[220, 960]`).
+    #[serde(default = "default_sftp_panel_width")]
+    pub sftp_panel_width: f32,
+    /// Automatically open and list the SFTP Panel when a new SSH `Session` connects.
+    #[serde(default = "default_true")]
+    pub auto_open_sftp: bool,
+    /// Optional local destination directory override for SFTP downloads (`None` uses OS Downloads).
+    #[serde(default)]
+    pub sftp_download_dir: Option<PathBuf>,
     /// Show the optional bottom status bar (hidden by default to match Tabby's edge-to-edge UI).
     #[serde(default)]
     pub show_status_bar: bool,
@@ -400,6 +438,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_sidebar_width() -> f32 {
+    DEFAULT_SIDEBAR_WIDTH
+}
+
+fn default_sftp_panel_width() -> f32 {
+    DEFAULT_SFTP_PANEL_WIDTH
+}
+
 fn default_window_opacity() -> f32 {
     1.0
 }
@@ -428,6 +474,10 @@ impl Default for TerminalConfig {
             bell_behavior: BellBehavior::VisualAndNotification,
             tab_bar_position: TabBarPosition::Top,
             show_profile_sidebar: true,
+            sidebar_width: DEFAULT_SIDEBAR_WIDTH,
+            sftp_panel_width: DEFAULT_SFTP_PANEL_WIDTH,
+            auto_open_sftp: true,
+            sftp_download_dir: None,
             show_status_bar: false,
             show_server_stats: true,
             hide_tab_index: false,

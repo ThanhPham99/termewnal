@@ -238,3 +238,19 @@ fn sftp_state_bookmarks_persist_toggle_and_remove_with_profile() {
     assert_eq!(cleaned.remote_bookmarks("p2"), &["/opt/data".to_string()]);
     assert_eq!(cleaned.local_bookmarks(), &["/tmp/logs".to_string()]);
 }
+
+#[test]
+fn sftp_state_loads_legacy_local_bookmarks_cleanly() {
+    let temp = TempDir::new().expect("create temp root");
+    let paths = ConfigPaths::from_root(temp.path());
+    std::fs::create_dir_all(paths.data_local_dir()).expect("create data dir");
+    std::fs::write(
+        paths.sftp_state_file(),
+        "schema_version = 1\nlocal_bookmarks = [\"/home/user/legacy\"]\n\n[last_profile_dirs]\np1 = \"/srv/app\"\n\n[profile_bookmarks]\np1 = [\"/var/log\"]\n",
+    )
+    .expect("write legacy sftp_state.toml");
+
+    let loaded = termewnal_core::load_sftp_state(&paths).expect("load legacy sftp_state.toml");
+    assert_eq!(loaded.last_dir("p1"), Some("/srv/app"));
+    assert_eq!(loaded.remote_bookmarks("p1"), &["/var/log".to_string()]);
+}

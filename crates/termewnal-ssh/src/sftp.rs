@@ -23,9 +23,9 @@ pub const DEFAULT_SFTP_MAX_PACKET_LEN: u32 = 262_144;
 /// Default maximum SFTP write packet payload limit (`256 KiB`, overriding `russh-sftp` 32 KiB default).
 pub const DEFAULT_SFTP_MAX_WRITE_PACKET_LEN: u32 = 262_144;
 /// Default number of pipelined write requests kept in flight per SFTP file handle.
-pub const DEFAULT_SFTP_MAX_CONCURRENT_WRITES: usize = 4;
+pub const DEFAULT_SFTP_MAX_CONCURRENT_WRITES: usize = 16;
 /// Default number of pipelined read requests kept in flight per SFTP file handle.
-pub const DEFAULT_SFTP_MAX_CONCURRENT_READS: usize = 4;
+pub const DEFAULT_SFTP_MAX_CONCURRENT_READS: usize = 16;
 /// Default timeout in seconds for individual SFTP request replies.
 pub const DEFAULT_SFTP_REQUEST_TIMEOUT_SECS: u64 = 30;
 
@@ -42,17 +42,27 @@ pub fn pipelined_sftp_client_config() -> russh_sftp::client::Config {
 
 /// Opens an SFTP subsystem channel on `transport` and initializes a pipelined [`SftpSession`].
 pub async fn open_sftp_session(transport: &SshTransport) -> Result<SftpSession, SshError> {
-    let mut channel = transport.open_session_channel().await?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(|err| SshError::Sftp(format!("failed requesting SFTP subsystem: {err}")))?;
+    let timeout = Duration::from_secs(DEFAULT_SFTP_REQUEST_TIMEOUT_SECS);
+    tokio::time::timeout(timeout, async {
+        let mut channel = transport.open_session_channel().await?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(|err| SshError::Sftp(format!("failed requesting SFTP subsystem: {err}")))?;
 
-    await_channel_reply(&mut channel, "SFTP subsystem", |_| {})
-        .await
-        .map_err(|err| SshError::Sftp(err.to_string()))?;
+        await_channel_reply(&mut channel, "SFTP subsystem", |_| {})
+            .await
+            .map_err(|err| SshError::Sftp(err.to_string()))?;
 
-    Ok(SftpSession::new_with_config(channel.into_stream(), pipelined_sftp_client_config()).await?)
+        Ok(SftpSession::new_with_config(channel.into_stream(), pipelined_sftp_client_config()).await?)
+    })
+    .await
+    .map_err(|_| {
+        SshError::TransferTransportDropped(format!(
+            "SFTP subsystem initialization timed out after {}s",
+            timeout.as_secs()
+        ))
+    })?
 }
 
 /// Stable cache key identifying a `Profile` or ad-hoc SSH target for `Transfer Transport` reuse.
@@ -344,6 +354,27 @@ impl TransferTransportPool {
         }
     }
 
+    /// Invalidates cached transport entries for `key` only if `failed_session` is still one of
+    /// the active cached SFTP channels, preventing late worker errors from evicting a freshly
+    /// reconnected transport established by a sibling worker.
+    pub fn invalidate_session(&self, key: &ProfileTransportKey, failed_session: &Arc<SftpSession>) {
+        if let Ok(mut entries) = self.entries.lock()
+            && let Some(entry) = entries.get(key)
+        {
+            let matches_browser = entry
+                .browser_sftp
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, failed_session));
+            let matches_transfer = entry
+                .transfer_sftp
+                .as_ref()
+                .is_some_and(|s| Arc::ptr_eq(s, failed_session));
+            if matches_browser || matches_transfer {
+                entries.remove(key);
+            }
+        }
+    }
+
     /// Returns the most recently observed SFTP transport mode & notice for `key`, if active.
     pub fn status_notice(&self, key: &ProfileTransportKey) -> Option<SftpStatusNotice> {
         let entries = self.entries.lock().ok()?;
@@ -420,7 +451,10 @@ impl TransferTransportPool {
                 let Some(transport) = transport else {
                     return Ok(None);
                 };
-                let cached_sftp = entry.transfer_sftp.as_ref().or(entry.browser_sftp.as_ref());
+                let cached_sftp = match role {
+                    SftpChannelRole::Browser => entry.browser_sftp.as_ref(),
+                    SftpChannelRole::Transfer => entry.transfer_sftp.as_ref(),
+                };
                 if let Some(session) = cached_sftp {
                     return Ok(Some(AcquiredSftpSession {
                         session: Arc::clone(session),
@@ -456,21 +490,17 @@ impl TransferTransportPool {
                         let sftp = Arc::new(session);
                         let mut entries = self.entries.lock().expect("pool entries mutex poisoned");
                         if let Some(entry) = entries.get_mut(&endpoint.key) {
-                            match ready.mode {
-                                SftpTransportMode::IsolatedTransferTransport => match role {
-                                    SftpChannelRole::Browser => {
-                                        entry.browser_sftp = Some(Arc::clone(&sftp))
-                                    }
-                                    SftpChannelRole::Transfer => {
-                                        entry.transfer_sftp = Some(Arc::clone(&sftp))
-                                    }
-                                },
-                                SftpTransportMode::MuxFallback => {
-                                    entry.browser_sftp = Some(Arc::clone(&sftp));
-                                    entry.transfer_sftp = Some(Arc::clone(&sftp));
+                            match role {
+                                SftpChannelRole::Browser => {
+                                    entry.browser_sftp = Some(Arc::clone(&sftp))
+                                }
+                                SftpChannelRole::Transfer => {
+                                    entry.transfer_sftp = Some(Arc::clone(&sftp))
                                 }
                             }
                         }
+                        drop(entries);
+                        self.reconnect_notify.notify_waiters();
                         return Ok(AcquiredSftpSession {
                             session: sftp,
                             mode: ready.mode,
@@ -497,6 +527,7 @@ impl TransferTransportPool {
             return self
                 .establish_mux_fallback(
                     &endpoint.key,
+                    role,
                     Arc::clone(primary),
                     "Interactive 2FA/auth active on Primary Transport; using multiplexed SFTP channel.",
                 )
@@ -505,7 +536,7 @@ impl TransferTransportPool {
 
         let silent_handler: Arc<dyn SshInteractionHandler> =
             Arc::new(SilentTransferInteractionHandler);
-        match SshTransport::connect(
+        match SshTransport::connect_for_transfer(
             &endpoint.connect_config,
             endpoint.vault.as_deref(),
             silent_handler,
@@ -532,6 +563,8 @@ impl TransferTransportPool {
                         transfer_sftp,
                     },
                 );
+                drop(entries);
+                self.reconnect_notify.notify_waiters();
                 Ok(AcquiredSftpSession {
                     session: sftp,
                     mode: SftpTransportMode::IsolatedTransferTransport,
@@ -542,6 +575,7 @@ impl TransferTransportPool {
                 if let Some(primary) = active_primary {
                     self.establish_mux_fallback(
                         &endpoint.key,
+                        role,
                         primary,
                         "Secondary connection required interactive 2FA/auth; fell back to multiplexed SFTP channel on Primary Transport.",
                     )
@@ -557,11 +591,16 @@ impl TransferTransportPool {
     async fn establish_mux_fallback(
         &self,
         key: &ProfileTransportKey,
+        role: SftpChannelRole,
         primary: Arc<SshTransport>,
         reason: &str,
     ) -> Result<AcquiredSftpSession, SshError> {
         let sftp = Arc::new(open_sftp_session(&primary).await?);
         let notice = Some(reason.to_string());
+        let (browser_sftp, transfer_sftp) = match role {
+            SftpChannelRole::Browser => (Some(Arc::clone(&sftp)), None),
+            SftpChannelRole::Transfer => (None, Some(Arc::clone(&sftp))),
+        };
         let mut entries = self.entries.lock().expect("pool entries mutex poisoned");
         entries.insert(
             key.clone(),
@@ -570,10 +609,12 @@ impl TransferTransportPool {
                 notice: notice.clone(),
                 transfer_transport: None,
                 primary_transport: Some(primary),
-                browser_sftp: Some(Arc::clone(&sftp)),
-                transfer_sftp: Some(Arc::clone(&sftp)),
+                browser_sftp,
+                transfer_sftp,
             },
         );
+        drop(entries);
+        self.reconnect_notify.notify_waiters();
         Ok(AcquiredSftpSession {
             session: sftp,
             mode: SftpTransportMode::MuxFallback,
@@ -778,7 +819,7 @@ impl SftpManager {
                 Err(err) => {
                     if err.is_connection_error() && retry < DEFAULT_SFTP_OP_MAX_RETRIES {
                         retry += 1;
-                        self.pool.invalidate(&endpoint.key);
+                        self.pool.invalidate_session(&endpoint.key, &acquired.session);
                         self.set_transport_status(
                             &endpoint.key,
                             SftpTransportStatus::AutoReconnecting {

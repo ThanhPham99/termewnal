@@ -353,3 +353,44 @@ fn profiles_groups_add_rename_delete_move_and_roundtrip_compat() {
         "empty groups list should be omitted from serialized TOML: {raw}"
     );
 }
+
+#[test]
+fn layout_widths_and_sftp_defaults_round_trip_with_legacy_config_compat() {
+    let temp = TempDir::new().expect("create temp root");
+    let paths = ConfigPaths::from_root(temp.path());
+    assert_eq!(paths.sftp_download_dir(), temp.path().join("downloads").as_path());
+
+    std::fs::create_dir_all(paths.config_dir()).expect("create config dir");
+    std::fs::write(
+        paths.config_file(),
+        "schema_version = 1\n\n[terminal]\nfont_size = 15.0\n",
+    )
+    .expect("write legacy config");
+    let loaded_legacy = load_config(&paths).expect("load legacy config");
+    assert_eq!(
+        loaded_legacy.terminal.sidebar_width,
+        termewnal_core::DEFAULT_SIDEBAR_WIDTH
+    );
+    assert_eq!(
+        loaded_legacy.terminal.sftp_panel_width,
+        termewnal_core::DEFAULT_SFTP_PANEL_WIDTH
+    );
+    assert!(loaded_legacy.terminal.auto_open_sftp);
+    assert_eq!(loaded_legacy.terminal.sftp_download_dir, None);
+
+    let mut cfg = loaded_legacy;
+    cfg.terminal.sidebar_width = 310.0;
+    cfg.terminal.sftp_panel_width = 420.0;
+    cfg.terminal.auto_open_sftp = false;
+    cfg.terminal.sftp_download_dir = Some(temp.path().join("custom-dl"));
+    save_config(&paths, &cfg).expect("save config with new fields");
+
+    let reloaded = load_config(&paths).expect("reload config");
+    assert_eq!(reloaded.terminal.sidebar_width, 310.0);
+    assert_eq!(reloaded.terminal.sftp_panel_width, 420.0);
+    assert!(!reloaded.terminal.auto_open_sftp);
+    assert_eq!(
+        reloaded.terminal.sftp_download_dir,
+        Some(temp.path().join("custom-dl"))
+    );
+}

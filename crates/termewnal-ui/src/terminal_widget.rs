@@ -606,6 +606,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) => {
                 if cursor.is_over(bounds) {
+                    shell.publish(Message::TerminalFocused);
                     if self.snapshot.mouse_mode && !state.modifiers.shift() {
                         if let Some(pos) = cursor.position_in(bounds) {
                             let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);
@@ -650,6 +651,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
                 if cursor.is_over(bounds) {
+                    shell.publish(Message::TerminalFocused);
                     if self.snapshot.mouse_mode && !state.modifiers.shift() {
                         if let Some(pos) = cursor.position_in(bounds) {
                             let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);

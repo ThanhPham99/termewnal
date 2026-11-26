@@ -32,7 +32,7 @@ Termewnal follows the exact visual architecture and UX of [`Eugeny/tabby`](https
 - **In-Pane Terminal Toolbars (`app.rs::render_pane`, `ssh_ui.rs`) & Search (`terminal_ergonomics.rs`)**:
   - Sleek `terminal-toolbar` (`bg_more` + `1px` bottom border) on SSH, Serial, and Telnet tabs with status dot, transport latency/state, `Reconnect`/`Cancel`, `SFTP`, and `Ports` actions.
   - Top-right docked `search-panel` (`border-radius: 0 0 5px 5px`) with `Search`, `▲`, `▼`, and `×`.
-- **Settings (`settings_ui.rs`), Selector Modal (`command_palette.rs`), & SFTP Panel (`sftp_drawer.rs`)**:
+- **Settings (`settings_ui.rs`), Selector Modal (`command_palette.rs`), & SFTP Panel (`sftp_plus.rs` / `sftp_drawer.rs`)**:
   - Settings uses Tabby's left `.nav-pills` rail + flush `.form-line` rows, a live `john@doe-pc$ ls` color scheme preview, `[ █ | | | ▁ ]` cursor buttons, window chrome toggles (`flex_tabs`, `hide_tab_index`, `show_profile_sidebar`, `show_status_bar`), and bordered primary hotkey chips.
   - Command Palette matches Tabby's `selector-modal` (top borderless search box, `.list-group-light` items, `ENTER` hint on selected row).
-  - SFTP Drawer features clickable path breadcrumbs, flat action buttons, and thin `3px` transfer progress bars.
+  - SFTP Panel (`SFTP+`) docks as a resizable, remote-only right panel inside each SSH **Pane** (auto-opened on SSH connect), pairing a compact navigation/filter/bookmark/upload toolbar and adaptive file table (`Name`, `Size`, width-gated `Modified`/`Permission`) with a collapsible `Transfers` tray and thin `3px` progress bars.

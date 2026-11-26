@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use iced::advanced::layout::{self, Layout};
 use iced::advanced::overlay;
 use iced::advanced::renderer::{self, Quad};
@@ -9,17 +11,14 @@ use iced::{
 };
 
 use crate::app::{Message, shortcut_for_key_event_with_palette};
-use crate::workspace::{MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, PaneId, SplitAxis, SplitId, TabId};
+use crate::ui_theme::{DividerDragState, DividerPress, draw_interactive_divider};
+use crate::workspace::{
+    DEFAULT_SPLIT_RATIO, MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, PaneId, SplitAxis, SplitId, TabId,
+};
 
 const DIVIDER_THICKNESS: f32 = 1.0;
 const DIVIDER_HIT_PADDING: f32 = 5.0;
 const PANE_BORDER_WIDTH: f32 = 1.0;
-
-#[derive(Debug, Default)]
-struct SplitDragState {
-    dragging: bool,
-    hovered: bool,
-}
 
 /// Interactive binary split container rendering two child elements separated by a draggable divider.
 pub struct SplitView<'a> {
@@ -89,11 +88,11 @@ fn split_first_size(total: Size, axis: SplitAxis, ratio: f32) -> (f32, f32) {
 
 impl Widget<Message, Theme, iced::Renderer> for SplitView<'_> {
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<SplitDragState>()
+        tree::Tag::of::<DividerDragState>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(SplitDragState::default())
+        tree::State::new(DividerDragState::default())
     }
 
     fn children(&self) -> Vec<Tree> {
@@ -186,7 +185,7 @@ impl Widget<Message, Theme, iced::Renderer> for SplitView<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let state = tree.state.downcast_mut::<SplitDragState>();
+        let state = tree.state.downcast_mut::<DividerDragState>();
         let bounds = layout.bounds();
         let (_visual_rect, hit_rect) = self.divider_rects(bounds);
 
@@ -194,7 +193,15 @@ impl Widget<Message, Theme, iced::Renderer> for SplitView<'_> {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
                 if cursor.is_over(hit_rect) =>
             {
-                state.dragging = true;
+                match state.on_left_press(Instant::now()) {
+                    DividerPress::DoubleClickReset => {
+                        shell.publish(Message::ResizeSplit {
+                            split_id: self.split_id,
+                            ratio: DEFAULT_SPLIT_RATIO,
+                        });
+                    }
+                    DividerPress::StartDrag => {}
+                }
                 shell.capture_event();
                 shell.request_redraw();
                 return;
@@ -262,7 +269,7 @@ impl Widget<Message, Theme, iced::Renderer> for SplitView<'_> {
         viewport: &Rectangle,
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
-        let state = tree.state.downcast_ref::<SplitDragState>();
+        let state = tree.state.downcast_ref::<DividerDragState>();
         let (_visual_rect, hit_rect) = self.divider_rects(layout.bounds());
         if state.dragging || cursor.is_over(hit_rect) {
             return match self.axis {
@@ -294,8 +301,6 @@ impl Widget<Message, Theme, iced::Renderer> for SplitView<'_> {
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        use iced::advanced::renderer::Renderer as _;
-
         for ((child, child_tree), child_layout) in self
             .children
             .iter()
@@ -308,27 +313,10 @@ impl Widget<Message, Theme, iced::Renderer> for SplitView<'_> {
                 .draw(child_tree, renderer, theme, style, child_layout, cursor, viewport);
         }
 
-        let state = tree.state.downcast_ref::<SplitDragState>();
+        let state = tree.state.downcast_ref::<DividerDragState>();
         let (visual_rect, _) = self.divider_rects(layout.bounds());
         if visual_rect.intersects(viewport) {
-            let ext = theme.extended_palette();
-            let color = if state.dragging || state.hovered {
-                ext.primary.strong.color
-            } else {
-                Color {
-                    a: 0.42,
-                    ..ext.background.strong.color
-                }
-            };
-            renderer.fill_quad(
-                Quad {
-                    bounds: visual_rect,
-                    border: Border::default(),
-                    shadow: Shadow::default(),
-                    snap: true,
-                },
-                Background::Color(color),
-            );
+            draw_interactive_divider(renderer, theme, visual_rect, state, 0.42);
         }
     }
 
