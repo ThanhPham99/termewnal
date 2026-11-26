@@ -291,6 +291,19 @@ enum BindOutcome {
     Forwarded,
 }
 
+fn is_listener_in_use(err: &io::Error) -> bool {
+    if err.kind() == io::ErrorKind::AddrInUse {
+        return true;
+    }
+    #[cfg(windows)]
+    if err.kind() == io::ErrorKind::PermissionDenied
+        || matches!(err.raw_os_error(), Some(5) | Some(231))
+    {
+        return true;
+    }
+    false
+}
+
 async fn bind_or_forward(
     socket_path: &Path,
     command: &IpcCommand,
@@ -304,7 +317,7 @@ async fn bind_or_forward(
                 restrict_unix_socket_permissions(socket_path);
                 return Ok(BindOutcome::Primary(listener));
             }
-            Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+            Err(err) if is_listener_in_use(&err) => {
                 match send_command_async(socket_path, command).await {
                     Ok(()) => return Ok(BindOutcome::Forwarded),
                     Err(probe_err) => {
@@ -334,7 +347,7 @@ async fn bind_or_forward(
             restrict_unix_socket_permissions(socket_path);
             Ok(BindOutcome::Primary(listener))
         }
-        Err(err) if err.kind() == io::ErrorKind::AddrInUse => {
+        Err(err) if is_listener_in_use(&err) => {
             send_command_async(socket_path, command).await?;
             Ok(BindOutcome::Forwarded)
         }

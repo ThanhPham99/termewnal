@@ -353,9 +353,8 @@ impl PtySession {
     /// and caches the result, falling back to OSC 7 reports or the last retained directory once
     /// the child exits.
     pub fn current_working_dir(&self) -> Option<PathBuf> {
-        let exited = self.buffer.is_exited();
-
-        if !exited {
+        #[cfg(target_os = "linux")]
+        if !self.buffer.is_exited() {
             let fg_pid = self
                 .master
                 .lock()
