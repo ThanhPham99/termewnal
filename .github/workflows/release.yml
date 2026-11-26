@@ -35,6 +35,7 @@ jobs:
             ca-certificates \
             curl \
             git \
+            python3 \
             xz-utils \
             build-essential \
             pkg-config \

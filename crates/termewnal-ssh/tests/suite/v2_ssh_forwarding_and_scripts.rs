@@ -607,11 +607,98 @@ s2c()
     let mut cfg = base_connect_cfg(srv.addr, &known_hosts);
     #[cfg(unix)]
     {
-        cfg.proxy_command = Some(format!(
-            "python3 -u '{}' %h %p %r '{}'",
-            relay_script.display(),
-            marker.display()
-        ));
+        let c_src = temp.path().join("proxy_relay.c");
+        let c_bin = temp.path().join("proxy_relay");
+        fs::write(
+            &c_src,
+            r#"#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+static int write_all_fd(int fd, const char *buf, ssize_t len) {
+    ssize_t off = 0;
+    while (off < len) {
+        ssize_t w = write(fd, buf + off, (size_t)(len - off));
+        if (w <= 0) return -1;
+        off += w;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc < 5) return 2;
+    const char *host = argv[1];
+    int port = atoi(argv[2]);
+    const char *user = argv[3];
+    const char *marker = argv[4];
+    FILE *f = fopen(marker, "w");
+    if (!f) return 3;
+    fprintf(f, "%s:%d:%s", host, port, user);
+    fclose(f);
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return 4;
+    struct sockaddr_in addr = {0};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) return 5;
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) return 6;
+
+    struct pollfd fds[2];
+    fds[0].events = POLLIN;
+    fds[1].fd = sock;
+    fds[1].events = POLLIN;
+    char buf[4096];
+    int in_open = 1, sock_open = 1;
+    while (sock_open) {
+        fds[0].fd = in_open ? STDIN_FILENO : -1;
+        if (poll(fds, 2, -1) <= 0) break;
+        if (in_open && (fds[0].revents & (POLLIN | POLLHUP | POLLERR))) {
+            ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+            if (n <= 0) {
+                in_open = 0;
+                shutdown(sock, SHUT_WR);
+            } else if (write_all_fd(sock, buf, n) != 0) {
+                sock_open = 0;
+            }
+        }
+        if (sock_open && (fds[1].revents & (POLLIN | POLLHUP | POLLERR))) {
+            ssize_t n = read(sock, buf, sizeof(buf));
+            if (n <= 0 || write_all_fd(STDOUT_FILENO, buf, n) != 0) {
+                sock_open = 0;
+            }
+        }
+    }
+    close(sock);
+    return 0;
+}
+"#,
+        )
+        .unwrap();
+        let cc_ok = std::process::Command::new("cc")
+            .arg(&c_src)
+            .arg("-o")
+            .arg(&c_bin)
+            .status()
+            .is_ok_and(|s| s.success());
+        if cc_ok {
+            cfg.proxy_command = Some(format!(
+                "'{}' %h %p %r '{}'",
+                c_bin.display(),
+                marker.display()
+            ));
+        } else {
+            cfg.proxy_command = Some(format!(
+                "python3 -u '{}' %h %p %r '{}'",
+                relay_script.display(),
+                marker.display()
+            ));
+        }
     }
     #[cfg(windows)]
     {
