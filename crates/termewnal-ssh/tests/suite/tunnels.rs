@@ -317,6 +317,20 @@ async fn start_supervised_session(
     sup
 }
 
+async fn assert_port_closed_soon(addr: SocketAddr) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if TcpStream::connect(addr).await.is_err() {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "stopped tunnel listener still accepting connections at {addr}"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
 #[tokio::test]
 async fn local_tunnel_defaults_to_loopback_and_forwards_tcp_bytes_over_direct_tcpip() {
     let temp = TempDir::new().unwrap();
@@ -357,7 +371,7 @@ async fn local_tunnel_defaults_to_loopback_and_forwards_tcp_bytes_over_direct_tc
     assert!(manager.stop_tunnel(&rule.id));
     let stop_snap = manager.snapshot();
     assert_eq!(stop_snap.tunnels[0].state, TunnelState::Stopped);
-    assert!(TcpStream::connect(bound_addr).await.is_err());
+    assert_port_closed_soon(bound_addr).await;
 
     sup.disconnect();
 }
@@ -1035,7 +1049,7 @@ async fn standalone_tunnel_runs_without_pty_shell_recovers_after_drop_and_tracks
     let final_snap = manager.snapshot();
     assert_eq!(final_snap.active_standalone_count, 0);
     assert_eq!(final_snap.tunnels[0].state, TunnelState::Stopped);
-    assert!(TcpStream::connect(bound_addr).await.is_err());
+    assert_port_closed_soon(bound_addr).await;
 
     assert!(manager.remove_tunnel(&rule.id));
     assert!(!manager.remove_tunnel(&rule.id));

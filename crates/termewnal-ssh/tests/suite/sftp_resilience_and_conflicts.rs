@@ -96,7 +96,11 @@ impl FaultServerState {
     }
 
     fn virtual_from_abs(&self, abs: &Path) -> String {
-        match abs.strip_prefix(&self.root_dir) {
+        let canon_root = fs::canonicalize(&self.root_dir).unwrap_or_else(|_| self.root_dir.clone());
+        match abs
+            .strip_prefix(&canon_root)
+            .or_else(|_| abs.strip_prefix(&self.root_dir))
+        {
             Ok(rel) if rel.as_os_str().is_empty() => "/".to_string(),
             Ok(rel) => format!(
                 "/{}",

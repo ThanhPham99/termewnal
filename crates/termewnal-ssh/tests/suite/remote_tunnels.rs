@@ -1181,7 +1181,8 @@ async fn remote_tunnel_rejects_forwarded_tcpip_when_local_target_refuses_without
     {
         let mut client = TcpStream::connect(("127.0.0.1", remote_port)).await.unwrap();
         let mut buf = [0u8; 16];
-        let res = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buf))
+        // Windows loopback TCP SYN retries take ~2s before WSAECONNREFUSED fires.
+        let res = tokio::time::timeout(Duration::from_secs(6), client.read(&mut buf))
             .await
             .expect("client must close cleanly on ConnectFailed");
         assert!(matches!(res, Ok(0) | Err(_)));

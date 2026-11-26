@@ -630,7 +630,17 @@ async fn session_bound_local_tunnel_starts_with_session_and_stops_when_tab_close
     // Closing the SSH tab/pane stops the session-bound tunnel and unbinds its port.
     let _ = state.update(Message::CloseFocusedPane);
     assert!(state.tunnel_manager().snapshot().tunnels.is_empty());
-    assert!(TcpStream::connect(bound_addr).await.is_err());
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if TcpStream::connect(bound_addr).await.is_err() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "session-bound tunnel listener still bound at {bound_addr}"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
 }
 
 #[tokio::test]

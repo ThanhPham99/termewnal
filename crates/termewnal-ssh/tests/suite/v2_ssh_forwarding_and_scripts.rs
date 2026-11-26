@@ -555,15 +555,26 @@ async fn proxy_command_expands_tokens_and_connects_ssh_transport() {
     let relay_script = temp.path().join("proxy_relay.py");
     fs::write(
         &relay_script,
-        r#"import socket, sys, threading
+        r#"import os, socket, sys, threading
+if sys.platform == "win32":
+    import msvcrt
+    msvcrt.setmode(sys.stdin.fileno(), os.O_BINARY)
+    msvcrt.setmode(sys.stdout.fileno(), os.O_BINARY)
 host, port, user, marker = sys.argv[1], int(sys.argv[2]), sys.argv[3], sys.argv[4]
 with open(marker, "w") as f:
     f.write(f"{host}:{port}:{user}")
 sock = socket.create_connection((host, port))
+stdin_fd = sys.stdin.fileno()
+stdout_fd = sys.stdout.fileno()
+def write_all(fd, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
 def c2s():
     try:
         while True:
-            d = sys.stdin.buffer.read1(4096)
+            d = os.read(stdin_fd, 4096)
             if not d:
                 break
             sock.sendall(d)
@@ -579,8 +590,7 @@ def s2c():
             d = sock.recv(4096)
             if not d:
                 break
-            sys.stdout.buffer.write(d)
-            sys.stdout.buffer.flush()
+            write_all(stdout_fd, d)
     except Exception:
         pass
 t = threading.Thread(target=c2s, daemon=True)
@@ -605,8 +615,29 @@ s2c()
     }
     #[cfg(windows)]
     {
+        let py_launcher = [("python", vec![]), ("py", vec!["-3"]), ("python3", vec![])]
+            .into_iter()
+            .find_map(|(exe, extra_args)| {
+                let mut probe = std::process::Command::new(exe);
+                for arg in &extra_args {
+                    probe.arg(arg);
+                }
+                probe.args(["-c", "import sys"]);
+                probe
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .map(|_| {
+                        if extra_args.is_empty() {
+                            exe.to_string()
+                        } else {
+                            format!("{exe} {}", extra_args.join(" "))
+                        }
+                    })
+            })
+            .unwrap_or_else(|| "python".to_string());
         cfg.proxy_command = Some(format!(
-            "python -u \"{}\" %h %p %r \"{}\"",
+            "{py_launcher} -u \"{}\" %h %p %r \"{}\"",
             relay_script.display(),
             marker.display()
         ));

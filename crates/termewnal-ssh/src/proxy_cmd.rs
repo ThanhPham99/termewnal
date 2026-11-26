@@ -141,6 +141,6 @@ fn build_shell_command(expanded: &str) -> Command {
 #[cfg(windows)]
 fn build_shell_command(expanded: &str) -> Command {
     let mut cmd = Command::new("cmd");
-    cmd.arg("/C").arg(expanded);
+    cmd.arg("/S").arg("/C").raw_arg(format!("\"{expanded}\""));
     cmd
 }
