@@ -34,9 +34,9 @@
 - **Session-Bound & Standalone Tunnels**: Create Local, Remote, and Dynamic SOCKS5 forwards bound to `127.0.0.1` by default (with explicit opt-in prompts for `0.0.0.0`).
 - **Seamless Recovery**: Preserves local listeners across transient SSH drops with a 10-second client hold grace window (avoiding `EADDRINUSE`), handles Remote `-R` `RequestDenied` backoff recovery, and displays live **`Auto-reconnecting`** / **`Reconnected successfully`** status in both the Sidebar and Status Bar.
 
-### Non-Blocking SFTP Drawer & SFTP+ Commander
-- **Dual Workflows**: Toggleable right-hand SFTP Drawer (`Ctrl+Shift+E`) and Tabby-inspired **SFTP+** dual-pane commander (`Local | Remote`) with drag-and-drop uploads, inline file viewer/editor, bookmarks, sorting, filtering, and permissions editing.
-- **Isolated Pipelined Transfers**: Runs bulk uploads/downloads on a dedicated `Transfer Transport` (falling back automatically to multiplexed primary channels on 2FA hosts), writes large files via `.termewnal.part` with atomic rename and byte-offset resume, caps queue concurrency cleanly, and surfaces live **`Auto-reconnecting`** / **`Reconnected successfully`** banners and transfer badges on connection drops.
+### Per-Pane SFTP+ Panel & Resilient Transfers
+- **Remote-Only SFTP+ Panel**: Automatically opens alongside newly connected SSH sessions (`Ctrl+Shift+E` to toggle), supports resizable sidebar and SFTP+ pane widths, bookmark/filter/sort workflows, inline viewer/editor, permissions editor, and **Open with...** OS application chooser with local edit monitoring & re-upload.
+- **Isolated Pipelined Transfers**: Runs bulk uploads/downloads on a dedicated `Transfer Transport` with 16-chunk SFTP pipelining (falling back automatically to separate browser/transfer multiplexed channels on 2FA hosts), writes uploads and downloads via `.termewnal.part` with atomic rename and source integrity-verified resume, exponential backoff + jitter recovery, and live **`Auto-reconnecting`** / **`Reconnected successfully`** indicators.
 
 ### Multi-Protocol Connections
 - **Serial**: Port discovery, configurable baud/framing/flow control, `Text` / `Readline` / `HexBytes` input modes, `Hexdump` output, and automatic reconnect.
@@ -63,7 +63,7 @@ termewnal/
 │   ├── termewnal-protocols/  # Serial terminal, Telnet client, ZMODEM engine, Docker/Podman discovery
 │   ├── termewnal-ssh/        # russh supervisor, ProxyJump/ProxyCommand/X11/Agent, resilient tunnels & SFTP
 │   └── termewnal-ui/         # iced desktop application, Tabby-inspired UI, SFTP+, Status Bar, Quake/Tray
-├── docs/adr/                 # Architecture Decision Records (ADR-0001..0005)
+├── docs/adr/                 # Architecture Decision Records (ADR-0001..0007)
 ├── DESIGN.md                 # Tabby-aligned visual & UX design system tokens
 └── GLOSSARY.md               # Domain terminology
 ```
