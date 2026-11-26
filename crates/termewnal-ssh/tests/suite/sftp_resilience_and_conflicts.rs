@@ -736,6 +736,7 @@ fn setup_endpoint(temp: &TempDir, srv: &FaultServer) -> SftpEndpoint {
         rows: 24,
         scrollback_lines: 10_000,
         proxy_jump: Vec::new(),
+        ..SshConnectConfig::default()
     };
     let key = ProfileTransportKey::from_connect_config(Some("prof-fault".to_string()), &cfg);
     SftpEndpoint::new(key, cfg)
@@ -1658,5 +1659,138 @@ async fn slice6_permission_preserve_failure_emits_permission_preserve_skipped_no
         ),
         "expected PermissionPreserveSkipped notice for dir chmod failure, got {:?}",
         dir_snap.notice
+    );
+}
+
+
+#[tokio::test]
+async fn sftp_manager_auto_reconnects_on_connection_drop_and_emits_reconnected_status() {
+    use termewnal_ssh::SftpTransportStatus;
+
+    let temp = TempDir::new().unwrap();
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&remote_root).unwrap();
+    fs::write(remote_root.join("src.txt"), b"reconnect-payload").unwrap();
+
+    let srv = spawn_fault_server(remote_root.clone(), "ops", "fault-pw").await;
+    let ep = setup_endpoint(&temp, &srv);
+    let manager = SftpManager::new().with_retry_delay(Duration::from_millis(20));
+
+    // Warm up the Transfer Transport cache.
+    manager.list_dir(&ep, ".").await.expect("initial list_dir");
+
+    let observed = Arc::new(Mutex::new(Vec::<SftpTransportStatus>::new()));
+    let observed_clone = Arc::clone(&observed);
+    let mut status_rx = manager.subscribe_status();
+    let watch_key = ep.key.clone();
+    let (done_tx, done_rx) = oneshot::channel();
+    let watcher = tokio::spawn(async move {
+        let mut done_tx = Some(done_tx);
+        while status_rx.changed().await.is_ok() {
+            if let Some(st) = status_rx.borrow_and_update().get(&watch_key).cloned() {
+                let is_reconnected = matches!(st, SftpTransportStatus::Reconnected { .. });
+                observed_clone.lock().unwrap().push(st);
+                if is_reconnected {
+                    if let Some(tx) = done_tx.take() {
+                        let _ = tx.send(());
+                    }
+                    break;
+                }
+            }
+        }
+    });
+
+    // Drop the TCP connection on the first rename attempt -> SftpManager must auto-reconnect and finish.
+    srv.state.drop_conn_on_rename.store(true, Ordering::SeqCst);
+    manager
+        .rename(&ep, "/src.txt", "/dst.txt")
+        .await
+        .expect("rename must recover after connection drop");
+
+    let _ = tokio::time::timeout(Duration::from_secs(2), done_rx).await;
+    watcher.abort();
+    assert!(remote_root.join("dst.txt").exists());
+    let states = observed.lock().unwrap().clone();
+    assert!(
+        states
+            .iter()
+            .any(|s| matches!(s, SftpTransportStatus::AutoReconnecting { attempt: 1, .. })),
+        "expected SftpTransportStatus::AutoReconnecting, got {states:?}"
+    );
+    assert!(
+        matches!(
+            manager.transport_status(&ep.key),
+            SftpTransportStatus::Reconnected { .. }
+        ) || states
+            .iter()
+            .any(|s| matches!(s, SftpTransportStatus::Reconnected { .. })),
+        "expected SftpTransportStatus::Reconnected, got {states:?}"
+    );
+}
+
+#[tokio::test]
+async fn transfer_queue_tracks_auto_reconnecting_and_reconnected_on_drop() {
+    use termewnal_ssh::TransferReconnectState;
+
+    let temp = TempDir::new().unwrap();
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&remote_root).unwrap();
+    let local_file = temp.path().join("upload.bin");
+    fs::write(&local_file, vec![b'A'; 1024 * 1024]).unwrap();
+
+    let srv = spawn_fault_server(remote_root.clone(), "ops", "fault-pw").await;
+    *srv.state.drop_conn_after_part_bytes.lock().unwrap() = Some(256 * 1024);
+    let ep = setup_endpoint(&temp, &srv);
+
+    let mut transfer_cfg = TransferConfig::default();
+    transfer_cfg.part_threshold_bytes = 64 * 1024;
+    let manager = SftpManager::new().with_retry_delay(Duration::from_millis(50));
+    let queue = TransferQueue::with_config(
+        manager,
+        TransferQueueConfig {
+            transfer: transfer_cfg,
+            reconnect_retry_delay: Duration::from_millis(250),
+            ..TransferQueueConfig::default()
+        },
+    );
+    let mut sub = queue.subscribe();
+    let tid = queue.enqueue_upload(ep, local_file, "/upload.bin".to_string());
+
+    let mut saw_auto_reconnecting = false;
+    let final_snap = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snap = sub.borrow_and_update().clone();
+            if let Some(item) = snap.transfers.iter().find(|t| t.id == tid) {
+                if matches!(
+                    item.reconnect_state,
+                    TransferReconnectState::AutoReconnecting { .. }
+                ) {
+                    saw_auto_reconnecting = true;
+                }
+                if item.status == TransferStatus::Completed {
+                    return item.clone();
+                }
+                if let TransferStatus::Failed { ref error } = item.status {
+                    panic!("transfer failed instead of recovering: {error}");
+                }
+            }
+            sub.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("transfer must complete after auto-reconnect");
+
+    assert!(saw_auto_reconnecting, "expected AutoReconnecting before Reconnected");
+    assert_eq!(
+        final_snap.reconnect_state,
+        TransferReconnectState::Reconnected
+    );
+    assert_eq!(
+        final_snap.status_notice.as_deref(),
+        Some("Reconnected successfully")
+    );
+    assert_eq!(
+        fs::read(remote_root.join("upload.bin")).unwrap().len(),
+        1024 * 1024
     );
 }

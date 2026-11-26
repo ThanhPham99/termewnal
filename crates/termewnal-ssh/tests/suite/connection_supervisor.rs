@@ -358,6 +358,7 @@ fn build_connect_config(port: u16, known_hosts: &Path) -> SshConnectConfig {
         cols: 80,
         rows: 24,
         scrollback_lines: 10_000,
+        ..SshConnectConfig::default()
     }
 }
 
@@ -965,4 +966,217 @@ async fn clean_remote_shell_exit_marks_buffer_exited_and_stops_without_reconnect
     .expect("supervisor task must terminate cleanly without reconnecting");
     assert_eq!(srv.state.connections.load(Ordering::SeqCst), 1);
     assert_eq!(supervisor.status(), TransportStatus::Disconnected);
+}
+
+
+#[tokio::test]
+async fn initial_retryable_connection_error_auto_reconnects_and_emits_reconnected_status() {
+    use russh::keys::{Algorithm, PrivateKey};
+    use russh::{MethodKind, MethodSet, server};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tempfile::TempDir;
+    use termewnal_core::SshAuthMethod;
+    use termewnal_pty::TerminalBuffer;
+    use termewnal_ssh::{
+        BoxFuture, ConnectionSupervisor, HostKeyDecision, HostKeyPrompt,
+        KeyboardInteractiveChallenge, OsAgentConnector, SshConnectConfig, SshInteractionHandler,
+        SupervisorConfig, SupervisorEvent, TransportStatus, record_known_host_path,
+    };
+    use tokio::io::copy_bidirectional;
+    use tokio::net::TcpListener;
+    use zeroize::Zeroizing;
+
+    struct LocalSshHandler;
+    impl server::Handler for LocalSshHandler {
+        type Error = russh::Error;
+
+        async fn auth_password(
+            &mut self,
+            user: &str,
+            password: &str,
+        ) -> Result<server::Auth, Self::Error> {
+            if user == "ops" && password == "secret" {
+                Ok(server::Auth::Accept)
+            } else {
+                Ok(server::Auth::reject())
+            }
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<server::Msg>,
+            reply: server::ChannelOpenHandle,
+            _session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn pty_request(
+            &mut self,
+            channel: russh::ChannelId,
+            _term: &str,
+            _c: u32,
+            _r: u32,
+            _pw: u32,
+            _ph: u32,
+            _m: &[(russh::Pty, u32)],
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
+        async fn shell_request(
+            &mut self,
+            channel: russh::ChannelId,
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            session.data(channel, b"OK\r\n".to_vec())?;
+            Ok(())
+        }
+    }
+
+    struct LocalPassAuth;
+    impl SshInteractionHandler for LocalPassAuth {
+        fn verify_unknown_host(&self, _prompt: HostKeyPrompt) -> BoxFuture<'_, HostKeyDecision> {
+            Box::pin(async { HostKeyDecision::Reject })
+        }
+        fn prompt_key_passphrase(
+            &self,
+            _key_path: &std::path::Path,
+        ) -> BoxFuture<'_, Option<Zeroizing<String>>> {
+            Box::pin(async { None })
+        }
+        fn prompt_password(
+            &self,
+            _u: &str,
+            _h: &str,
+        ) -> BoxFuture<'_, Option<Zeroizing<String>>> {
+            Box::pin(async { Some(Zeroizing::new("secret".to_string())) })
+        }
+        fn prompt_keyboard_interactive(
+            &self,
+            _c: KeyboardInteractiveChallenge,
+        ) -> BoxFuture<'_, Option<Vec<Zeroizing<String>>>> {
+            Box::pin(async { None })
+        }
+    }
+
+    let key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519).unwrap();
+    let pubkey = key.public_key().clone();
+    let mut cfg = server::Config::default();
+    cfg.auth_rejection_time = Duration::from_millis(1);
+    cfg.methods = MethodSet::from(&[MethodKind::Password][..]);
+    cfg.keys.push(key);
+    let cfg = Arc::new(cfg);
+
+    let ssh_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ssh_addr = ssh_listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = ssh_listener.accept().await {
+            let cfg = Arc::clone(&cfg);
+            tokio::spawn(async move {
+                let _ = server::run_stream(cfg, stream, LocalSshHandler).await;
+            });
+        }
+    });
+
+    // Gate proxy rejects the initial connection so supervisor starts auto-reconnecting on attempt #1.
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let allow_connect = Arc::new(AtomicBool::new(false));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let allow_clone = Arc::clone(&allow_connect);
+    let attempts_clone = Arc::clone(&attempts);
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = proxy_listener.accept().await {
+            attempts_clone.fetch_add(1, Ordering::SeqCst);
+            if !allow_clone.load(Ordering::SeqCst) {
+                drop(inbound);
+                continue;
+            }
+            tokio::spawn(async move {
+                if let Ok(mut outbound) = tokio::net::TcpStream::connect(ssh_addr).await {
+                    let _ = copy_bidirectional(&mut inbound, &mut outbound).await;
+                }
+            });
+        }
+    });
+
+    let temp = TempDir::new().unwrap();
+    let kh = temp.path().join("known_hosts");
+    record_known_host_path("127.0.0.1", proxy_addr.port(), &pubkey, &kh).unwrap();
+
+    let mut sup_cfg = SupervisorConfig::default();
+    sup_cfg.backoff_min = Duration::from_millis(50);
+    sup_cfg.backoff_max = Duration::from_millis(100);
+    sup_cfg.keepalive_interval = Duration::from_secs(30);
+
+    let connect_cfg = SshConnectConfig {
+        host: "127.0.0.1".to_string(),
+        port: proxy_addr.port(),
+        username: "ops".to_string(),
+        auth: SshAuthMethod::Password {
+            vault_secret_ref: None,
+        },
+        known_hosts_path: Some(kh),
+        nodelay: true,
+        term_name: "xterm-256color".to_string(),
+        cols: 80,
+        rows: 24,
+        scrollback_lines: 1000,
+        ..SshConnectConfig::default()
+    };
+
+    let buffer = Arc::new(TerminalBuffer::new(80, 24, 1000));
+    let (sup, mut events_rx) = ConnectionSupervisor::connect_on_buffer_with_events(
+        connect_cfg,
+        sup_cfg,
+        buffer,
+        None,
+        Arc::new(LocalPassAuth),
+        Arc::new(OsAgentConnector::default()),
+    );
+
+    let mut saw_reconnecting_with_err = false;
+    let mut kept_error_on_connecting_retry = false;
+    let mut saw_connected = false;
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(ev) = events_rx.recv().await {
+            if let SupervisorEvent::StatusChanged(status_ev) = ev {
+                match status_ev.status {
+                    TransportStatus::Reconnecting { attempt, .. } if attempt >= 1 => {
+                        assert!(
+                            status_ev.last_error.is_some(),
+                            "Reconnecting event must carry initial connection error"
+                        );
+                        saw_reconnecting_with_err = true;
+                        allow_connect.store(true, Ordering::SeqCst);
+                    }
+                    TransportStatus::Connecting if saw_reconnecting_with_err => {
+                        if status_ev.last_error.is_some() {
+                            kept_error_on_connecting_retry = true;
+                        }
+                    }
+                    TransportStatus::Connected { .. } if saw_reconnecting_with_err => {
+                        saw_connected = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    })
+    .await
+    .expect("supervisor must recover from initial retryable failure");
+
+    assert!(saw_reconnecting_with_err);
+    assert!(kept_error_on_connecting_retry);
+    assert!(saw_connected);
+    sup.disconnect();
 }

@@ -12,7 +12,7 @@ use termewnal_core::{
     AppConfig, DEFAULT_KEEPALIVE_INTERVAL_SECS, DEFAULT_KEEPALIVE_MAX_MISSED, Profile,
     vault::SecretStore,
 };
-use termewnal_pty::TerminalBuffer;
+use termewnal_pty::{LoginScriptRunner, TerminalBuffer};
 use tokio::sync::{Notify, broadcast, mpsc, oneshot, watch};
 use tokio::time::Instant as TokioInstant;
 use tracing::{debug, warn};
@@ -21,6 +21,7 @@ use crate::TransportStatus;
 use crate::auth::{AgentConnector, BoxFuture, SshInteractionHandler};
 use crate::client::{
     SshConnectConfig, SshTransport, TcpKeepaliveSettings, await_channel_reply, ceil_secs,
+    request_channel_forwarding,
 };
 use crate::error::SshError;
 use crate::proxy_jump::{SshTransportChain, connect_transport_chain};
@@ -144,6 +145,11 @@ pub trait TransportConnector: Send + Sync {
             Ok(SshTransportChain::direct(transport))
         })
     }
+
+    /// Optional `Vault` store exposed to [`ConnectionSupervisor`] for `LoginScriptStep` secret lookup.
+    fn vault_store(&self) -> Option<&dyn SecretStore> {
+        None
+    }
 }
 
 /// Default [`TransportConnector`] supporting direct TCP and ordered multi-hop `ProxyJump`
@@ -202,6 +208,10 @@ impl TransportConnector for DefaultTransportConnector {
             )
             .await
         })
+    }
+
+    fn vault_store(&self) -> Option<&dyn SecretStore> {
+        self.vault.as_deref()
     }
 }
 
@@ -496,6 +506,7 @@ impl ConnectionSupervisor {
             buffer: Arc::clone(&buffer),
             connector,
             time_source,
+            cmd_tx: cmd_tx.clone(),
             cmd_rx,
             status_tx,
             transport_tx,
@@ -696,6 +707,7 @@ struct SupervisorActor {
     buffer: Arc<TerminalBuffer>,
     connector: Arc<dyn TransportConnector>,
     time_source: Arc<dyn TimeSource>,
+    cmd_tx: mpsc::UnboundedSender<SupervisorCmd>,
     cmd_rx: mpsc::UnboundedReceiver<SupervisorCmd>,
     status_tx: watch::Sender<TransportStatus>,
     transport_tx: watch::Sender<Option<Arc<SshTransport>>>,
@@ -716,7 +728,12 @@ impl SupervisorActor {
         let mut reconnect_attempt: u32 = 0;
 
         loop {
-            self.publish_status(TransportStatus::Connecting, None, None);
+            let retry_err = if reconnect_attempt > 0 || self.has_connected_once {
+                self.last_error.clone()
+            } else {
+                None
+            };
+            self.publish_status(TransportStatus::Connecting, None, retry_err);
 
             match self.attempt_connect_and_open_pty().await {
                 ConnectOutcome::Connected {
@@ -732,6 +749,10 @@ impl SupervisorActor {
                     self.used_interactive_auth
                         .store(chain.used_interactive_auth(), Ordering::SeqCst);
 
+                    let mut login_runner = LoginScriptRunner::compile(
+                        &self.connect_config.login_scripts,
+                        self.connector.vault_store(),
+                    );
                     let mut mux_command_sent = None;
                     if is_reconnect {
                         let divider = format_reconnected_divider(self.time_source.now().wall);
@@ -761,6 +782,10 @@ impl SupervisorActor {
                     } else if !initial_output.is_empty() {
                         self.buffer.feed_bytes(&initial_output);
                     }
+                    if !login_runner.is_finished() {
+                        let dispatches = login_runner.advance(&initial_output);
+                        schedule_supervisor_login_dispatches(&self.cmd_tx, dispatches);
+                    }
 
                     self.last_error = None;
                     self.publish_status(
@@ -769,7 +794,7 @@ impl SupervisorActor {
                         None,
                     );
 
-                    match self.monitor_connected(chain, rx, tx).await {
+                    match self.monitor_connected(chain, rx, tx, &mut login_runner).await {
                         ConnectedExit::Drop(reason) => {
                             self.last_error = Some(reason);
                             self.clear_transport();
@@ -808,23 +833,16 @@ impl SupervisorActor {
                 ConnectOutcome::RetryableError(err_msg) => {
                     self.clear_transport();
                     self.last_error = Some(err_msg.clone());
-                    if self.has_connected_once || reconnect_attempt > 0 {
-                        reconnect_attempt = reconnect_attempt.saturating_add(1).max(1);
-                        match self.wait_reconnect_backoff(reconnect_attempt).await {
-                            BackoffWaitOutcome::RetryNow => continue,
-                            BackoffWaitOutcome::CancelledToDisconnected => {
-                                if !self.park_disconnected(Some(err_msg)).await {
-                                    break;
-                                }
-                                reconnect_attempt = 1;
+                    reconnect_attempt = reconnect_attempt.saturating_add(1).max(1);
+                    match self.wait_reconnect_backoff(reconnect_attempt).await {
+                        BackoffWaitOutcome::RetryNow => continue,
+                        BackoffWaitOutcome::CancelledToDisconnected => {
+                            if !self.park_disconnected(Some(err_msg)).await {
+                                break;
                             }
-                            BackoffWaitOutcome::Shutdown => break,
+                            reconnect_attempt = 1;
                         }
-                    } else {
-                        if !self.park_disconnected(Some(err_msg)).await {
-                            break;
-                        }
-                        reconnect_attempt = 1;
+                        BackoffWaitOutcome::Shutdown => break,
                     }
                 }
                 ConnectOutcome::FatalMitm(err) => {
@@ -925,6 +943,18 @@ impl SupervisorActor {
                 return Err(err);
             }
 
+            let x11_auth = guard.chain().target().x11_auth().cloned();
+            request_channel_forwarding(
+                &tx,
+                &mut rx,
+                cfg.forward_agent,
+                x11_auth.as_ref(),
+                &mut |data| {
+                    initial_output.extend_from_slice(data);
+                },
+            )
+            .await;
+
             if let Err(err) = tx.request_shell(true).await {
                 guard.teardown().await;
                 return Err(SshError::Channel(err.to_string()));
@@ -994,6 +1024,7 @@ impl SupervisorActor {
         chain: SshTransportChain,
         mut rx: russh::ChannelReadHalf,
         tx: russh::ChannelWriteHalf<ClientMsg>,
+        login_runner: &mut LoginScriptRunner,
     ) -> ConnectedExit {
         let transport = Arc::clone(chain.target());
         let mut exit_status: Option<i32> = None;
@@ -1036,6 +1067,10 @@ impl SupervisorActor {
                     match msg {
                         Some(ChannelMsg::Data { data }) | Some(ChannelMsg::ExtendedData { data, .. }) => {
                             self.buffer.feed_bytes(&data);
+                            if !login_runner.is_finished() {
+                                let dispatches = login_runner.advance(&data);
+                                schedule_supervisor_login_dispatches(&self.cmd_tx, dispatches);
+                            }
                             if missed_probes > 0 {
                                 missed_probes = 0;
                                 self.publish_status(
@@ -1489,4 +1524,39 @@ fn is_clock_jump(
         return false;
     }
     wall_delta.saturating_sub(mono_delta) > threshold / 2
+}
+
+fn schedule_supervisor_login_dispatches(
+    cmd_tx: &mpsc::UnboundedSender<SupervisorCmd>,
+    dispatches: Vec<termewnal_pty::LoginScriptDispatch>,
+) {
+    if dispatches.is_empty() {
+        return;
+    }
+    let mut iter = dispatches.into_iter().peekable();
+    while let Some(next) = iter.peek() {
+        if !next.delay.is_zero() {
+            break;
+        }
+        let dispatch = iter.next().expect("peeked dispatch");
+        let _ = cmd_tx.send(SupervisorCmd::WriteBytes(dispatch.bytes.to_vec()));
+    }
+    let remaining: Vec<_> = iter.collect();
+    if remaining.is_empty() {
+        return;
+    }
+    let cmd_tx = cmd_tx.clone();
+    tokio::spawn(async move {
+        for dispatch in remaining {
+            if !dispatch.delay.is_zero() {
+                tokio::time::sleep(dispatch.delay).await;
+            }
+            if cmd_tx
+                .send(SupervisorCmd::WriteBytes(dispatch.bytes.to_vec()))
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
 }

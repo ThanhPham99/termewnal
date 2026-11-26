@@ -460,6 +460,10 @@ impl NormRect {
 pub struct WorkspaceTab {
     pub id: TabId,
     pub title: Option<String>,
+    pub color: Option<String>,
+    pub pinned: bool,
+    pub bell_active: bool,
+    pub progress: termewnal_pty::TerminalProgressState,
     pub root: SplitNode,
     pub focused_pane: PaneId,
     pub zoomed_pane: Option<PaneId>,
@@ -624,6 +628,10 @@ impl Workspace {
         self.tabs.push(WorkspaceTab {
             id: tab_id,
             title,
+            color: None,
+            pinned: false,
+            bell_active: false,
+            progress: termewnal_pty::TerminalProgressState::Hidden,
             root: SplitNode::Leaf {
                 pane_id,
                 session_id,
@@ -648,6 +656,10 @@ impl Workspace {
         self.tabs.push(WorkspaceTab {
             id: tab_id,
             title,
+            color: None,
+            pinned: false,
+            bell_active: false,
+            progress: termewnal_pty::TerminalProgressState::Hidden,
             root,
             focused_pane,
             zoomed_pane,
@@ -662,18 +674,130 @@ impl Workspace {
     /// Sets the active tab by 0-based tab index (clamped when non-empty).
     pub fn set_active_tab_index(&mut self, idx: usize) {
         if let Some(tab) = self.tabs.get(idx).or_else(|| self.tabs.last()) {
-            self.active_tab = Some(tab.id);
+            let tid = tab.id;
+            self.active_tab = Some(tid);
+            self.set_tab_bell(tid, false);
         }
     }
 
     /// Activates the tab identified by `tab_id`, returning `true` if it exists.
     pub fn select_tab(&mut self, tab_id: TabId) -> bool {
-        if self.tabs.iter().any(|t| t.id == tab_id) {
+        if let Some(tab) = self.tabs.iter_mut().find(|t| t.id == tab_id) {
+            tab.bell_active = false;
             self.active_tab = Some(tab_id);
             true
         } else {
             false
         }
+    }
+
+    /// Renames `tab_id` (clearing explicit override when empty).
+    pub fn rename_tab(&mut self, tab_id: TabId, title: Option<String>) -> bool {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return false;
+        };
+        tab.title = title.and_then(|s| {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        true
+    }
+
+    /// Updates custom hex accent color for `tab_id`.
+    pub fn set_tab_color(&mut self, tab_id: TabId, color: Option<String>) -> bool {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return false;
+        };
+        tab.color = color.and_then(|s| {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        true
+    }
+
+    /// Toggles pinned state of `tab_id` and returns the new value.
+    pub fn toggle_pin_tab(&mut self, tab_id: TabId) -> Option<bool> {
+        let tab = self.tab_mut(tab_id)?;
+        tab.pinned = !tab.pinned;
+        Some(tab.pinned)
+    }
+
+    /// Explicitly sets `color` and `pinned` metadata on `tab_id`.
+    pub fn set_tab_metadata(
+        &mut self,
+        tab_id: TabId,
+        color: Option<String>,
+        pinned: bool,
+    ) -> bool {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return false;
+        };
+        tab.color = color;
+        tab.pinned = pinned;
+        true
+    }
+
+    /// Updates bell activity badge for `tab_id`.
+    pub fn set_tab_bell(&mut self, tab_id: TabId, active: bool) -> bool {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return false;
+        };
+        tab.bell_active = active;
+        true
+    }
+
+    /// Updates `OSC 9;4` progress bar state for `tab_id`.
+    pub fn set_tab_progress(
+        &mut self,
+        tab_id: TabId,
+        progress: termewnal_pty::TerminalProgressState,
+    ) -> bool {
+        let Some(tab) = self.tab_mut(tab_id) else {
+            return false;
+        };
+        tab.progress = progress;
+        true
+    }
+
+    /// Closes every unpinned tab other than `keep_tab_id`, returning closed `SessionId`s.
+    pub fn close_other_tabs(&mut self, keep_tab_id: TabId) -> Vec<SessionId> {
+        if !self.contains_tab(keep_tab_id) {
+            return Vec::new();
+        }
+        let mut closed_sessions = Vec::new();
+        self.tabs.retain(|tab| {
+            if tab.id == keep_tab_id || tab.pinned {
+                true
+            } else {
+                closed_sessions.extend(tab.root.session_ids());
+                false
+            }
+        });
+        if !self.active_tab.is_some_and(|id| self.contains_tab(id)) {
+            self.active_tab = Some(keep_tab_id);
+        }
+        closed_sessions
+    }
+
+    /// Closes unpinned tabs strictly to the right of `pivot_tab_id`, returning closed `SessionId`s.
+    pub fn close_tabs_to_right(&mut self, pivot_tab_id: TabId) -> Vec<SessionId> {
+        let Some(pivot_idx) = self.tabs.iter().position(|t| t.id == pivot_tab_id) else {
+            return Vec::new();
+        };
+        let mut closed_sessions = Vec::new();
+        let mut idx = 0;
+        self.tabs.retain(|tab| {
+            let keep = idx <= pivot_idx || tab.pinned;
+            idx += 1;
+            if !keep {
+                closed_sessions.extend(tab.root.session_ids());
+            }
+            keep
+        });
+        if !self.active_tab.is_some_and(|id| self.contains_tab(id)) {
+            self.active_tab = Some(pivot_tab_id);
+        }
+        closed_sessions
     }
 
     /// Cycles active tab selection forward or backward with wrap-around.
@@ -690,7 +814,7 @@ impl Workspace {
             CycleDirection::Previous => (current_idx + self.tabs.len() - 1) % self.tabs.len(),
         };
         let next_id = self.tabs[next_idx].id;
-        self.active_tab = Some(next_id);
+        self.select_tab(next_id);
         Some(next_id)
     }
 
@@ -834,6 +958,7 @@ impl Workspace {
         self.active_tab = Some(found.0);
         if let Some(tab) = self.tab_mut(found.0) {
             tab.focused_pane = found.1;
+            tab.bell_active = false;
         }
         Some(found)
     }

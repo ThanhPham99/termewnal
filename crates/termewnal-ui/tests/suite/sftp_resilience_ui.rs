@@ -511,6 +511,7 @@ async fn boot_connected_ui(
             rows: 24,
             scrollback_lines: 10_000,
             proxy_jump: Vec::new(),
+            ..SshConnectConfig::default()
         },
     )
     .with_agent_connector(Arc::new(OsAgentConnector::default()));
@@ -851,4 +852,174 @@ async fn slice6_sftp_download_rejects_path_traversal_file_and_dir_names_with_bro
     }
 
     assert!(!temp.path().join("escape.txt").exists());
+}
+
+
+#[tokio::test]
+async fn sftp_drawer_and_plus_display_auto_reconnecting_and_reconnected_successfully_on_connection_error() {
+    use termewnal_ssh::{
+        ProfileTransportKey, RemoteListing, SftpTransportMode, TransferDirection, TransferId,
+        TransferQueueSnapshot, TransferReconnectState, TransferSnapshot, TransferStatus,
+    };
+    use termewnal_ui::{RecoveryNoticeKind, SftpConnectionState, SftpLayoutMode};
+
+    let temp = TempDir::new().unwrap();
+    let remote_root = temp.path().join("remote");
+    std::fs::create_dir_all(&remote_root).unwrap();
+    let (addr, host_pubkey, _srv_state, _shutdown_tx) =
+        spawn_ui_resilience_server(remote_root).await;
+    let (mut state, win, sid) = boot_connected_ui(&temp, addr, &host_pubkey).await;
+
+    let _ = state.update(Message::ToggleSftpDrawerForSession(sid));
+    let _ = state.update(Message::SftpRefresh);
+    let gen_drop = state.sftp_drawer().list_generation();
+
+    // Connection error triggers AutoReconnecting instead of leaving a dead browser_error.
+    let _ = state.update(Message::SftpBrowseResult {
+        session_id: sid,
+        generation: gen_drop,
+        result: Err("connection lost: unexpected EOF".to_string()),
+    });
+    assert!(state.sftp_drawer().browser_error().is_none());
+    assert!(matches!(
+        state.sftp_drawer().connection_state(),
+        SftpConnectionState::AutoReconnecting { attempt: 1, .. }
+    ));
+    let bar_reconn = state.status_bar_snapshot();
+    assert_eq!(
+        bar_reconn.sftp_notice.as_ref().unwrap().kind,
+        RecoveryNoticeKind::AutoReconnecting
+    );
+    assert!(bar_reconn.sftp_notice.as_ref().unwrap().message.contains("auto-reconnecting"));
+    let _ = state.view(win);
+    let _ = state.update(Message::SftpSetLayoutMode(SftpLayoutMode::DualHorizontal));
+    let _ = state.view(win);
+
+    // Subsequent successful listing transitions SFTP to ReconnectedSuccessfully.
+    let _ = state.update(Message::SftpRefresh);
+    let gen_ok = state.sftp_drawer().list_generation();
+    let _ = state.update(Message::SftpBrowseResult {
+        session_id: sid,
+        generation: gen_ok,
+        result: Ok(RemoteListing {
+            resolved_path: "/home/ops".to_string(),
+            entries: Vec::new(),
+            transport_mode: SftpTransportMode::IsolatedTransferTransport,
+            notice: None,
+        }),
+    });
+    assert_eq!(
+        state.sftp_drawer().connection_state(),
+        &SftpConnectionState::ReconnectedSuccessfully
+    );
+    let bar_ok = state.status_bar_snapshot();
+    assert_eq!(
+        bar_ok.sftp_notice.as_ref().unwrap().kind,
+        RecoveryNoticeKind::ReconnectedSuccessfully
+    );
+    assert!(bar_ok.sftp_notice.as_ref().unwrap().message.contains("reconnected successfully"));
+    let _ = state.view(win);
+    let _ = state.update(Message::SftpSetLayoutMode(SftpLayoutMode::SideDock));
+    let _ = state.view(win);
+
+    // Non-connection error still surfaces browser_error normally.
+    let _ = state.update(Message::SftpRefresh);
+    let gen_perm = state.sftp_drawer().list_generation();
+    let _ = state.update(Message::SftpBrowseResult {
+        session_id: sid,
+        generation: gen_perm,
+        result: Err("permission denied".to_string()),
+    });
+    assert_eq!(state.sftp_drawer().browser_error(), Some("permission denied"));
+
+    // Transfer queue auto-reconnecting and reconnected states render & project into Status Bar.
+    // Close & clear drawer reconnected banner first via a fresh mutation cycle or separate session:
+    let _ = state.update(Message::QuickConnectSsh(SshTargetSpec::quick_connect(
+        "Transfer Queue Host",
+        SshConnectConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "ops".to_string(),
+            ..SshConnectConfig::default()
+        },
+    )));
+    let sid_tx = state.active_session_id().unwrap();
+    let key = ProfileTransportKey::new(None, "127.0.0.1", addr.port(), "ops");
+    let _ = state.update(Message::ToggleSftpDrawerForSession(sid_tx));
+    let _ = state.update(Message::SshEvent {
+        session_id: sid_tx,
+        event: termewnal_ui::SshUiEvent::Connected {
+            generation: state.ssh_session(sid_tx).unwrap().ssh_generation(),
+            session: None,
+            supervisor: None,
+        },
+    });
+    let tx_item = |reconnect_state: TransferReconnectState, status: TransferStatus| TransferSnapshot {
+        id: TransferId(99),
+        profile_key: key.clone(),
+        direction: TransferDirection::Upload,
+        local_path: temp.path().join("f.bin"),
+        remote_path: "/home/ops/f.bin".to_string(),
+        file_name: "f.bin".to_string(),
+        bytes_transferred: 512,
+        total_bytes: 1024,
+        throughput_bytes_per_sec: 128,
+        status,
+        transport_mode: Some(SftpTransportMode::IsolatedTransferTransport),
+        status_notice: Some("Auto-reconnecting transfer...".to_string()),
+        reconnect_state,
+        notice: None,
+        pending_conflict: None,
+        resume_offset: 512,
+        using_part_file: true,
+    };
+
+    let _ = state.update(Message::TransferQueueUpdated(TransferQueueSnapshot {
+        transfers: vec![tx_item(
+            TransferReconnectState::AutoReconnecting {
+                attempt: 1,
+                reason: "broken pipe".to_string(),
+            },
+            TransferStatus::InProgress,
+        )],
+        active_count: 1,
+        ..TransferQueueSnapshot::default()
+    }));
+    let bar_tx_reconn = state.status_bar_snapshot();
+    assert_eq!(
+        bar_tx_reconn.sftp_notice.as_ref().unwrap().kind,
+        RecoveryNoticeKind::AutoReconnecting
+    );
+    assert!(
+        bar_tx_reconn
+            .sftp_notice
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("Transfer auto-reconnecting")
+    );
+    let _ = state.view(win);
+
+    let _ = state.update(Message::TransferQueueUpdated(TransferQueueSnapshot {
+        transfers: vec![tx_item(
+            TransferReconnectState::Reconnected,
+            TransferStatus::Completed,
+        )],
+        completed_count: 1,
+        ..TransferQueueSnapshot::default()
+    }));
+    let bar_tx_done = state.status_bar_snapshot();
+    assert_eq!(
+        bar_tx_done.sftp_notice.as_ref().unwrap().kind,
+        RecoveryNoticeKind::ReconnectedSuccessfully
+    );
+    assert!(
+        bar_tx_done
+            .sftp_notice
+            .as_ref()
+            .unwrap()
+            .message
+            .contains("Transfer reconnected successfully")
+    );
+    let _ = state.view(win);
 }

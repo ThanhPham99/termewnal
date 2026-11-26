@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{CURRENT_SCHEMA_VERSION, ConfigPaths};
 use crate::error::CoreError;
+use crate::profile::{
+    DockerRuntime, NewlineMode, SerialFlowControl, SerialInputMode, SerialOutputMode, SerialParity,
+};
 use crate::storage::{load_toml_or_default, save_toml_atomic};
 
 /// Axis along which a split container divides two child subtrees.
@@ -43,10 +46,75 @@ pub enum SessionDescriptor {
         #[serde(default)]
         auto_connect_on_startup: bool,
     },
+    /// Serial RS-232/USB `Session`.
+    Serial {
+        #[serde(default)]
+        profile_id: Option<String>,
+        port: String,
+        baud_rate: u32,
+        #[serde(default = "default_serial_data_bits")]
+        data_bits: u8,
+        #[serde(default)]
+        parity: SerialParity,
+        #[serde(default = "default_serial_stop_bits")]
+        stop_bits: u8,
+        #[serde(default)]
+        flow_control: SerialFlowControl,
+        #[serde(default)]
+        input_mode: SerialInputMode,
+        #[serde(default)]
+        output_mode: SerialOutputMode,
+        #[serde(default)]
+        newline_mode: NewlineMode,
+        #[serde(default)]
+        auto_reconnect: bool,
+        #[serde(default)]
+        title: Option<String>,
+    },
+    /// Telnet TCP `Session`.
+    Telnet {
+        #[serde(default)]
+        profile_id: Option<String>,
+        host: String,
+        #[serde(default = "default_telnet_port")]
+        port: u16,
+        #[serde(default)]
+        auto_reconnect: bool,
+        #[serde(default)]
+        title: Option<String>,
+    },
+    /// Docker / Podman container exec `Session`.
+    Docker {
+        #[serde(default)]
+        profile_id: Option<String>,
+        #[serde(default)]
+        runtime: DockerRuntime,
+        container: String,
+        #[serde(default)]
+        shell: Option<String>,
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        working_dir: Option<String>,
+        #[serde(default)]
+        title: Option<String>,
+    },
 }
 
 fn default_ssh_port() -> u16 {
     22
+}
+
+fn default_telnet_port() -> u16 {
+    23
+}
+
+fn default_serial_data_bits() -> u8 {
+    8
+}
+
+fn default_serial_stop_bits() -> u8 {
+    1
 }
 
 /// Binary split-tree node persisted for a workspace tab.
@@ -69,6 +137,12 @@ pub enum LayoutSplitNode {
 pub struct TabLayout {
     #[serde(default)]
     pub title: Option<String>,
+    /// Optional custom hex color accent for this tab.
+    #[serde(default)]
+    pub color: Option<String>,
+    /// Whether this tab is pinned (prevented from accidental close-others/close-right).
+    #[serde(default)]
+    pub pinned: bool,
     /// 0-based leaf traversal index of the focused pane inside `root`.
     #[serde(default)]
     pub focused_pane: usize,

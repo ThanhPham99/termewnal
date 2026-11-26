@@ -1,9 +1,13 @@
 use std::path::Path;
 use std::time::Duration;
 
+use termewnal_core::{HighlightRule, RgbColor};
 use termewnal_pty::{
-    CursorShape, GridSearchMatch, PtySession, PtySpawnConfig, Scroll, SelectionType, ShellSpec,
-    Side, detect_urls_in_snapshot, shell_escape_path, shell_escape_paths, url_at_cell,
+    CursorShape, DetectedLinkKind, GridSearchMatch, PtyMouseButton, PtyMouseEventKind, PtySession,
+    PtySpawnConfig, Scroll, SelectionType, ShellSpec, Side, TerminalBuffer,
+    compile_highlight_rules, compute_highlight_grid, detect_links_in_snapshot,
+    detect_urls_in_snapshot, encode_mouse_event, link_at_cell, shell_escape_path,
+    shell_escape_paths, url_at_cell,
 };
 
 fn test_pty_config(cols: u16, rows: u16, scrollback_lines: usize) -> PtySpawnConfig {
@@ -279,4 +283,110 @@ fn shell_escape_formats_plain_special_and_unicode_paths_safely() {
         ]),
         "/tmp/a.txt '/tmp/with space.txt' '/tmp/quote'\\''s'"
     );
+}
+
+#[test]
+fn link_detection_mouse_encoding_and_highlight_rules_work() {
+    let buffer = TerminalBuffer::new(80, 6, 100);
+    buffer.feed_bytes(
+        b"ERROR at crates/termewnal-ui/src/app.rs:42:10 and https://example.com/a/b\r\nfile:///tmp/out.log:9",
+    );
+    let snap = buffer.snapshot();
+
+    let links = detect_links_in_snapshot(&snap);
+    assert!(links.iter().any(|l| {
+        matches!(
+            &l.kind,
+            DetectedLinkKind::LocalFile {
+                path,
+                line: Some(42),
+                col: Some(10),
+            } if path == "crates/termewnal-ui/src/app.rs"
+        )
+    }));
+    assert!(links.iter().any(|l| {
+        matches!(
+            &l.kind,
+            DetectedLinkKind::LocalFile {
+                path,
+                line: Some(9),
+                col: None,
+            } if path == "/tmp/out.log"
+        )
+    }));
+    assert!(links.iter().any(|l| {
+        l.kind == DetectedLinkKind::WebUrl && l.target == "https://example.com/a/b"
+    }));
+    assert!(link_at_cell(&snap, 12, 0).is_some());
+
+    // Mouse event encoding (SGR 1006 & normal X10).
+    assert_eq!(
+        encode_mouse_event(
+            PtyMouseButton::Left,
+            PtyMouseEventKind::Press,
+            4,
+            2,
+            false,
+            false,
+            false,
+            true
+        ),
+        b"\x1b[<0;5;3M"
+    );
+    assert_eq!(
+        encode_mouse_event(
+            PtyMouseButton::Left,
+            PtyMouseEventKind::Release,
+            4,
+            2,
+            false,
+            false,
+            false,
+            true
+        ),
+        b"\x1b[<0;5;3m"
+    );
+    assert_eq!(
+        encode_mouse_event(
+            PtyMouseButton::WheelUp,
+            PtyMouseEventKind::Press,
+            0,
+            0,
+            false,
+            false,
+            true,
+            true
+        ),
+        b"\x1b[<80;1;1M"
+    );
+    assert_eq!(
+        encode_mouse_event(
+            PtyMouseButton::Right,
+            PtyMouseEventKind::Release,
+            1,
+            1,
+            false,
+            false,
+            false,
+            false
+        ),
+        vec![0x1b, b'[', b'M', 35, 34, 34]
+    );
+
+    // Highlight rule matching.
+    let compiled = compile_highlight_rules(&[HighlightRule {
+        id: "err".to_string(),
+        name: "Errors".to_string(),
+        pattern: "error".to_string(),
+        foreground: Some("#ff4444".to_string()),
+        background: None,
+        bold: true,
+        enabled: true,
+        case_insensitive: true,
+    }]);
+    let grid = compute_highlight_grid(&snap, &compiled);
+    let err_cell = grid[0].expect("col 0 of row 0 matched ERROR");
+    assert_eq!(err_cell.fg, Some(RgbColor::new(0xff, 0x44, 0x44)));
+    assert!(err_cell.bold);
+    assert!(grid[6].is_none());
 }

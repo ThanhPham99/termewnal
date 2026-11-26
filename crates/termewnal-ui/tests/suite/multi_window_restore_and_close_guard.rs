@@ -175,7 +175,10 @@ fn multi_window_ipc_open_window_and_open_tab_share_runtime_with_isolated_workspa
 
     // Focus w1, then dispatch IPC OpenTab -> must open tab in w1, not w2.
     let _ = state.update(Message::WindowFocused(w1));
-    let _ = state.update(Message::IpcCommand(IpcCommand::OpenTab { profile_id: None }));
+    let _ = state.update(Message::IpcCommand(IpcCommand::OpenTab {
+        profile_id: None,
+        cwd: None,
+    }));
     assert_eq!(state.window_workspace(w1).unwrap().tab_count(), 2);
     assert_eq!(state.window_workspace(w2).unwrap().tab_count(), 1);
     let s3 = state
@@ -401,6 +404,8 @@ fn restored_remote_sessions_start_disconnected_and_honor_profile_auto_connect_on
             tabs: vec![
                 TabLayout {
                     title: Some("SSH Pair".to_string()),
+                    color: None,
+                    pinned: false,
                     focused_pane: 0,
                     zoomed_pane: None,
                     root: LayoutSplitNode::Split {
@@ -431,6 +436,8 @@ fn restored_remote_sessions_start_disconnected_and_honor_profile_auto_connect_on
                 },
                 TabLayout {
                     title: Some("Ad-hoc SSH".to_string()),
+                    color: None,
+                    pinned: false,
                     focused_pane: 0,
                     zoomed_pane: None,
                     root: LayoutSplitNode::Leaf {
@@ -550,6 +557,7 @@ fn ipc_open_tab_with_ssh_profile_creates_real_ssh_session_and_honors_auto_connec
     // IPC OpenTab with auto_connect_on_startup = false creates SessionEntry::Ssh in Disconnected state.
     let _ = state.update(Message::IpcCommand(IpcCommand::OpenTab {
         profile_id: Some("ipc-ssh-manual".to_string()),
+        cwd: None,
     }));
     let manual_sid = state.active_session_id().expect("manual IPC tab session");
     assert!(state.session(manual_sid).is_none());
@@ -575,6 +583,7 @@ fn ipc_open_tab_with_ssh_profile_creates_real_ssh_session_and_honors_auto_connec
     // IPC OpenTab with auto_connect_on_startup = true starts Connecting immediately and returns task.
     let auto_task = state.update(Message::IpcCommand(IpcCommand::OpenTab {
         profile_id: Some("ipc-ssh-auto".to_string()),
+        cwd: None,
     }));
     assert!(auto_task.units() >= 2);
     let auto_sid = state.active_session_id().expect("auto IPC tab session");

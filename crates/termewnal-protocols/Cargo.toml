@@ -1,0 +1,16 @@
+[package]
+name = "termewnal-protocols"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serial2.workspace = true
+termewnal-core = { path = "../termewnal-core" }
+termewnal-pty = { path = "../termewnal-pty" }
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -66,6 +66,8 @@ fn resolves_proxy_jump_hops_from_saved_profiles_openssh_hosts_literals_and_rejec
         identity_files: vec![PathBuf::from("/ssh/id_edge")],
         proxy_jump: Vec::new(),
         forward_agent: None,
+        forward_x11: None,
+        proxy_command: None,
     };
 
     // Mixed chain: Saved Profile ("corp-bastion") + OpenSshHost ("edge-ro") + user-overridden alias + IPv6 literal.
@@ -617,6 +619,7 @@ async fn multihop_proxy_jump_chain_authenticates_per_hop_enforces_known_hosts_an
         cols: 80,
         rows: 24,
         scrollback_lines: 10_000,
+        ..SshConnectConfig::default()
     };
 
     // 1. Unknown hosts on A -> B -> C trigger per-hop TOFU prompts in chain order and persist keys.
@@ -976,6 +979,7 @@ async fn supervisor_cascade_tears_down_and_rebuilds_chain_when_bastion_drops_mid
         cols: 80,
         rows: 24,
         scrollback_lines: 10_000,
+        ..SshConnectConfig::default()
     };
 
     let mut sup_cfg = SupervisorConfig::default();
@@ -1237,6 +1241,7 @@ async fn supervisor_cascade_tears_down_healthy_outer_hop_and_rebuilds_on_interme
         cols: 80,
         rows: 24,
         scrollback_lines: 10_000,
+        ..SshConnectConfig::default()
     };
 
     let mut sup_cfg = SupervisorConfig::default();
@@ -1467,6 +1472,7 @@ async fn multihop_chain_supports_ssh_agent_and_interactive_prompt_per_hop_and_pr
         cols: 80,
         rows: 24,
         scrollback_lines: 10_000,
+        ..SshConnectConfig::default()
     };
 
     let chain = connect_transport_chain(&cfg, None, None, handler.clone(), agent)

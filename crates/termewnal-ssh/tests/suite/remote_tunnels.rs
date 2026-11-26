@@ -446,6 +446,7 @@ fn build_connect_config(addr: SocketAddr, known_hosts_path: &Path) -> SshConnect
         cols: 80,
         rows: 24,
         scrollback_lines: 1000,
+        ..SshConnectConfig::default()
     }
 }
 

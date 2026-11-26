@@ -10,5 +10,9 @@ mod themes_and_ergonomics_config;
 mod transfer_config;
 #[path = "suite/tunnel_rules.rs"]
 mod tunnel_rules;
+#[path = "suite/v2_collections_and_keybindings.rs"]
+mod v2_collections_and_keybindings;
+#[path = "suite/v2_config_sync.rs"]
+mod v2_config_sync;
 #[path = "suite/vault_and_hot_reload.rs"]
 mod vault_and_hot_reload;

@@ -31,6 +31,7 @@ fn secondary_launch_forwards_open_window_and_open_tab_to_primary_over_local_ipc(
         &paths,
         IpcCommand::OpenTab {
             profile_id: Some("prod-bastion".to_string()),
+            cwd: None,
         },
     )
     .expect("third launch forwards OpenTab")
@@ -61,6 +62,7 @@ fn secondary_launch_forwards_open_window_and_open_tab_to_primary_over_local_ipc(
         received.1,
         IpcCommand::OpenTab {
             profile_id: Some("prod-bastion".to_string()),
+            cwd: None,
         }
     );
 
@@ -95,8 +97,14 @@ fn primary_probes_and_reclaims_stale_socket_without_clobbering_live_primary() {
     let mut rx = primary.take_receiver().expect("receiver available");
 
     // While primary is live, a new launch must forward instead of reclaiming the live socket.
-    match acquire_or_forward(&paths, IpcCommand::OpenTab { profile_id: None })
-        .expect("live primary receives forwarded OpenTab")
+    match acquire_or_forward(
+        &paths,
+        IpcCommand::OpenTab {
+            profile_id: None,
+            cwd: None,
+        },
+    )
+    .expect("live primary receives forwarded OpenTab")
     {
         LaunchOutcome::SecondaryForwarded => {}
         LaunchOutcome::Primary(_) => panic!("must not clobber live primary socket"),
@@ -112,7 +120,13 @@ fn primary_probes_and_reclaims_stale_socket_without_clobbering_live_primary() {
         })
         .expect("receive OpenTab")
         .expect("channel open");
-    assert_eq!(cmd, IpcCommand::OpenTab { profile_id: None });
+    assert_eq!(
+        cmd,
+        IpcCommand::OpenTab {
+            profile_id: None,
+            cwd: None,
+        }
+    );
 
     drop(primary);
 

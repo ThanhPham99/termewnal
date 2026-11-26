@@ -1,18 +1,21 @@
 use std::sync::Arc;
 
 use iced::keyboard::{Key, Modifiers};
-use iced::{Theme, window};
+use iced::{Size, Theme, window};
 use tempfile::TempDir;
 use termewnal_core::{
     AppConfig, BuiltinTheme, ConfigPaths, CursorStyle, Profile, ProfileTarget, SecretStore,
-    SshAuthMethod, TransferConflictPolicy, TunnelDirection, TunnelRule, VaultBackend, VaultConfig,
-    load_config, load_profiles, save_config, save_profiles,
+    SshAuthMethod, SshProxyConfig, SshProxyKind, TransferConflictPolicy, TunnelDirection,
+    TunnelRule, VaultBackend, VaultConfig, load_config, load_profiles, save_config, save_profiles,
     vault::{EncryptedVault, InMemorySecretStore, VaultSession},
 };
-use termewnal_ui::command_palette::PaletteAction;
+use termewnal_ssh::{ServerStatsSnapshot, TransportStatus};
+use termewnal_ui::command_palette::{PaletteAction, QuickConnectTarget};
+use termewnal_ui::server_stats_bar::{format_net_speed, format_stat_percent};
 use termewnal_ui::status_bar::StatusBarAction;
 use termewnal_ui::{
-    AppState, Message, ProfileAuthChoice, ProfileKindChoice, SettingsTab, shortcut_for_key_event,
+    AppState, Message, ProfileAuthChoice, ProfileKindChoice, SettingsTab, SshConnectionMode,
+    shortcut_for_key_event,
 };
 
 #[test]
@@ -345,6 +348,15 @@ fn profile_manager_creates_edits_deletes_and_isolates_vault_secrets() {
     assert_eq!(load_profiles(&paths).unwrap().profiles.len(), 2);
 
     let _ = state.update(Message::OpenEditProfileModal(created_id.clone()));
+    assert!(state.profile_editor().existing_secret_ref.is_some());
+    assert!(!state.profile_editor().jump_panel_open);
+    drop(state.view(win));
+    let _ = state.update(Message::ProfileFormToggleJumpPanel);
+    assert!(state.profile_editor().jump_panel_open);
+    drop(state.view(win));
+    let _ = state.update(Message::ProfileFormForgetSecret);
+    assert!(state.profile_editor().existing_secret_ref.is_none());
+    drop(state.view(win));
     let _ = state.update(Message::ProfileDelete(created_id));
     let after_delete = load_profiles(&paths).unwrap();
     assert_eq!(after_delete.profiles.len(), 1);
@@ -443,4 +455,427 @@ fn modal_focus_isolation_and_multi_theme_and_welcome_views_render_cleanly() {
     let _ = state.update(Message::CloseTab(tab_id));
     assert!(state.active_tab_id().is_none());
     drop(state.view(win));
+}
+
+#[test]
+fn responsive_apple_hig_layout_renders_across_all_viewport_tiers() {
+    use iced::{Color, Size};
+    use termewnal_core::{TabBarPosition, ThemePalette};
+    use termewnal_ui::ui_theme::{ChromePalette, ViewportTier, modal_body_height, modal_width};
+    use termewnal_ui::v2_modals::ProtocolLauncherTab;
+
+    // 1. Viewport tier breakpoints.
+    assert_eq!(ViewportTier::from_width(720.0), ViewportTier::Compact);
+    assert_eq!(ViewportTier::from_width(859.9), ViewportTier::Compact);
+    assert_eq!(ViewportTier::from_width(860.0), ViewportTier::Medium);
+    assert_eq!(ViewportTier::from_width(1179.0), ViewportTier::Medium);
+    assert_eq!(ViewportTier::from_width(1180.0), ViewportTier::Wide);
+
+    // 2. Modal clamping bounds for wide, medium, compact, and extreme narrow windows.
+    assert!((modal_width(760.0, 1440.0) - 760.0).abs() < f32::EPSILON);
+    assert!((modal_width(760.0, 720.0) - 680.0).abs() < f32::EPSILON);
+    assert!((modal_width(760.0, 500.0) - 480.0).abs() < f32::EPSILON);
+    assert!((modal_width(760.0, 240.0) - 260.0).abs() < f32::EPSILON);
+    assert!((modal_body_height(460.0, 800.0, 240.0) - 460.0).abs() < f32::EPSILON);
+    assert!((modal_body_height(460.0, 480.0, 240.0) - 240.0).abs() < f32::EPSILON);
+    assert!((modal_body_height(460.0, 320.0, 240.0) - 140.0).abs() < f32::EPSILON);
+
+    // 3. Tabby Default Dark & Default Light tokens (`Follow the color scheme`).
+    let dark_chrome = ChromePalette::from_palette(&ThemePalette::for_name(BuiltinTheme::Dark.name()));
+    assert!(!dark_chrome.is_light);
+    assert_eq!(dark_chrome.term_bg, Color::from_rgb8(0x17, 0x17, 0x17));
+    assert_eq!(dark_chrome.accent, Color::from_rgb8(0x5d, 0xa9, 0xf6));
+
+    let light_chrome =
+        ChromePalette::from_palette(&ThemePalette::for_name(BuiltinTheme::Light.name()));
+    assert!(light_chrome.is_light);
+    assert_eq!(light_chrome.term_bg, Color::from_rgb8(0xf8, 0xf9, 0xfa));
+    assert_eq!(light_chrome.accent, Color::from_rgb8(0x42, 0x71, 0xae));
+
+    // 4. Full UI view rendering across Wide, Medium, and Compact (Quake-like) dimensions.
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut state = super::common::boot_test_app(paths).expect("boot AppState");
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    // Profile sidebar is always visible and non-toggleable; bottom status bar starts hidden.
+    assert!(state.sidebar().is_open());
+    assert!(!state.config().terminal.show_status_bar);
+    assert!(!state.config().terminal.hide_tab_index);
+    assert!(!state.config().terminal.flex_tabs);
+
+    // Exercise Tabby window/chrome toggles in Settings & live state.
+    let _ = state.update(Message::OpenSettingsModal);
+    let _ = state.update(Message::SettingsShowProfileSidebarToggled(false));
+    let _ = state.update(Message::SettingsShowStatusBarToggled(true));
+    let _ = state.update(Message::SettingsHideTabIndexToggled(true));
+    let _ = state.update(Message::SettingsFlexTabsToggled(true));
+    assert!(state.sidebar().is_open());
+    assert!(state.config().terminal.show_status_bar);
+    assert!(state.config().terminal.hide_tab_index);
+    assert!(state.config().terminal.flex_tabs);
+    let _ = state.update(Message::SettingsSave);
+
+    // Sidebar remains open regardless of SetSidebarOpen/ToggleSidebar alongside SFTP Drawer.
+    let _ = state.update(Message::SetSidebarOpen(false));
+    assert!(state.sidebar().is_open());
+    let _ = state.update(Message::ToggleSftpDrawer);
+
+    let viewports = [
+        Size::new(1440.0, 900.0), // Wide
+        Size::new(980.0, 700.0),  // Medium
+        Size::new(720.0, 480.0),  // Compact / Quake
+        Size::new(520.0, 420.0),  // Very narrow
+    ];
+
+    for size in viewports {
+        let _ = state.update(Message::WindowResized(win, size));
+        let _ = state.update(Message::SettingsTabBarPositionSelected(TabBarPosition::Top));
+        drop(state.view(win));
+
+        let _ = state.update(Message::SettingsTabBarPositionSelected(TabBarPosition::Left));
+        drop(state.view(win));
+
+        // Exercise Settings sheet across representative tabs at each size.
+        let _ = state.update(Message::OpenSettingsModal);
+        for tab in [
+            SettingsTab::Appearance,
+            SettingsTab::Terminal,
+            SettingsTab::Keybindings,
+            SettingsTab::Vault,
+            SettingsTab::Sync,
+        ] {
+            let _ = state.update(Message::SettingsSelectTab(tab));
+            drop(state.view(win));
+        }
+        let _ = state.update(Message::EscapePressed);
+
+        // Exercise Profile Editor across all protocol kinds & SSH tabs, Tunnel Create, Command Palette,
+        // Quick Commands, Workspaces, and Protocol Launcher.
+        let _ = state.update(Message::OpenNewProfileModal);
+        for ptab in [
+            termewnal_ui::ProfileEditorTab::General,
+            termewnal_ui::ProfileEditorTab::Ports,
+            termewnal_ui::ProfileEditorTab::Advanced,
+            termewnal_ui::ProfileEditorTab::LoginScripts,
+        ] {
+            let _ = state.update(Message::ProfileFormTabSelected(ptab));
+            drop(state.view(win));
+        }
+        for kind in [
+            ProfileKindChoice::Ssh,
+            ProfileKindChoice::LocalShell,
+            ProfileKindChoice::Serial,
+            ProfileKindChoice::Telnet,
+            ProfileKindChoice::Docker,
+        ] {
+            let _ = state.update(Message::ProfileFormKindChanged(kind));
+            drop(state.view(win));
+        }
+        let _ = state.update(Message::EscapePressed);
+
+        let _ = state.update(Message::OpenTunnelCreateModal);
+        drop(state.view(win));
+        let _ = state.update(Message::EscapePressed);
+
+        let _ = state.update(Message::OpenQuickConnectPalette);
+        drop(state.view(win));
+        let _ = state.update(Message::EscapePressed);
+
+        let _ = state.update(Message::OpenQuickCommandsModal);
+        drop(state.view(win));
+        let _ = state.update(Message::EscapePressed);
+
+        let _ = state.update(Message::OpenWorkspacesModal);
+        drop(state.view(win));
+        let _ = state.update(Message::EscapePressed);
+
+        for ptab in [
+            ProtocolLauncherTab::Containers,
+            ProtocolLauncherTab::Serial,
+            ProtocolLauncherTab::Telnet,
+        ] {
+            let _ = state.update(Message::OpenProtocolLauncherModal(ptab));
+            drop(state.view(win));
+            let _ = state.update(Message::EscapePressed);
+        }
+    }
+
+    // Close active tab and render Empty Welcome Launcher at Compact size too.
+    if let Some(tab_id) = state.active_tab_id() {
+        let _ = state.update(Message::CloseTab(tab_id));
+    }
+    let _ = state.update(Message::WindowResized(win, Size::new(720.0, 480.0)));
+    drop(state.view(win));
+}
+
+#[test]
+fn integrated_tabby_system_bar_borderless_window_controls_render_cleanly() {
+    let win_settings = termewnal_ui::window_chrome::main_window_settings(1280, 800);
+    assert!(!win_settings.decorations);
+    assert!(!win_settings.exit_on_close_request);
+    assert!(win_settings.icon.is_some());
+    assert!(termewnal_ui::window_chrome::app_window_icon().is_some());
+
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut state = super::common::boot_test_app(paths).expect("boot AppState");
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    // Render across all TabBarPosition orientations (integrated Top System Bar vs docked Title Bar + Tab Strip).
+    for pos in [
+        termewnal_core::TabBarPosition::Top,
+        termewnal_core::TabBarPosition::Bottom,
+        termewnal_core::TabBarPosition::Left,
+        termewnal_core::TabBarPosition::Right,
+    ] {
+        let _ = state.update(Message::SettingsTabBarPositionSelected(pos));
+        drop(state.view(win));
+    }
+
+    // Exercise custom client-side System Bar window controls (Settings, Minimize, Maximize/Restore, Drag, Edge Resize).
+    let _ = state.update(Message::OpenSettingsModal);
+    assert!(state.settings_ui().is_open());
+    drop(state.view(win));
+    let _ = state.update(Message::EscapePressed);
+
+    let _ = state.update(Message::WindowToggleMaximize(win));
+    drop(state.view(win));
+    let _ = state.update(Message::WindowToggleMaximize(win));
+    drop(state.view(win));
+
+    let _ = state.update(Message::WindowDragStart(win));
+    let _ = state.update(Message::WindowMinimize(win));
+    let _ = state.update(Message::WindowShowSystemMenu(win));
+    let _ = state.update(Message::WindowEdgeResize(
+        win,
+        window::Direction::SouthEast,
+    ));
+}
+
+#[test]
+fn server_stats_bar_formats_renders_and_toggles_cleanly() {
+    assert_eq!(format_stat_percent(None), "--%");
+    assert_eq!(format_stat_percent(Some(18.4)), "18%");
+    assert_eq!(format_net_speed(None), "--");
+    assert_eq!(format_net_speed(Some(512)), "512 B/s");
+    assert_eq!(format_net_speed(Some(423_936)), "414 K/s");
+    assert_eq!(format_net_speed(Some(13_107_200)), "12.5 M/s");
+
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut state = super::common::boot_test_app(paths).expect("boot AppState");
+    assert!(state.config().terminal.show_server_stats);
+
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    let _ = state.update(Message::QuickConnect(QuickConnectTarget {
+        host: "10.0.0.10".to_string(),
+        port: 22,
+        username: "root".to_string(),
+    }));
+    let sid = state.active_session_id().expect("ssh session active");
+    let _ = state.update(Message::SetSessionTransportStatus {
+        session_id: sid,
+        status: TransportStatus::Connected {
+            latency_ms: Some(12),
+        },
+    });
+    // Render before first stats sample (--% placeholder).
+    drop(state.view(win));
+
+    let generation = state.ssh_session(sid).unwrap().ssh_generation();
+    let stats = ServerStatsSnapshot {
+        cpu_percent: Some(18.0),
+        ram_percent: Some(58.0),
+        ram_used_kb: Some(580_000),
+        ram_total_kb: Some(1_000_000),
+        disk_percent: Some(74.0),
+        disk_used_kb: Some(74_000_000),
+        disk_total_kb: Some(100_000_000),
+        net_rx_bytes_per_sec: Some(423_936),
+        net_tx_bytes_per_sec: Some(305_152),
+    };
+    let _ = state.update(Message::ServerStatsUpdated {
+        session_id: sid,
+        generation,
+        stats: stats.clone(),
+    });
+    assert_eq!(state.ssh_session(sid).unwrap().server_stats(), Some(&stats));
+
+    for (w, h) in [(1280.0, 800.0), (960.0, 640.0), (640.0, 480.0)] {
+        let _ = state.update(Message::WindowResized(win, Size::new(w, h)));
+        drop(state.view(win));
+    }
+
+    let _ = state.update(Message::SettingsShowServerStatsToggled(false));
+    assert!(!state.config().terminal.show_server_stats);
+    drop(state.view(win));
+
+    let _ = state.update(Message::SettingsShowServerStatsToggled(true));
+    assert!(state.config().terminal.show_server_stats);
+    drop(state.view(win));
+
+    let _ = state.update(Message::ServerStatsUnavailable {
+        session_id: sid,
+        generation,
+    });
+    assert!(state.ssh_session(sid).unwrap().server_stats().is_none());
+    drop(state.view(win));
+}
+
+#[test]
+fn ssh_connection_mode_dropdown_and_proxy_settings_persist_with_vault_isolation() {
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut cfg = AppConfig::default();
+    #[cfg(unix)]
+    if std::path::Path::new("/bin/sh").exists() {
+        cfg.terminal.shell = Some("/bin/sh".to_string());
+    }
+    cfg.vault = VaultConfig {
+        backend: VaultBackend::EncryptedFile,
+        auto_lock_minutes: 30,
+    };
+    save_config(&paths, &cfg).expect("save EncryptedFile config");
+
+    let vault = Arc::new(VaultSession::new(
+        cfg.vault.clone(),
+        Arc::new(InMemorySecretStore::new()),
+        EncryptedVault::open(paths.vault_file()),
+    ));
+    let mut state = AppState::boot_with_paths_and_vault(paths.clone(), vault).expect("boot app");
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+    let _ = state.update(Message::VaultInitializeSubmitted(
+        "vault-master-pw".to_string(),
+    ));
+
+    let _ = state.update(Message::OpenNewProfileModal);
+    assert_eq!(state.profile_editor().connection_mode, SshConnectionMode::Direct);
+    assert!(!state.profile_editor().connection_menu_open);
+
+    // Open and close the 5-option Connection popover cleanly across viewport tiers.
+    let _ = state.update(Message::ProfileFormToggleConnectionMenu);
+    assert!(state.profile_editor().connection_menu_open);
+    drop(state.view(win));
+    let _ = state.update(Message::ProfileFormCloseConnectionMenu);
+    assert!(!state.profile_editor().connection_menu_open);
+
+    let _ = state.update(Message::ProfileFormNameChanged("Bastion App".to_string()));
+    let _ = state.update(Message::ProfileFormHostChanged("10.0.0.10".to_string()));
+    let _ = state.update(Message::ProfileFormUsernameChanged("deploy".to_string()));
+
+    // Render all connection modes (wide & compact).
+    for mode in SshConnectionMode::ALL {
+        let _ = state.update(Message::ProfileFormConnectionModeSelected(mode));
+        assert_eq!(state.profile_editor().connection_mode, mode);
+        assert!(!state.profile_editor().connection_menu_open);
+        for (w, h) in [(1280.0, 800.0), (540.0, 480.0)] {
+            let _ = state.update(Message::WindowResized(win, Size::new(w, h)));
+            drop(state.view(win));
+        }
+    }
+    let _ = state.update(Message::WindowResized(win, Size::new(1280.0, 800.0)));
+
+    // Empty Proxy command validates cleanly.
+    let _ = state.update(Message::ProfileFormConnectionModeSelected(
+        SshConnectionMode::ProxyCommand,
+    ));
+    let _ = state.update(Message::ProfileSave);
+    assert!(state.profile_editor().validation_error.is_some());
+
+    // Select SOCKS proxy, validate required host, then persist with Vault-stored proxy password.
+    let _ = state.update(Message::ProfileFormConnectionModeSelected(
+        SshConnectionMode::SocksProxy,
+    ));
+    let _ = state.update(Message::ProfileSave);
+    assert!(state.profile_editor().validation_error.is_some());
+
+    let _ = state.update(Message::ProfileFormProxyHostChanged("127.0.0.1".to_string()));
+    let _ = state.update(Message::ProfileFormProxyPortChanged("1080".to_string()));
+    let _ = state.update(Message::ProfileFormProxyUsernameChanged("socks-user".to_string()));
+    let _ = state.update(Message::ProfileFormProxySecretChanged(
+        "socks-proxy-secret".to_string(),
+    ));
+    let _ = state.update(Message::ProfileSave);
+    assert!(!state.profile_editor().is_open());
+
+    let profiles_raw = std::fs::read_to_string(paths.profiles_file()).unwrap();
+    assert!(
+        !profiles_raw.contains("socks-proxy-secret"),
+        "profiles.toml must never store plaintext proxy secrets"
+    );
+
+    let saved = load_profiles(&paths).unwrap();
+    let prof_id = saved.profiles[0].id.clone();
+    let secret_ref = match &saved.profiles[0].target {
+        ProfileTarget::Ssh {
+            proxy: Some(SshProxyConfig {
+                kind,
+                host,
+                port,
+                username,
+                vault_secret_ref,
+            }),
+            proxy_command,
+            proxy_jump,
+            ..
+        } => {
+            assert_eq!(*kind, SshProxyKind::Socks5);
+            assert_eq!(host, "127.0.0.1");
+            assert_eq!(*port, 1080);
+            assert_eq!(username.as_deref(), Some("socks-user"));
+            assert!(proxy_command.is_none());
+            assert!(proxy_jump.is_empty());
+            vault_secret_ref.clone().expect("proxy vault_secret_ref stored")
+        }
+        other => panic!("expected SSH SOCKS proxy target, got {other:?}"),
+    };
+    assert_eq!(
+        state
+            .vault()
+            .get_secret(&secret_ref)
+            .unwrap()
+            .as_deref()
+            .map(String::as_str),
+        Some("socks-proxy-secret")
+    );
+
+    // Re-open Edit modal -> restores SOCKS proxy mode + Vault indicator, then switch to HTTP proxy.
+    let _ = state.update(Message::OpenEditProfileModal(prof_id.clone()));
+    assert_eq!(
+        state.profile_editor().connection_mode,
+        SshConnectionMode::SocksProxy
+    );
+    assert!(state.profile_editor().socks_proxy.existing_secret_ref.is_some());
+    let _ = state.update(Message::ProfileFormForgetProxySecret);
+    assert!(state.profile_editor().socks_proxy.existing_secret_ref.is_none());
+
+    let _ = state.update(Message::ProfileFormConnectionModeSelected(
+        SshConnectionMode::HttpProxy,
+    ));
+    assert_eq!(state.profile_editor().http_proxy.port, "8080");
+    let _ = state.update(Message::ProfileFormProxyHostChanged(
+        "proxy.corp.local".to_string(),
+    ));
+    let _ = state.update(Message::ProfileFormProxyPortChanged("3128".to_string()));
+    let _ = state.update(Message::ProfileSave);
+
+    let reloaded = load_profiles(&paths).unwrap();
+    match &reloaded.profiles[0].target {
+        ProfileTarget::Ssh {
+            proxy: Some(proxy),
+            ..
+        } => {
+            assert_eq!(proxy.kind, SshProxyKind::HttpConnect);
+            assert_eq!(proxy.host, "proxy.corp.local");
+            assert_eq!(proxy.port, 3128);
+            assert!(proxy.vault_secret_ref.is_none());
+        }
+        other => panic!("expected HTTP CONNECT proxy target, got {other:?}"),
+    }
 }

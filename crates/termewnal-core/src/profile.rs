@@ -9,11 +9,13 @@ use crate::config::{AppConfig, CURRENT_SCHEMA_VERSION, ConfigPaths};
 use crate::error::CoreError;
 use crate::storage::{load_toml_or_default, save_toml_atomic};
 
-/// Top-level `profiles.toml` document holding saved `Profile` entries.
+/// Top-level `profiles.toml` document holding saved `Profile` entries and explicit group names.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProfilesConfig {
     pub schema_version: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
     pub profiles: Vec<Profile>,
 }
 
@@ -21,8 +23,151 @@ impl Default for ProfilesConfig {
     fn default() -> Self {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
+            groups: Vec::new(),
             profiles: Vec::new(),
         }
+    }
+}
+
+impl ProfilesConfig {
+    /// Returns deduplicated, sorted non-empty group names from explicit `groups` and profile memberships.
+    pub fn all_groups(&self) -> Vec<String> {
+        let mut by_key: std::collections::BTreeMap<String, String> =
+            std::collections::BTreeMap::new();
+        for group in &self.groups {
+            if let Some(clean) = normalize_group_label(group) {
+                by_key.entry(clean.to_ascii_lowercase()).or_insert(clean);
+            }
+        }
+        for profile in &self.profiles {
+            if let Some(group) = profile.group.as_deref().and_then(normalize_group_label) {
+                by_key.entry(group.to_ascii_lowercase()).or_insert(group);
+            }
+        }
+        by_key.into_values().collect()
+    }
+
+    /// Registers a new explicit group name, returning `true` if added.
+    pub fn add_group(&mut self, name: &str) -> bool {
+        let Some(clean) = normalize_group_label(name) else {
+            return false;
+        };
+        let key = clean.to_ascii_lowercase();
+        let exists = self
+            .all_groups()
+            .into_iter()
+            .any(|g| g.to_ascii_lowercase() == key);
+        if exists {
+            return false;
+        }
+        self.groups.push(clean);
+        true
+    }
+
+    /// Renames an existing group and updates matching profiles, returning `true` if anything changed.
+    pub fn rename_group(&mut self, old_name: &str, new_name: &str) -> bool {
+        let Some(old_clean) = normalize_group_label(old_name) else {
+            return false;
+        };
+        let Some(new_clean) = normalize_group_label(new_name) else {
+            return false;
+        };
+        let old_key = old_clean.to_ascii_lowercase();
+        let new_key = new_clean.to_ascii_lowercase();
+        if old_key != new_key
+            && self
+                .all_groups()
+                .into_iter()
+                .any(|g| g.to_ascii_lowercase() == new_key)
+        {
+            return false;
+        }
+
+        let mut changed = false;
+        for group in &mut self.groups {
+            if group.trim().eq_ignore_ascii_case(&old_clean) {
+                if *group != new_clean {
+                    *group = new_clean.clone();
+                    changed = true;
+                }
+            }
+        }
+        for profile in &mut self.profiles {
+            if profile
+                .group
+                .as_deref()
+                .and_then(normalize_group_label)
+                .is_some_and(|g| g.eq_ignore_ascii_case(&old_clean))
+            {
+                if profile.group.as_deref() != Some(new_clean.as_str()) {
+                    profile.group = Some(new_clean.clone());
+                    changed = true;
+                }
+            }
+        }
+        if !self
+            .groups
+            .iter()
+            .any(|g| g.trim().eq_ignore_ascii_case(&new_clean))
+            && (changed || self.profiles.iter().any(|p| p.group.as_deref() == Some(new_clean.as_str())))
+        {
+            self.groups.push(new_clean);
+            changed = true;
+        }
+        changed
+    }
+
+    /// Removes `group_name` and moves its profiles to Ungrouped (`group = None`).
+    pub fn delete_group(&mut self, group_name: &str) -> bool {
+        let Some(clean) = normalize_group_label(group_name) else {
+            return false;
+        };
+        let prev_len = self.groups.len();
+        self.groups
+            .retain(|g| !g.trim().eq_ignore_ascii_case(&clean));
+        let mut changed = self.groups.len() != prev_len;
+        for profile in &mut self.profiles {
+            if profile
+                .group
+                .as_deref()
+                .and_then(normalize_group_label)
+                .is_some_and(|g| g.eq_ignore_ascii_case(&clean))
+            {
+                profile.group = None;
+                changed = true;
+            }
+        }
+        changed
+    }
+
+    /// Reassigns `profile_id` to `group` (`None` = Ungrouped), returning `true` on change.
+    pub fn move_profile_to_group(&mut self, profile_id: &str, group: Option<&str>) -> bool {
+        let next_group = group.and_then(normalize_group_label);
+        let Some(profile) = self.profiles.iter_mut().find(|p| p.id == profile_id) else {
+            return false;
+        };
+        if profile.group == next_group {
+            return false;
+        }
+        profile.group = next_group.clone();
+        if let Some(group_name) = next_group
+            && !self
+                .groups
+                .iter()
+                .any(|g| g.trim().eq_ignore_ascii_case(&group_name))
+        {
+            self.groups.push(group_name);
+        }
+        true
+    }
+}
+
+fn normalize_group_label(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("Ungrouped") {
+        None
+    } else {
+        Some(trimmed.to_string())
     }
 }
 
@@ -79,12 +224,79 @@ impl Profile {
                 username: username.into(),
                 auth,
                 proxy_jump: Vec::new(),
+                proxy_command: None,
+                proxy: None,
+                forward_agent: false,
+                forward_x11: false,
+                login_scripts: Vec::new(),
                 auto_connect_on_startup: false,
                 tmux_reattach: None,
                 keepalive_interval_secs: None,
                 keepalive_max_missed: None,
                 auto_attach_mux: false,
                 mux_attach_command: None,
+            },
+            tunnels: Vec::new(),
+        }
+    }
+
+    /// Creates a new Serial RS-232/USB `Profile` with sensible 115200 8N1 defaults.
+    pub fn serial(name: impl Into<String>, port: impl Into<String>, baud_rate: u32) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            group: None,
+            tags: Vec::new(),
+            target: ProfileTarget::Serial {
+                port: port.into(),
+                baud_rate,
+                data_bits: 8,
+                parity: SerialParity::None,
+                stop_bits: 1,
+                flow_control: SerialFlowControl::None,
+                input_mode: SerialInputMode::Text,
+                output_mode: SerialOutputMode::Text,
+                newline_mode: NewlineMode::Cr,
+                auto_reconnect: true,
+            },
+            tunnels: Vec::new(),
+        }
+    }
+
+    /// Creates a new Telnet `Profile`.
+    pub fn telnet(name: impl Into<String>, host: impl Into<String>, port: u16) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            group: None,
+            tags: Vec::new(),
+            target: ProfileTarget::Telnet {
+                host: host.into(),
+                port,
+                auto_reconnect: false,
+                login_scripts: Vec::new(),
+            },
+            tunnels: Vec::new(),
+        }
+    }
+
+    /// Creates a new Docker/Podman container exec `Profile`.
+    pub fn docker(
+        name: impl Into<String>,
+        runtime: DockerRuntime,
+        container: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: Uuid::new_v4().to_string(),
+            name: name.into(),
+            group: None,
+            tags: Vec::new(),
+            target: ProfileTarget::Docker {
+                runtime,
+                container: container.into(),
+                shell: None,
+                user: None,
+                working_dir: None,
             },
             tunnels: Vec::new(),
         }
@@ -97,7 +309,7 @@ impl Profile {
                 auto_connect_on_startup,
                 ..
             } => *auto_connect_on_startup,
-            ProfileTarget::LocalShell { .. } => false,
+            _ => false,
         }
     }
 
@@ -127,7 +339,7 @@ impl Profile {
                 auto_attach_mux: *auto_attach_mux,
                 mux_attach_command: mux_attach_command.clone(),
             }),
-            ProfileTarget::LocalShell { .. } => None,
+            _ => None,
         }
     }
 
@@ -186,9 +398,7 @@ impl Profile {
                 keepalive_interval_secs.unwrap_or(global.keepalive_interval_secs),
                 keepalive_max_missed.unwrap_or(global.keepalive_max_missed),
             ),
-            ProfileTarget::LocalShell { .. } => {
-                (global.keepalive_interval_secs, global.keepalive_max_missed)
-            }
+            _ => (global.keepalive_interval_secs, global.keepalive_max_missed),
         }
     }
 
@@ -252,6 +462,117 @@ pub struct SshProfileConfig {
     pub mux_attach_command: Option<String>,
 }
 
+/// Ordered expect/send automation step executed after connecting an SSH, Telnet, or Serial `Session`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LoginScriptStep {
+    /// Substring or regex expected in incoming stream output before sending (empty sends immediately).
+    pub expect: String,
+    /// Text to send when matched (unused if `secret_ref` resolves a secret from `Vault`).
+    pub send: String,
+    /// Interpret `expect` as a regular expression instead of a literal substring.
+    pub is_regex: bool,
+    /// Append `\r` after `send` payload.
+    #[serde(default = "default_script_newline")]
+    pub append_newline: bool,
+    /// Optional delay in milliseconds after matching before writing `send`.
+    pub delay_ms: u64,
+    /// Optional `Vault` secret reference substituted instead of plaintext `send`.
+    pub secret_ref: Option<String>,
+}
+
+fn default_script_newline() -> bool {
+    true
+}
+
+/// Serial port parity check setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialParity {
+    #[default]
+    None,
+    Odd,
+    Even,
+}
+
+/// Serial port flow control mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialFlowControl {
+    #[default]
+    None,
+    Software,
+    Hardware,
+}
+
+/// Serial terminal user input mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialInputMode {
+    #[default]
+    Text,
+    Readline,
+    HexBytes,
+}
+
+/// Serial terminal incoming byte rendering mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SerialOutputMode {
+    #[default]
+    Text,
+    Hexdump,
+}
+
+/// Line ending conversion mode for Serial and interactive byte streams.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NewlineMode {
+    #[default]
+    Cr,
+    Lf,
+    CrLf,
+    Keep,
+}
+
+/// Supported container engine runtime for `ProfileTarget::Docker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DockerRuntime {
+    #[default]
+    Docker,
+    Podman,
+}
+
+/// Upstream network proxy protocol used when dialing an SSH target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SshProxyKind {
+    #[default]
+    Socks5,
+    HttpConnect,
+}
+
+fn default_proxy_port() -> u16 {
+    1080
+}
+
+/// Outbound SOCKS5 or HTTP `CONNECT` proxy server configuration for an SSH endpoint.
+///
+/// Proxy credentials are never stored in plaintext TOML; `vault_secret_ref` references `Vault`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SshProxyConfig {
+    pub kind: SshProxyKind,
+    pub host: String,
+    #[serde(default = "default_proxy_port")]
+    pub port: u16,
+    #[serde(default)]
+    pub username: Option<String>,
+    #[serde(default)]
+    pub vault_secret_ref: Option<String>,
+}
+
 /// Connection target for a `Profile`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -276,6 +597,16 @@ pub enum ProfileTarget {
         #[serde(default)]
         proxy_jump: Vec<String>,
         #[serde(default)]
+        proxy_command: Option<String>,
+        #[serde(default)]
+        proxy: Option<SshProxyConfig>,
+        #[serde(default)]
+        forward_agent: bool,
+        #[serde(default)]
+        forward_x11: bool,
+        #[serde(default)]
+        login_scripts: Vec<LoginScriptStep>,
+        #[serde(default)]
         auto_connect_on_startup: bool,
         #[serde(default)]
         tmux_reattach: Option<String>,
@@ -288,10 +619,70 @@ pub enum ProfileTarget {
         #[serde(default)]
         mux_attach_command: Option<String>,
     },
+    /// RS-232 / USB Serial port terminal.
+    Serial {
+        port: String,
+        #[serde(default = "default_serial_baud")]
+        baud_rate: u32,
+        #[serde(default = "default_serial_data_bits")]
+        data_bits: u8,
+        #[serde(default)]
+        parity: SerialParity,
+        #[serde(default = "default_serial_stop_bits")]
+        stop_bits: u8,
+        #[serde(default)]
+        flow_control: SerialFlowControl,
+        #[serde(default)]
+        input_mode: SerialInputMode,
+        #[serde(default)]
+        output_mode: SerialOutputMode,
+        #[serde(default)]
+        newline_mode: NewlineMode,
+        #[serde(default = "default_script_newline")]
+        auto_reconnect: bool,
+    },
+    /// TCP Telnet client session.
+    Telnet {
+        host: String,
+        #[serde(default = "default_telnet_port")]
+        port: u16,
+        #[serde(default)]
+        auto_reconnect: bool,
+        #[serde(default)]
+        login_scripts: Vec<LoginScriptStep>,
+    },
+    /// Docker or Podman container interactive shell (`exec -it`).
+    Docker {
+        #[serde(default)]
+        runtime: DockerRuntime,
+        container: String,
+        #[serde(default)]
+        shell: Option<String>,
+        #[serde(default)]
+        user: Option<String>,
+        #[serde(default)]
+        working_dir: Option<String>,
+    },
 }
 
 fn default_ssh_port() -> u16 {
     22
+}
+
+fn default_telnet_port() -> u16 {
+    23
+}
+
+fn default_serial_baud() -> u32 {
+    115_200
+}
+
+fn default_serial_data_bits() -> u8 {
+    8
+}
+
+fn default_serial_stop_bits() -> u8 {
+    1
 }
 
 /// Non-secret SSH authentication method metadata stored on a `Profile`.

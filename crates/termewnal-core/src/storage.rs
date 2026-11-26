@@ -80,9 +80,17 @@ where
         source,
     })?;
 
+    save_bytes_atomic(path, serialized.as_bytes())
+}
+
+/// Atomically writes `bytes` to `path` via temp staging and rolling `.bak` / `.bak1` backups.
+pub(crate) fn save_bytes_atomic(path: &Path, bytes: &[u8]) -> Result<(), CoreError> {
     let parent = path.parent().ok_or_else(|| CoreError::Io {
         path: path.to_path_buf(),
-        source: io::Error::new(io::ErrorKind::InvalidInput, "target path has no parent directory"),
+        source: io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target path has no parent directory",
+        ),
     })?;
 
     fs::create_dir_all(parent).map_err(|source| CoreError::Io {
@@ -91,7 +99,7 @@ where
     })?;
 
     // Stage and fsync the new content before rotating backups so a failed write never shifts backups.
-    let tmp = stage_temp_file(parent, serialized.as_bytes())?;
+    let tmp = stage_temp_file(parent, bytes)?;
 
     if path.exists() {
         rotate_backups(path, parent)?;

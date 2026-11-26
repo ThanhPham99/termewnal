@@ -5,13 +5,33 @@ use termewnal_ssh::TransportStatus;
 
 use crate::app::{Message, SessionId};
 use crate::sidebar::{ActiveTunnelEntry, TunnelRuntimeState};
-use crate::ui_theme::{ChromePalette, PillTone, badge_pill, pill_button_style, status_dot};
+use crate::ui_theme::{
+    ChromePalette, FONT_META, PillTone, ViewportTier, badge_pill, hairline_h, mono_font,
+    pill_button_style, status_dot, ui_font_medium,
+};
 
 /// Kind of active terminal `Session` shown in the bottom Status Bar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKindLabel {
     Local,
     Ssh,
+    Serial,
+    Telnet,
+    Docker,
+}
+
+/// Severity/kind of a live recovery status indicator in the Status Bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryNoticeKind {
+    AutoReconnecting,
+    ReconnectedSuccessfully,
+}
+
+/// Concise status pill rendered in the Status Bar for active recovery or completion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusRecoveryNotice {
+    pub kind: RecoveryNoticeKind,
+    pub message: String,
 }
 
 /// Active `Session` metadata projected into the Status Bar.
@@ -25,6 +45,7 @@ pub struct SessionStatusHook {
     pub rows: u16,
     pub exited: Option<Option<i32>>,
     pub transport_status: TransportStatus,
+    pub is_auto_reconnecting: bool,
     pub zoomed: bool,
     pub broadcast: bool,
 }
@@ -93,6 +114,8 @@ pub enum StatusBarAction {
 pub struct StatusBarState {
     tunnels: TunnelSummaryHook,
     transfers: TransferSummaryHook,
+    tunnel_notice: Option<StatusRecoveryNotice>,
+    sftp_notice: Option<StatusRecoveryNotice>,
 }
 
 impl StatusBarState {
@@ -121,6 +144,26 @@ impl StatusBarState {
         self.transfers = transfers;
     }
 
+    /// Returns the current `Tunnel` recovery notice shown in the Status Bar, if any.
+    pub fn tunnel_notice(&self) -> Option<&StatusRecoveryNotice> {
+        self.tunnel_notice.as_ref()
+    }
+
+    /// Updates the `Tunnel` recovery notice shown in the Status Bar.
+    pub fn set_tunnel_notice(&mut self, notice: Option<StatusRecoveryNotice>) {
+        self.tunnel_notice = notice;
+    }
+
+    /// Returns the current SFTP / `Transfer` recovery notice shown in the Status Bar, if any.
+    pub fn sftp_notice(&self) -> Option<&StatusRecoveryNotice> {
+        self.sftp_notice.as_ref()
+    }
+
+    /// Updates the SFTP / `Transfer` recovery notice shown in the Status Bar.
+    pub fn set_sftp_notice(&mut self, notice: Option<StatusRecoveryNotice>) {
+        self.sftp_notice = notice;
+    }
+
     /// Toggles the extensible SFTP/Transfer drawer open flag for Ticket 13 wiring.
     pub fn toggle_transfer_drawer(&mut self) -> bool {
         self.transfers.drawer_open = !self.transfers.drawer_open;
@@ -137,6 +180,10 @@ pub struct StatusBarSnapshot {
     pub sidebar_open: bool,
     pub transfer_drawer_open: bool,
     pub vault_unlocked: bool,
+    pub connection_notice: Option<StatusRecoveryNotice>,
+    pub tunnel_notice: Option<StatusRecoveryNotice>,
+    pub sftp_notice: Option<StatusRecoveryNotice>,
+    pub zmodem_notice: Option<String>,
     pub last_error: Option<String>,
 }
 
@@ -164,6 +211,24 @@ impl StatusBarSnapshot {
                     session.target, session.cols, session.rows
                 )
             }
+            SessionKindLabel::Serial => {
+                format!(
+                    "SERIAL · {} · {}x{}{exit_suffix}",
+                    session.target, session.cols, session.rows
+                )
+            }
+            SessionKindLabel::Telnet => {
+                format!(
+                    "TELNET · {} · {}x{}{exit_suffix}",
+                    session.target, session.cols, session.rows
+                )
+            }
+            SessionKindLabel::Docker => {
+                format!(
+                    "DOCKER · {} · {}x{}{exit_suffix}",
+                    session.target, session.cols, session.rows
+                )
+            }
         }
     }
 
@@ -172,8 +237,12 @@ impl StatusBarSnapshot {
         let Some(session) = &self.active_session else {
             return "Transport: idle".to_string();
         };
-        if session.kind == SessionKindLabel::Local {
-            return "Transport: Local PTY".to_string();
+        if matches!(session.kind, SessionKindLabel::Local | SessionKindLabel::Docker) {
+            return if session.kind == SessionKindLabel::Docker {
+                "Transport: Container PTY".to_string()
+            } else {
+                "Transport: Local PTY".to_string()
+            };
         }
         match &session.transport_status {
             TransportStatus::Disconnected => "Transport: Disconnected".to_string(),
@@ -196,10 +265,11 @@ impl StatusBarSnapshot {
     pub fn shows_reconnect_controls(&self) -> bool {
         self.active_session.as_ref().is_some_and(|session| {
             session.kind == SessionKindLabel::Ssh
-                && matches!(
-                    session.transport_status,
-                    TransportStatus::Degraded { .. } | TransportStatus::Reconnecting { .. }
-                )
+                && (session.is_auto_reconnecting
+                    || matches!(
+                        session.transport_status,
+                        TransportStatus::Degraded { .. } | TransportStatus::Reconnecting { .. }
+                    ))
         })
     }
 
@@ -276,62 +346,99 @@ impl StatusBarSnapshot {
     }
 }
 
+fn render_recovery_pill(
+    notice: &StatusRecoveryNotice,
+    chrome: ChromePalette,
+) -> Element<'static, Message, Theme, iced::Renderer> {
+    let (fg, bg) = match notice.kind {
+        RecoveryNoticeKind::AutoReconnecting => (chrome.warning, chrome.warning_soft),
+        RecoveryNoticeKind::ReconnectedSuccessfully => (chrome.success, chrome.success_soft),
+    };
+    badge_pill(notice.message.clone(), fg, bg, Color::TRANSPARENT)
+}
+
 /// Renders the persistent bottom Status Bar from `snapshot`.
 pub fn render_status_bar(
     snapshot: &StatusBarSnapshot,
     palette: &ThemePalette,
 ) -> Element<'static, Message, Theme, iced::Renderer> {
-    let chrome = ChromePalette::from_palette(palette);
+    render_status_bar_responsive(snapshot, palette, 1280.0)
+}
 
-    let sidebar_btn = button(text("Profiles").size(11))
-        .padding([3, 9])
-        .style(pill_button_style(
-            chrome,
-            if snapshot.sidebar_open {
-                PillTone::ActiveAccent
-            } else {
-                PillTone::Ghost
-            },
-        ))
-        .on_press(Message::StatusBarAction(StatusBarAction::ToggleSidebar));
+/// Renders the bottom Status Bar responsively for `window_width`, wrapping cleanly on narrow screens.
+pub fn render_status_bar_responsive(
+    snapshot: &StatusBarSnapshot,
+    palette: &ThemePalette,
+    window_width: f32,
+) -> Element<'static, Message, Theme, iced::Renderer> {
+    let chrome = ChromePalette::from_palette(palette);
+    let tier = ViewportTier::from_width(window_width);
 
     let session_dot = match snapshot
         .active_session
         .as_ref()
         .map(|s| (&s.kind, s.exited, &s.transport_status))
     {
-        Some((SessionKindLabel::Local, None, _)) => chrome.success,
-        Some((SessionKindLabel::Ssh, _, TransportStatus::Connected { .. })) => chrome.accent,
+        Some((SessionKindLabel::Local | SessionKindLabel::Docker, None, _)) => chrome.success,
         Some((
-            SessionKindLabel::Ssh,
+            SessionKindLabel::Ssh | SessionKindLabel::Serial | SessionKindLabel::Telnet,
+            _,
+            TransportStatus::Connected { .. },
+        )) => chrome.accent,
+        Some((
+            SessionKindLabel::Ssh | SessionKindLabel::Serial | SessionKindLabel::Telnet,
             _,
             TransportStatus::Connecting
             | TransportStatus::Degraded { .. }
             | TransportStatus::Reconnecting { .. },
         )) => chrome.warning,
-        Some((_, Some(_), _)) | Some((SessionKindLabel::Ssh, _, TransportStatus::Disconnected)) => {
-            chrome.text_muted
-        }
+        Some((_, Some(_), _))
+        | Some((
+            SessionKindLabel::Ssh | SessionKindLabel::Serial | SessionKindLabel::Telnet,
+            _,
+            TransportStatus::Disconnected,
+        )) => chrome.text_muted,
         None => chrome.text_muted,
     };
 
-    let mut left = row![
-        sidebar_btn,
-        status_dot(session_dot),
-        text(snapshot.session_text())
-            .size(11)
-            .color(chrome.text_primary),
-    ]
-    .spacing(8)
-    .align_y(Alignment::Center);
+    let mut left_items: Vec<Element<'static, Message, Theme, iced::Renderer>> = vec![
+        row![
+            status_dot(session_dot),
+            text(snapshot.session_text())
+                .size(FONT_META)
+                .font(mono_font())
+                .color(chrome.text_primary),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .into(),
+    ];
 
     if let Some(session) = &snapshot.active_session {
         if session.zoomed {
-            left = left.push(badge_pill("ZOOM", chrome.accent, chrome.accent_soft, Color::TRANSPARENT));
+            left_items.push(badge_pill(
+                "Zoom",
+                chrome.accent,
+                chrome.accent_soft,
+                Color::TRANSPARENT,
+            ));
         }
         if session.broadcast {
-            left = left.push(badge_pill("BROADCAST", chrome.danger, chrome.danger_soft, Color::TRANSPARENT));
+            left_items.push(badge_pill(
+                "Broadcast",
+                chrome.danger,
+                chrome.danger_soft,
+                Color::TRANSPARENT,
+            ));
         }
+    }
+    if let Some(znotice) = &snapshot.zmodem_notice {
+        left_items.push(badge_pill(
+            znotice.clone(),
+            chrome.accent,
+            chrome.accent_soft,
+            chrome.border_subtle,
+        ));
     }
 
     let transport_color = match snapshot
@@ -339,17 +446,35 @@ pub fn render_status_bar(
         .as_ref()
         .map(|s| (&s.kind, &s.transport_status))
     {
-        Some((SessionKindLabel::Ssh, TransportStatus::Connected { .. })) => chrome.success,
-        Some((SessionKindLabel::Ssh, TransportStatus::Degraded { .. }))
-        | Some((SessionKindLabel::Ssh, TransportStatus::Reconnecting { .. }))
-        | Some((SessionKindLabel::Ssh, TransportStatus::Connecting)) => chrome.warning,
-        Some((SessionKindLabel::Ssh, TransportStatus::Disconnected)) => chrome.text_muted,
+        Some((
+            SessionKindLabel::Ssh | SessionKindLabel::Serial | SessionKindLabel::Telnet,
+            TransportStatus::Connected { .. },
+        )) => chrome.success,
+        Some((
+            SessionKindLabel::Ssh | SessionKindLabel::Serial | SessionKindLabel::Telnet,
+            TransportStatus::Degraded { .. },
+        ))
+        | Some((
+            SessionKindLabel::Ssh | SessionKindLabel::Serial | SessionKindLabel::Telnet,
+            TransportStatus::Reconnecting { .. },
+        ))
+        | Some((
+            SessionKindLabel::Ssh | SessionKindLabel::Serial | SessionKindLabel::Telnet,
+            TransportStatus::Connecting,
+        )) => chrome.warning,
+        Some((
+            SessionKindLabel::Ssh | SessionKindLabel::Serial | SessionKindLabel::Telnet,
+            TransportStatus::Disconnected,
+        )) => chrome.text_muted,
         _ => chrome.text_secondary,
     };
 
     let transport_label = row![
         status_dot(transport_color),
-        text(snapshot.transport_text()).size(11).color(transport_color),
+        text(snapshot.transport_text())
+            .size(FONT_META)
+            .font(mono_font())
+            .color(transport_color),
     ]
     .spacing(5)
     .align_y(Alignment::Center);
@@ -357,38 +482,42 @@ pub fn render_status_bar(
     let transport_widget: Element<'static, Message, Theme, iced::Renderer> =
         if snapshot.shows_probe_control() {
             button(transport_label)
-                .padding([3, 8])
+                .padding([4, 8])
                 .style(pill_button_style(chrome, PillTone::Ghost))
                 .on_press(Message::StatusBarAction(StatusBarAction::ProbeAll))
                 .into()
         } else {
-            container(transport_label).padding([3, 4]).into()
+            container(transport_label).padding([4, 4]).into()
         };
 
-    let mut right = row![transport_widget]
-        .spacing(6)
-        .align_y(Alignment::Center);
+    let mut right_items: Vec<Element<'static, Message, Theme, iced::Renderer>> =
+        vec![transport_widget];
+
+    if let Some(notice) = &snapshot.connection_notice {
+        right_items.push(render_recovery_pill(notice, chrome));
+    }
 
     if snapshot.shows_reconnect_controls()
         && let Some(session) = &snapshot.active_session
     {
-        right = right
-            .push(
-                button(text("Reconnect now").size(11))
-                    .padding([3, 8])
-                    .style(pill_button_style(chrome, PillTone::Primary))
-                    .on_press(Message::StatusBarAction(StatusBarAction::ReconnectSession(
-                        session.session_id,
-                    ))),
-            )
-            .push(
-                button(text("Cancel").size(11))
-                    .padding([3, 8])
-                    .style(pill_button_style(chrome, PillTone::Subtle))
-                    .on_press(Message::StatusBarAction(StatusBarAction::CancelReconnect(
-                        session.session_id,
-                    ))),
-            );
+        right_items.push(
+            button(text("Reconnect now").size(FONT_META).font(ui_font_medium()))
+                .padding([4, 9])
+                .style(pill_button_style(chrome, PillTone::Primary))
+                .on_press(Message::StatusBarAction(StatusBarAction::ReconnectSession(
+                    session.session_id,
+                )))
+                .into(),
+        );
+        right_items.push(
+            button(text("Cancel").size(FONT_META))
+                .padding([4, 8])
+                .style(pill_button_style(chrome, PillTone::Subtle))
+                .on_press(Message::StatusBarAction(StatusBarAction::CancelReconnect(
+                    session.session_id,
+                )))
+                .into(),
+        );
     }
 
     let tunnel_color = if snapshot.tunnels.error > 0 {
@@ -404,87 +533,124 @@ pub fn render_status_bar(
         chrome.text_secondary
     };
 
-    right = right.push(
+    right_items.push(
         button(
             row![
                 status_dot(tunnel_color),
-                text(snapshot.tunnels_text()).size(11).color(tunnel_color),
+                text(snapshot.tunnels_text())
+                    .size(FONT_META)
+                    .font(mono_font())
+                    .color(tunnel_color),
             ]
             .spacing(5)
             .align_y(Alignment::Center),
         )
-        .padding([3, 8])
+        .padding([4, 8])
         .style(pill_button_style(chrome, PillTone::Ghost))
-        .on_press(Message::StatusBarAction(StatusBarAction::ToggleTunnelsView)),
+        .on_press(Message::StatusBarAction(StatusBarAction::ToggleTunnelsView))
+        .into(),
     );
+
+    if let Some(notice) = &snapshot.tunnel_notice {
+        right_items.push(render_recovery_pill(notice, chrome));
+    }
 
     if snapshot.tunnels.holding > 0
         || snapshot.tunnels.reconnecting > 0
         || snapshot.tunnels.retrying > 0
         || snapshot.tunnels.error > 0
     {
-        right = right.push(
-            button(text("Reconnect Tunnels").size(11))
-                .padding([3, 8])
+        right_items.push(
+            button(text("Reconnect Tunnels").size(FONT_META).font(ui_font_medium()))
+                .padding([4, 9])
                 .style(pill_button_style(chrome, PillTone::Primary))
-                .on_press(Message::StatusBarAction(StatusBarAction::ReconnectTunnels)),
+                .on_press(Message::StatusBarAction(StatusBarAction::ReconnectTunnels))
+                .into(),
         );
     }
 
-    right = right.push(
-        button(text(snapshot.transfers_text()).size(11))
-            .padding([3, 8])
-            .style(pill_button_style(
-                chrome,
-                if snapshot.transfer_drawer_open {
-                    PillTone::ActiveAccent
-                } else {
-                    PillTone::Ghost
-                },
-            ))
-            .on_press(Message::StatusBarAction(
-                StatusBarAction::ToggleTransferDrawer,
-            )),
+    right_items.push(
+        button(
+            text(snapshot.transfers_text())
+                .size(FONT_META)
+                .font(mono_font()),
+        )
+        .padding([4, 8])
+        .style(pill_button_style(
+            chrome,
+            if snapshot.transfer_drawer_open {
+                PillTone::Subtle
+            } else {
+                PillTone::Ghost
+            },
+        ))
+        .on_press(Message::StatusBarAction(
+            StatusBarAction::ToggleTransferDrawer,
+        ))
+        .into(),
     );
 
+    if let Some(notice) = &snapshot.sftp_notice {
+        right_items.push(render_recovery_pill(notice, chrome));
+    }
+
     if snapshot.vault_unlocked {
-        right = right.push(
-            button(text("Lock Vault").size(11))
-                .padding([3, 8])
+        right_items.push(
+            button(text("Lock Vault").size(FONT_META).font(ui_font_medium()))
+                .padding([4, 8])
                 .style(pill_button_style(chrome, PillTone::Subtle))
-                .on_press(Message::StatusBarAction(StatusBarAction::LockVault)),
+                .on_press(Message::StatusBarAction(StatusBarAction::LockVault))
+                .into(),
         );
     }
 
-    right = right
-        .push(
-            button(text("Settings").size(11))
-                .padding([3, 8])
-                .style(pill_button_style(chrome, PillTone::Ghost))
-                .on_press(Message::StatusBarAction(StatusBarAction::OpenSettings)),
-        )
-        .push(
-            button(text("Ctrl+K").size(11))
-                .padding([3, 8])
-                .style(pill_button_style(chrome, PillTone::Subtle))
-                .on_press(Message::StatusBarAction(
-                    StatusBarAction::OpenCommandPalette,
-                )),
-        );
+    right_items.push(
+        button(text("Settings").size(FONT_META).font(ui_font_medium()))
+            .padding([4, 8])
+            .style(pill_button_style(chrome, PillTone::Ghost))
+            .on_press(Message::StatusBarAction(StatusBarAction::OpenSettings))
+            .into(),
+    );
+    right_items.push(
+        button(text("Ctrl+K").size(FONT_META).font(mono_font()))
+            .padding([4, 9])
+            .style(pill_button_style(chrome, PillTone::Subtle))
+            .on_press(Message::StatusBarAction(
+                StatusBarAction::OpenCommandPalette,
+            ))
+            .into(),
+    );
 
-    let top_hairline = container(space::horizontal().height(1))
-        .width(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(chrome.border_subtle)),
-            ..Default::default()
-        });
+    let bar_body: Element<'static, Message, Theme, iced::Renderer> = match tier {
+        ViewportTier::Compact => {
+            let left_wrap = row(left_items)
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .wrap()
+                .vertical_spacing(4);
+            let right_wrap = row(right_items)
+                .spacing(6)
+                .align_y(Alignment::Center)
+                .wrap()
+                .vertical_spacing(4);
+            column![left_wrap, right_wrap]
+                .spacing(4)
+                .padding([5, 10])
+                .width(Length::Fill)
+                .into()
+        }
+        ViewportTier::Medium | ViewportTier::Wide => {
+            let left = row(left_items).spacing(8).align_y(Alignment::Center);
+            let right = row(right_items).spacing(5).align_y(Alignment::Center);
+            row![left, space::horizontal(), right]
+                .spacing(8)
+                .padding([5, 12])
+                .align_y(Alignment::Center)
+                .into()
+        }
+    };
 
-    let bar = row![left, space::horizontal(), right]
-        .spacing(8)
-        .padding([4, 10])
-        .align_y(Alignment::Center);
-
-    container(column![top_hairline, bar].width(Length::Fill))
+    container(column![hairline_h(chrome), bar_body].width(Length::Fill))
         .width(Length::Fill)
         .style(move |_theme: &Theme| container::Style {
             background: Some(Background::Color(chrome.chrome_bg)),

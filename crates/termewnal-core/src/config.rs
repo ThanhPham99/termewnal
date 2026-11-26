@@ -4,8 +4,10 @@ use directories::{BaseDirs, ProjectDirs};
 use serde::{Deserialize, Serialize};
 
 use crate::error::CoreError;
+use crate::keybindings::KeybindingConfig;
 use crate::profile::{ProfilesConfig, load_profiles, save_profiles};
 use crate::storage::{load_toml_or_default, save_toml_atomic};
+use crate::theme::ThemeOverrides;
 
 /// Current schema version written to `config.toml` and `profiles.toml`.
 pub const CURRENT_SCHEMA_VERSION: u32 = 1;
@@ -22,6 +24,9 @@ pub const DEFAULT_PART_THRESHOLD_BYTES: u64 = 1_048_576;
 const CONFIG_FILE_NAME: &str = "config.toml";
 const PROFILES_FILE_NAME: &str = "profiles.toml";
 const LAYOUT_FILE_NAME: &str = "layout.toml";
+const SFTP_STATE_FILE_NAME: &str = "sftp_state.toml";
+const QUICK_COMMANDS_FILE_NAME: &str = "quick_commands.toml";
+const WORKSPACES_FILE_NAME: &str = "workspaces.toml";
 const IPC_SOCKET_FILE_NAME: &str = "termewnal.sock";
 const VAULT_FILE_NAME: &str = "vault.enc";
 
@@ -121,6 +126,26 @@ impl ConfigPaths {
         self.data_local_dir.join(LAYOUT_FILE_NAME)
     }
 
+    /// Path to `sftp_state.toml` storing remembered per-profile SFTP working directories.
+    pub fn sftp_state_file(&self) -> PathBuf {
+        self.data_local_dir.join(SFTP_STATE_FILE_NAME)
+    }
+
+    /// Path to `quick_commands.toml` storing reusable `QuickCommand` snippets.
+    pub fn quick_commands_file(&self) -> PathBuf {
+        self.config_dir.join(QUICK_COMMANDS_FILE_NAME)
+    }
+
+    /// Path to `workspaces.toml` storing named `WorkspaceTemplate` presets.
+    pub fn workspaces_file(&self) -> PathBuf {
+        self.config_dir.join(WORKSPACES_FILE_NAME)
+    }
+
+    /// Directory where per-session output logs are saved by default.
+    pub fn logs_dir(&self) -> PathBuf {
+        self.data_local_dir.join("logs")
+    }
+
     /// Path to the single-instance local IPC socket (`runtime_dir` with `data_local_dir` fallback).
     pub fn ipc_socket_file(&self) -> PathBuf {
         self.runtime_dir
@@ -145,6 +170,151 @@ pub enum CursorStyle {
     Beam,
 }
 
+/// Edge where the workspace tab bar is docked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TabBarPosition {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Behavior when right-clicking inside a non-mouse-mode terminal pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RightClickAction {
+    #[default]
+    Menu,
+    Paste,
+    Off,
+}
+
+/// Action taken when a terminal emits BEL (`\x07`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BellBehavior {
+    Visual,
+    Notification,
+    #[default]
+    VisualAndNotification,
+    Off,
+}
+
+/// Regex-based terminal output `HighlightRule`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HighlightRule {
+    pub id: String,
+    pub name: String,
+    pub pattern: String,
+    #[serde(default)]
+    pub foreground: Option<String>,
+    #[serde(default)]
+    pub background: Option<String>,
+    #[serde(default)]
+    pub bold: bool,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub case_insensitive: bool,
+}
+
+/// Screen edge where the Quake drop-down window anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum QuakeEdge {
+    #[default]
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// Quake drop-down console configuration stored in `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuakeConfig {
+    pub enabled: bool,
+    pub edge: QuakeEdge,
+    pub size_percent: u8,
+    pub hotkey: String,
+    pub hide_on_blur: bool,
+}
+
+impl Default for QuakeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            edge: QuakeEdge::Top,
+            size_percent: 45,
+            hotkey: "Ctrl+Alt+Space".to_string(),
+            hide_on_blur: false,
+        }
+    }
+}
+
+/// System Tray icon and background behavior stored in `config.toml`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct TrayConfig {
+    pub enabled: bool,
+    pub minimize_to_tray: bool,
+    pub show_notifications: bool,
+}
+
+impl Default for TrayConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            minimize_to_tray: true,
+            show_notifications: true,
+        }
+    }
+}
+
+/// Supported Config Sync backend providers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncProviderKind {
+    #[default]
+    None,
+    LocalDirectory,
+    WebDav,
+    GitHubGist,
+}
+
+/// Non-secret Config Sync settings stored in `config.toml` (tokens live in `Vault`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SyncConfig {
+    pub provider: SyncProviderKind,
+    pub local_dir: Option<PathBuf>,
+    pub gist_id: Option<String>,
+    pub webdav_url: Option<String>,
+    pub webdav_username: Option<String>,
+    pub vault_token_ref: Option<String>,
+    pub encrypt_bundle: bool,
+    pub auto_sync_on_save: bool,
+    pub last_sync_at: Option<String>,
+}
+
+impl Default for SyncConfig {
+    fn default() -> Self {
+        Self {
+            provider: SyncProviderKind::None,
+            local_dir: None,
+            gist_id: None,
+            webdav_url: None,
+            webdav_username: None,
+            vault_token_ref: None,
+            encrypt_bundle: false,
+            auto_sync_on_save: false,
+            last_sync_at: None,
+        }
+    }
+}
+
 /// Terminal emulation and rendering preferences stored in `config.toml`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -162,17 +332,80 @@ pub struct TerminalConfig {
     pub font_ligatures: bool,
     /// Terminal cursor shape.
     pub cursor_style: CursorStyle,
+    /// Enable blinking cursor in active panes.
+    #[serde(default)]
+    pub cursor_blink: bool,
     /// Built-in UI/terminal theme name.
     pub theme: String,
+    /// Optional custom hex color overrides on top of the selected built-in theme.
+    #[serde(default)]
+    pub theme_overrides: ThemeOverrides,
+    /// Window/terminal surface opacity in `[0.3, 1.0]`.
+    #[serde(default = "default_window_opacity")]
+    pub window_opacity: f32,
     /// Copy selected terminal text to clipboard automatically.
     pub copy_on_select: bool,
     /// Prompt for confirmation before pasting text containing newlines.
     #[serde(default = "default_confirm_multiline_paste")]
     pub confirm_multiline_paste: bool,
+    /// Right-click behavior inside terminal viewport (`menu`, `paste`, or `off`).
+    #[serde(default)]
+    pub right_click_action: RightClickAction,
+    /// Paste clipboard on middle mouse button click when not in PTY mouse mode.
+    #[serde(default = "default_true")]
+    pub middle_click_paste: bool,
+    /// Action taken on BEL (`\x07`).
+    #[serde(default)]
+    pub bell_behavior: BellBehavior,
+    /// Position of the workspace tab bar (`top`, `bottom`, `left`, `right`).
+    #[serde(default)]
+    pub tab_bar_position: TabBarPosition,
+    /// Always show the profile tree sidebar on startup (non-collapsible).
+    #[serde(default = "default_true")]
+    pub show_profile_sidebar: bool,
+    /// Show the optional bottom status bar (hidden by default to match Tabby's edge-to-edge UI).
+    #[serde(default)]
+    pub show_status_bar: bool,
+    /// Show live server resource stats (CPU/RAM/DISK/NET) at the bottom of each SSH session.
+    #[serde(default = "default_true")]
+    pub show_server_stats: bool,
+    /// Hide numeric 1..N tab indices inside tab headers (Tabby `hideTabIndex`, default false).
+    #[serde(default)]
+    pub hide_tab_index: bool,
+    /// Size horizontal tabs dynamically to fill space instead of fixed 200px width (Tabby `flexTabs`).
+    #[serde(default)]
+    pub flex_tabs: bool,
+    /// Treat Alt+<key> as ESC+<key> meta prefix in terminal input.
+    #[serde(default = "default_true")]
+    pub alt_is_meta: bool,
+    /// Word boundary characters for double-click semantic selection.
+    #[serde(default = "default_word_separators")]
+    pub word_separators: String,
+    /// Automatically record terminal output logs for new sessions.
+    #[serde(default)]
+    pub auto_log_sessions: bool,
+    /// Optional directory override for session log files.
+    #[serde(default)]
+    pub log_directory: Option<PathBuf>,
+    /// Regex-based terminal output `HighlightRule` entries.
+    #[serde(default)]
+    pub highlight_rules: Vec<HighlightRule>,
 }
 
 fn default_confirm_multiline_paste() -> bool {
     true
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_window_opacity() -> f32 {
+    1.0
+}
+
+fn default_word_separators() -> String {
+    r#" /\|()"'-.,:;<>~!@#$%^&*+=[]{}~?│"#.to_string()
 }
 
 impl Default for TerminalConfig {
@@ -184,9 +417,26 @@ impl Default for TerminalConfig {
             font_size: 14.0,
             font_ligatures: false,
             cursor_style: CursorStyle::Block,
+            cursor_blink: false,
             theme: "Dark".to_string(),
+            theme_overrides: ThemeOverrides::default(),
+            window_opacity: 1.0,
             copy_on_select: false,
             confirm_multiline_paste: true,
+            right_click_action: RightClickAction::Menu,
+            middle_click_paste: true,
+            bell_behavior: BellBehavior::VisualAndNotification,
+            tab_bar_position: TabBarPosition::Top,
+            show_profile_sidebar: true,
+            show_status_bar: false,
+            show_server_stats: true,
+            hide_tab_index: false,
+            flex_tabs: false,
+            alt_is_meta: true,
+            word_separators: default_word_separators(),
+            auto_log_sessions: false,
+            log_directory: None,
+            highlight_rules: Vec::new(),
         }
     }
 }
@@ -292,6 +542,18 @@ pub struct AppConfig {
     pub keepalive_interval_secs: u64,
     /// Global maximum consecutive missed SSH keepalive probes before reconnecting.
     pub keepalive_max_missed: u32,
+    /// Custom keyboard shortcut overrides.
+    #[serde(default)]
+    pub keybindings: KeybindingConfig,
+    /// Quake drop-down console configuration.
+    #[serde(default)]
+    pub quake: QuakeConfig,
+    /// System Tray integration configuration.
+    #[serde(default)]
+    pub tray: TrayConfig,
+    /// Configuration synchronization settings (tokens remain strictly in `Vault`).
+    #[serde(default)]
+    pub sync: SyncConfig,
 }
 
 impl Default for AppConfig {
@@ -304,6 +566,10 @@ impl Default for AppConfig {
             transfer: TransferConfig::default(),
             keepalive_interval_secs: DEFAULT_KEEPALIVE_INTERVAL_SECS,
             keepalive_max_missed: DEFAULT_KEEPALIVE_MAX_MISSED,
+            keybindings: KeybindingConfig::default(),
+            quake: QuakeConfig::default(),
+            tray: TrayConfig::default(),
+            sync: SyncConfig::default(),
         }
     }
 }

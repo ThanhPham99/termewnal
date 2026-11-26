@@ -15,10 +15,14 @@ use iced::{
     Background, Border, Color, Element, Event, Font, Length, Pixels, Point, Rectangle, Shadow,
     Size, Theme, mouse, window,
 };
-use termewnal_core::{BuiltinTheme, CursorStyle, TerminalConfig, ThemePalette};
+use termewnal_core::{
+    BuiltinTheme, CursorStyle, RightClickAction, TerminalConfig, ThemePalette,
+};
 use termewnal_pty::{
-    CellFlags, CursorShape, DetectedUrl, GridSearchMatch, NamedColor, Rgb, SelectionType, Side,
-    TermColor, TerminalCell, TerminalSnapshot, url_at_cell,
+    CellFlags, CompiledHighlightRule, CursorShape, DetectedLink, DetectedLinkKind,
+    GridSearchMatch, HighlightStyle, NamedColor, PtyMouseButton, PtyMouseEventKind, Rgb,
+    SelectionType, Side, TermColor, TerminalCell, TerminalSnapshot, compile_highlight_rules,
+    compute_highlight_grid, encode_mouse_event, link_at_cell,
 };
 
 use crate::app::{Message, SessionId};
@@ -78,8 +82,8 @@ impl ImeComposition {
     }
 }
 
-/// Inner padding (in logical pixels) around the terminal grid so text never hugs window borders.
-pub const TERMINAL_INNER_PAD: f32 = 8.0;
+/// Inner padding (in logical pixels) around the terminal grid matching Tabby's 15px terminal margin.
+pub const TERMINAL_INNER_PAD: f32 = 14.0;
 
 fn content_bounds(bounds: Rectangle) -> Rectangle {
     let pad = TERMINAL_INNER_PAD;
@@ -109,27 +113,77 @@ pub fn ime_cursor_anchor_rect(
 }
 
 /// Rendering and behavioral configuration passed to [`TerminalViewport`].
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TerminalViewOptions {
     pub palette: TerminalPalette,
     pub font_family: String,
     pub font_size: f32,
     pub font_ligatures: bool,
     pub cursor_style: CursorStyle,
+    pub cursor_blink: bool,
+    pub cursor_visible: bool,
     pub copy_on_select: bool,
+    pub right_click_action: RightClickAction,
+    pub middle_click_paste: bool,
+    pub opacity: f32,
+    pub highlight_rules: Arc<[CompiledHighlightRule]>,
+    pub bell_flash: bool,
     pub ime_enabled: bool,
+}
+
+impl PartialEq for TerminalViewOptions {
+    fn eq(&self, other: &Self) -> bool {
+        self.palette == other.palette
+            && self.font_family == other.font_family
+            && self.font_size == other.font_size
+            && self.font_ligatures == other.font_ligatures
+            && self.cursor_style == other.cursor_style
+            && self.cursor_blink == other.cursor_blink
+            && self.cursor_visible == other.cursor_visible
+            && self.copy_on_select == other.copy_on_select
+            && self.right_click_action == other.right_click_action
+            && self.middle_click_paste == other.middle_click_paste
+            && self.opacity == other.opacity
+            && Arc::ptr_eq(&self.highlight_rules, &other.highlight_rules)
+            && self.bell_flash == other.bell_flash
+            && self.ime_enabled == other.ime_enabled
+    }
 }
 
 impl TerminalViewOptions {
     /// Builds [`TerminalViewOptions`] from persisted [`TerminalConfig`].
     pub fn from_config(cfg: &TerminalConfig, ime_enabled: bool) -> Self {
+        Self::from_config_with_runtime(
+            cfg,
+            ime_enabled,
+            Arc::from(compile_highlight_rules(&cfg.highlight_rules)),
+            true,
+            false,
+        )
+    }
+
+    /// Builds [`TerminalViewOptions`] with pre-compiled highlight rules and blink/bell state.
+    pub fn from_config_with_runtime(
+        cfg: &TerminalConfig,
+        ime_enabled: bool,
+        highlight_rules: Arc<[CompiledHighlightRule]>,
+        cursor_visible: bool,
+        bell_flash: bool,
+    ) -> Self {
         Self {
             palette: TerminalPalette::from_config(cfg),
             font_family: cfg.font_family.clone(),
             font_size: cfg.font_size,
             font_ligatures: cfg.font_ligatures,
             cursor_style: cfg.cursor_style,
+            cursor_blink: cfg.cursor_blink,
+            cursor_visible: !cfg.cursor_blink || cursor_visible,
             copy_on_select: cfg.copy_on_select,
+            right_click_action: cfg.right_click_action,
+            middle_click_paste: cfg.middle_click_paste,
+            opacity: cfg.window_opacity.clamp(0.3, 1.0),
+            highlight_rules,
+            bell_flash,
             ime_enabled,
         }
     }
@@ -153,9 +207,12 @@ pub struct TerminalPalette {
 }
 
 impl TerminalPalette {
-    /// Builds a [`TerminalPalette`] from [`TerminalConfig::theme`].
+    /// Builds a [`TerminalPalette`] from [`TerminalConfig::theme`] and optional color overrides.
     pub fn from_config(cfg: &TerminalConfig) -> Self {
-        Self::from_core(&ThemePalette::for_name(&cfg.theme))
+        Self::from_core(&ThemePalette::for_name_with_overrides(
+            &cfg.theme,
+            &cfg.theme_overrides,
+        ))
     }
 
     /// Converts a core [`ThemePalette`] to Iced colors.
@@ -288,9 +345,11 @@ struct ViewportState {
     last_requested_size: Option<(u16, u16)>,
     ime: ImeComposition,
     cursor_cell: Option<(usize, usize)>,
-    hovered_url: Option<DetectedUrl>,
+    hovered_link: Option<DetectedLink>,
     dragging_selection: bool,
     last_click: Option<(Instant, usize, usize, u8)>,
+    held_mouse_button: Option<PtyMouseButton>,
+    last_motion_cell: Option<(usize, usize)>,
 }
 
 impl Default for ViewportState {
@@ -301,9 +360,11 @@ impl Default for ViewportState {
             last_requested_size: None,
             ime: ImeComposition::default(),
             cursor_cell: None,
-            hovered_url: None,
+            hovered_link: None,
             dragging_selection: false,
             last_click: None,
+            held_mouse_button: None,
+            last_motion_cell: None,
         }
     }
 }
@@ -394,12 +455,13 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
-                let prev_hover = state.hovered_url.clone();
+                let prev_hover = state.hovered_link.clone();
+                let pty_mouse_active = self.snapshot.mouse_mode && !state.modifiers.shift();
                 if bounds.contains(*position) {
                     let (col, row, side) = point_to_cell(*position, inner, cell_size, &self.snapshot);
                     state.cursor_cell = Some((col, row));
-                    state.hovered_url = if state.modifiers.control() {
-                        url_at_cell(&self.snapshot, col, row)
+                    state.hovered_link = if state.modifiers.control() {
+                        link_at_cell(&self.snapshot, col, row)
                     } else {
                         None
                     };
@@ -410,18 +472,34 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                             row,
                             side,
                         });
+                    } else if pty_mouse_active
+                        && (state.held_mouse_button.is_some() || self.snapshot.mouse_motion)
+                        && state.last_motion_cell != Some((col, row))
+                    {
+                        let btn = state.held_mouse_button.unwrap_or(PtyMouseButton::Left);
+                        state.last_motion_cell = Some((col, row));
+                        self.forward_pty_mouse(
+                            btn,
+                            PtyMouseEventKind::Drag,
+                            col,
+                            row,
+                            state.modifiers,
+                            shell,
+                        );
                     }
                 } else {
                     state.cursor_cell = None;
-                    state.hovered_url = None;
+                    state.last_motion_cell = None;
+                    state.hovered_link = None;
                 }
-                if state.hovered_url != prev_hover {
+                if state.hovered_link != prev_hover {
                     shell.request_redraw();
                 }
             }
             Event::Mouse(mouse::Event::CursorLeft) => {
                 state.cursor_cell = None;
-                if state.hovered_url.take().is_some() {
+                state.last_motion_cell = None;
+                if state.hovered_link.take().is_some() {
                     shell.request_redraw();
                 }
             }
@@ -445,9 +523,40 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                     let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);
                     let (col, row, side) = point_to_cell(abs, inner, cell_size, &self.snapshot);
                     if state.modifiers.control()
-                        && let Some(detected) = url_at_cell(&self.snapshot, col, row)
+                        && let Some(detected) = link_at_cell(&self.snapshot, col, row)
                     {
-                        shell.publish(Message::OpenUrl(detected.url));
+                        match detected.kind {
+                            DetectedLinkKind::WebUrl => {
+                                shell.publish(Message::OpenUrl(detected.target));
+                            }
+                            DetectedLinkKind::LocalFile {
+                                path,
+                                line,
+                                col: file_col,
+                            } => {
+                                shell.publish(Message::OpenLocalFile {
+                                    session_id: self.session_id,
+                                    path,
+                                    line,
+                                    col: file_col,
+                                });
+                            }
+                        }
+                        shell.capture_event();
+                        return;
+                    }
+
+                    if self.snapshot.mouse_mode && !state.modifiers.shift() {
+                        state.held_mouse_button = Some(PtyMouseButton::Left);
+                        state.last_motion_cell = Some((col, row));
+                        self.forward_pty_mouse(
+                            PtyMouseButton::Left,
+                            PtyMouseEventKind::Press,
+                            col,
+                            row,
+                            state.modifiers,
+                            shell,
+                        );
                         shell.capture_event();
                         return;
                     }
@@ -470,6 +579,23 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 }
             }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
+                if state.held_mouse_button == Some(PtyMouseButton::Left) {
+                    state.held_mouse_button = None;
+                    state.last_motion_cell = None;
+                    if let Some(pos) = cursor.position_in(bounds) {
+                        let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);
+                        let (col, row, _) = point_to_cell(abs, inner, cell_size, &self.snapshot);
+                        self.forward_pty_mouse(
+                            PtyMouseButton::Left,
+                            PtyMouseEventKind::Release,
+                            col,
+                            row,
+                            state.modifiers,
+                            shell,
+                        );
+                        shell.capture_event();
+                    }
+                }
                 if state.dragging_selection {
                     state.dragging_selection = false;
                     shell.publish(Message::SelectionFinish {
@@ -478,14 +604,110 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                     shell.capture_event();
                 }
             }
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) => {
+                if cursor.is_over(bounds) {
+                    if self.snapshot.mouse_mode && !state.modifiers.shift() {
+                        if let Some(pos) = cursor.position_in(bounds) {
+                            let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);
+                            let (col, row, _) =
+                                point_to_cell(abs, inner, cell_size, &self.snapshot);
+                            state.held_mouse_button = Some(PtyMouseButton::Middle);
+                            state.last_motion_cell = Some((col, row));
+                            self.forward_pty_mouse(
+                                PtyMouseButton::Middle,
+                                PtyMouseEventKind::Press,
+                                col,
+                                row,
+                                state.modifiers,
+                                shell,
+                            );
+                            shell.capture_event();
+                        }
+                    } else if self.options.middle_click_paste {
+                        publish_clipboard_paste(self.session_id, clipboard, shell);
+                        shell.capture_event();
+                    }
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Middle)) => {
+                if state.held_mouse_button == Some(PtyMouseButton::Middle) {
+                    state.held_mouse_button = None;
+                    state.last_motion_cell = None;
+                    if let Some(pos) = cursor.position_in(bounds) {
+                        let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);
+                        let (col, row, _) = point_to_cell(abs, inner, cell_size, &self.snapshot);
+                        self.forward_pty_mouse(
+                            PtyMouseButton::Middle,
+                            PtyMouseEventKind::Release,
+                            col,
+                            row,
+                            state.modifiers,
+                            shell,
+                        );
+                        shell.capture_event();
+                    }
+                }
+            }
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Right)) => {
-                if cursor.is_over(bounds) && !self.snapshot.mouse_mode {
-                    publish_clipboard_paste(self.session_id, clipboard, shell);
-                    shell.capture_event();
+                if cursor.is_over(bounds) {
+                    if self.snapshot.mouse_mode && !state.modifiers.shift() {
+                        if let Some(pos) = cursor.position_in(bounds) {
+                            let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);
+                            let (col, row, _) =
+                                point_to_cell(abs, inner, cell_size, &self.snapshot);
+                            state.held_mouse_button = Some(PtyMouseButton::Right);
+                            state.last_motion_cell = Some((col, row));
+                            self.forward_pty_mouse(
+                                PtyMouseButton::Right,
+                                PtyMouseEventKind::Press,
+                                col,
+                                row,
+                                state.modifiers,
+                                shell,
+                            );
+                            shell.capture_event();
+                        }
+                    } else {
+                        match self.options.right_click_action {
+                            RightClickAction::Paste => {
+                                publish_clipboard_paste(self.session_id, clipboard, shell);
+                                shell.capture_event();
+                            }
+                            RightClickAction::Menu => {
+                                if let Some(pos) = cursor.position() {
+                                    shell.publish(Message::OpenTerminalContextMenu {
+                                        session_id: self.session_id,
+                                        position: pos,
+                                    });
+                                    shell.capture_event();
+                                }
+                            }
+                            RightClickAction::Off => {}
+                        }
+                    }
+                }
+            }
+            Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Right)) => {
+                if state.held_mouse_button == Some(PtyMouseButton::Right) {
+                    state.held_mouse_button = None;
+                    state.last_motion_cell = None;
+                    if let Some(pos) = cursor.position_in(bounds) {
+                        let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);
+                        let (col, row, _) = point_to_cell(abs, inner, cell_size, &self.snapshot);
+                        self.forward_pty_mouse(
+                            PtyMouseButton::Right,
+                            PtyMouseEventKind::Release,
+                            col,
+                            row,
+                            state.modifiers,
+                            shell,
+                        );
+                        shell.capture_event();
+                    }
                 }
             }
             Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                if cursor.is_over(bounds) && !self.snapshot.mouse_mode {
+                if cursor.is_over(bounds) {
                     let delta_lines = match delta {
                         mouse::ScrollDelta::Lines { y, .. } => (*y * 3.0).round() as i32,
                         mouse::ScrollDelta::Pixels { y, .. } => {
@@ -493,25 +715,54 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                         }
                     };
                     if delta_lines != 0 {
-                        shell.publish(Message::ScrollViewport {
-                            session_id: self.session_id,
-                            delta_lines,
-                        });
-                        shell.capture_event();
+                        if self.snapshot.mouse_mode && !state.modifiers.shift() {
+                            let (col, row) = cursor
+                                .position_in(bounds)
+                                .map(|pos| {
+                                    let abs = Point::new(bounds.x + pos.x, bounds.y + pos.y);
+                                    let (c, r, _) =
+                                        point_to_cell(abs, inner, cell_size, &self.snapshot);
+                                    (c, r)
+                                })
+                                .or(state.cursor_cell)
+                                .unwrap_or((0, 0));
+                            let btn = if delta_lines > 0 {
+                                PtyMouseButton::WheelUp
+                            } else {
+                                PtyMouseButton::WheelDown
+                            };
+                            for _ in 0..delta_lines.unsigned_abs().clamp(1, 3) {
+                                self.forward_pty_mouse(
+                                    btn,
+                                    PtyMouseEventKind::Press,
+                                    col,
+                                    row,
+                                    state.modifiers,
+                                    shell,
+                                );
+                            }
+                            shell.capture_event();
+                        } else {
+                            shell.publish(Message::ScrollViewport {
+                                session_id: self.session_id,
+                                delta_lines,
+                            });
+                            shell.capture_event();
+                        }
                     }
                 }
             }
             Event::Keyboard(keyboard::Event::ModifiersChanged(modifiers)) => {
                 state.modifiers = *modifiers;
-                let prev = state.hovered_url.clone();
-                state.hovered_url = if modifiers.control()
+                let prev = state.hovered_link.clone();
+                state.hovered_link = if modifiers.control()
                     && let Some((col, row)) = state.cursor_cell
                 {
-                    url_at_cell(&self.snapshot, col, row)
+                    link_at_cell(&self.snapshot, col, row)
                 } else {
                     None
                 };
-                if state.hovered_url != prev {
+                if state.hovered_link != prev {
                     shell.request_redraw();
                 }
             }
@@ -523,37 +774,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 ..
             }) => {
                 state.modifiers = *modifiers;
-                if self.options.ime_enabled && is_focused {
-                    if modifiers.control()
-                        && !modifiers.shift()
-                        && !modifiers.alt()
-                        && !modifiers.logo()
-                        && is_ascii_letter(key, modified_key, 'f')
-                    {
-                        shell.publish(Message::OpenSearch);
-                        shell.capture_event();
-                        return;
-                    }
-
-                    if modifiers.control()
-                        && modifiers.shift()
-                        && !modifiers.alt()
-                        && !modifiers.logo()
-                    {
-                        if is_ascii_letter(key, modified_key, 'c') {
-                            shell.publish(Message::CopySelection {
-                                session_id: self.session_id,
-                            });
-                            shell.capture_event();
-                            return;
-                        }
-                        if is_ascii_letter(key, modified_key, 'v') {
-                            publish_clipboard_paste(self.session_id, clipboard, shell);
-                            shell.capture_event();
-                            return;
-                        }
-                    }
-
+                if self.options.ime_enabled && is_focused && !shell.is_event_captured() {
                     if modifiers.shift()
                         && !modifiers.control()
                         && !modifiers.alt()
@@ -641,7 +862,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
     ) -> mouse::Interaction {
         let state = tree.state.downcast_ref::<ViewportState>();
         if cursor.is_over(layout.bounds()) {
-            if state.hovered_url.is_some() {
+            if state.hovered_link.is_some() {
                 mouse::Interaction::Pointer
             } else {
                 mouse::Interaction::Text
@@ -680,7 +901,11 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             Shaping::Auto
         };
 
-        // Paint full viewport background first.
+        // Paint full viewport background first with configured opacity.
+        let canvas_bg = Color {
+            a: palette.background.a * self.options.opacity,
+            ..palette.background
+        };
         renderer.fill_quad(
             Quad {
                 bounds,
@@ -688,11 +913,16 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 shadow: Shadow::default(),
                 snap: true,
             },
-            Background::Color(palette.background),
+            Background::Color(canvas_bg),
         );
 
         let cols = self.snapshot.cols as usize;
         let rows = self.snapshot.rows as usize;
+        let highlight_grid = compute_highlight_grid(&self.snapshot, &self.options.highlight_rules);
+        let bold_font = Font {
+            weight: iced::font::Weight::Bold,
+            ..self.font
+        };
 
         for row in 0..rows {
             let y = inner.y + (row as f32) * cell_size.height;
@@ -715,8 +945,9 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                     continue;
                 }
 
-                let (fg, bg) =
-                    self.resolve_cell_appearance(cell, palette, grid_line, col, row, cols);
+                let hl = highlight_grid.get(row * cols + col).copied().flatten();
+                let (fg, bg, run_bold) =
+                    self.resolve_cell_appearance(cell, palette, grid_line, col, row, cols, hl);
 
                 let cell_width_cells = if cell.flags.contains(CellFlags::WIDE_CHAR) {
                     2.0
@@ -762,15 +993,17 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                             if !self.options.font_ligatures && (next.c.is_ascii() != first_ascii) {
                                 break;
                             }
-                            let (next_fg, next_bg) = self.resolve_cell_appearance(
+                            let next_hl = highlight_grid.get(row * cols + col + 1).copied().flatten();
+                            let (next_fg, next_bg, next_bold) = self.resolve_cell_appearance(
                                 next,
                                 palette,
                                 grid_line,
                                 col + 1,
                                 row,
                                 cols,
+                                next_hl,
                             );
-                            if next_fg != run_fg || next_bg != bg {
+                            if next_fg != run_fg || next_bg != bg || next_bold != run_bold {
                                 break;
                             }
                             col += 1;
@@ -785,7 +1018,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                             bounds: Size::new(inner.width, cell_size.height),
                             size: Pixels(self.options.font_size),
                             line_height: LineHeight::Absolute(Pixels(cell_size.height)),
-                            font: self.font,
+                            font: if run_bold { bold_font } else { self.font },
                             align_x: text::Alignment::Left,
                             align_y: iced::alignment::Vertical::Top,
                             shaping,
@@ -801,8 +1034,8 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             }
         }
 
-        // Underline hovered URL on Ctrl+Hover.
-        if let Some(hovered) = &state.hovered_url {
+        // Underline hovered URL or local file path on Ctrl+Hover.
+        if let Some(hovered) = &state.hovered_link {
             for span in &hovered.spans {
                 let y = inner.y + (span.row as f32 + 1.0) * cell_size.height - 2.0;
                 let x = inner.x + (span.start_col as f32) * cell_size.width;
@@ -821,6 +1054,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
 
         if let Some(cursor_snap) = self.snapshot.cursor
             && cursor_snap.shape != CursorShape::Hidden
+            && (!is_focused || self.options.cursor_visible)
         {
             let cursor_rect = ime_cursor_anchor_rect(&self.snapshot, inner, cell_size);
             let cursor_color = Color {
@@ -905,6 +1139,29 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             );
         }
 
+        // Render active visual bell flash border if triggered recently.
+        if self.options.bell_flash && bounds.width > 4.0 && bounds.height > 4.0 {
+            renderer.fill_quad(
+                Quad {
+                    bounds,
+                    border: Border {
+                        color: Color {
+                            a: 0.75,
+                            ..palette.ui_accent
+                        },
+                        width: 2.0,
+                        radius: 0.0.into(),
+                    },
+                    shadow: Shadow::default(),
+                    snap: true,
+                },
+                Background::Color(Color {
+                    a: 0.06,
+                    ..palette.ui_accent
+                }),
+            );
+        }
+
         // Render active Vietnamese/CJK IME pre-edit overlay inline at the cursor cell.
         if is_focused && !state.ime.content.is_empty() {
             draw_ime_preedit(
@@ -923,6 +1180,34 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
 }
 
 impl TerminalViewport {
+    fn forward_pty_mouse(
+        &self,
+        button: PtyMouseButton,
+        kind: PtyMouseEventKind,
+        col: usize,
+        row: usize,
+        modifiers: Modifiers,
+        shell: &mut Shell<'_, Message>,
+    ) {
+        let bytes = encode_mouse_event(
+            button,
+            kind,
+            col,
+            row,
+            modifiers.shift(),
+            modifiers.alt(),
+            modifiers.control(),
+            self.snapshot.mouse_sgr,
+        );
+        if !bytes.is_empty() {
+            shell.publish(Message::TerminalInput {
+                session_id: self.session_id,
+                bytes,
+            });
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn resolve_cell_appearance(
         &self,
         cell: &TerminalCell,
@@ -931,8 +1216,22 @@ impl TerminalViewport {
         col: usize,
         row: usize,
         cols: usize,
-    ) -> (Color, Color) {
+        highlight: Option<HighlightStyle>,
+    ) -> (Color, Color, bool) {
         let (mut fg, mut bg) = resolve_cell_colors(cell, palette);
+        let mut bold = cell.flags.contains(CellFlags::BOLD);
+
+        if let Some(hl) = highlight {
+            if let Some(hfg) = hl.fg {
+                fg = rgb_to_iced(hfg);
+            }
+            if let Some(hbg) = hl.bg {
+                bg = rgb_to_iced(hbg);
+            }
+            if hl.bold {
+                bold = true;
+            }
+        }
 
         if let Some((idx, _)) = self
             .search_matches
@@ -951,7 +1250,7 @@ impl TerminalViewport {
             bg = palette.selection_bg;
         }
 
-        (fg, bg)
+        (fg, bg, bold)
     }
 }
 
@@ -1079,14 +1378,6 @@ fn next_click_count(
     };
     *last_click = Some((now, col, row, count));
     count
-}
-
-fn is_ascii_letter(key: &Key, modified_key: &Key, letter: char) -> bool {
-    matches!(
-        (key.as_ref(), modified_key.as_ref()),
-        (Key::Character(s), _) | (_, Key::Character(s))
-            if s.chars().next().is_some_and(|c| c.to_ascii_lowercase() == letter)
-    )
 }
 
 fn resolve_font(font_family: &str) -> Font {

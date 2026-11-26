@@ -120,6 +120,9 @@ pub struct TunnelSnapshot {
     pub held_clients: usize,
     pub active_connections: usize,
     pub last_error: Option<String>,
+    pub reconnect_attempt: Option<u32>,
+    pub next_retry_secs: Option<u64>,
+    pub reconnected: bool,
 }
 
 /// Aggregated telemetry snapshot published by [`TunnelManager`].
@@ -291,6 +294,7 @@ struct ManagedTunnel {
     remote_bound: bool,
     retrying: Option<RetryTelemetry>,
     fatal_error: Option<String>,
+    was_recovering: bool,
     task_gen: u64,
     stop_tx: Option<watch::Sender<bool>>,
     retry_now_tx: Option<mpsc::UnboundedSender<()>>,
@@ -543,6 +547,18 @@ impl TunnelManager {
         (true, receivers)
     }
 
+    /// Stops a `Tunnel` if running and removes its entry from the manager snapshot registry.
+    pub fn remove_tunnel(&self, tunnel_id: &str) -> bool {
+        let mut guard = self.inner.registry.lock().expect("tunnel registry poisoned");
+        let Some(mut entry) = guard.remove(tunnel_id) else {
+            return false;
+        };
+        let receivers = stop_managed_entry(&mut entry);
+        self.inner.publish(&guard);
+        drop(receivers);
+        true
+    }
+
     /// Stops and removes all `Session`-bound (non-`Standalone`) `Tunnel`s attached to `session_id`.
     pub fn stop_session_tunnels(&self, session_id: u64) -> usize {
         let (count, receivers) = self.stop_session_tunnels_internal(session_id);
@@ -650,6 +666,9 @@ impl TunnelManager {
             held_clients: 0,
             active_connections: 0,
             last_error: Some(error.clone()),
+            reconnect_attempt: None,
+            next_retry_secs: None,
+            reconnected: false,
         };
 
         let mut guard = self.inner.registry.lock().expect("tunnel registry poisoned");
@@ -664,6 +683,7 @@ impl TunnelManager {
                 remote_bound: false,
                 retrying: None,
                 fatal_error: Some(error),
+                was_recovering: false,
                 task_gen,
                 stop_tx: None,
                 retry_now_tx: None,
@@ -706,6 +726,7 @@ impl TunnelManager {
             false,
             None,
             None,
+            false,
         );
         let tunnel_id = rule.id.clone();
 
@@ -735,6 +756,9 @@ impl TunnelManager {
                     held_clients: 0,
                     active_connections: 0,
                     last_error: None,
+                    reconnect_attempt: None,
+                    next_retry_secs: None,
+                    reconnected: false,
                 };
 
                 self.insert_managed_tunnel(
@@ -745,6 +769,7 @@ impl TunnelManager {
                         remote_bound: false,
                         retrying: None,
                         fatal_error: None,
+                        was_recovering: false,
                         task_gen,
                         stop_tx: Some(stop_tx),
                         retry_now_tx: None,
@@ -799,6 +824,9 @@ impl TunnelManager {
                     held_clients: 0,
                     active_connections: 0,
                     last_error: None,
+                    reconnect_attempt: None,
+                    next_retry_secs: None,
+                    reconnected: false,
                 };
 
                 self.insert_managed_tunnel(
@@ -809,6 +837,7 @@ impl TunnelManager {
                         remote_bound: false,
                         retrying: None,
                         fatal_error: None,
+                        was_recovering: false,
                         task_gen,
                         stop_tx: Some(stop_tx),
                         retry_now_tx: Some(retry_now_tx),
@@ -891,6 +920,7 @@ fn compute_tunnel_state(
     remote_bound: bool,
     retrying: Option<&RetryTelemetry>,
     fatal_error: Option<&str>,
+    was_recovering: bool,
 ) -> TunnelState {
     if let Some(err) = fatal_error {
         return TunnelState::Error(err.to_string());
@@ -908,7 +938,11 @@ fn compute_tunnel_state(
     match transport_status {
         TransportStatus::Connected { .. } => {
             if direction == TunnelDirection::Remote && !remote_bound {
-                TunnelState::Starting
+                if was_recovering {
+                    TunnelState::Reconnecting
+                } else {
+                    TunnelState::Starting
+                }
             } else {
                 TunnelState::Active
             }
@@ -916,7 +950,13 @@ fn compute_tunnel_state(
         TransportStatus::Degraded { .. } | TransportStatus::Reconnecting { .. } => {
             TunnelState::Reconnecting
         }
-        TransportStatus::Connecting => TunnelState::Starting,
+        TransportStatus::Connecting => {
+            if was_recovering {
+                TunnelState::Reconnecting
+            } else {
+                TunnelState::Starting
+            }
+        }
         TransportStatus::Disconnected => TunnelState::Stopped,
     }
 }
@@ -930,6 +970,63 @@ fn refresh_entry_state(entry: &mut ManagedTunnel) {
             entry.snapshot.remote_bound_port = None;
         }
     }
+    if entry.fatal_error.is_some() {
+        entry.was_recovering = true;
+        entry.snapshot.reconnected = false;
+        entry.snapshot.reconnect_attempt = None;
+        entry.snapshot.next_retry_secs = None;
+    } else if let Some(retry) = &entry.retrying {
+        entry.was_recovering = true;
+        entry.snapshot.reconnected = false;
+        entry.snapshot.reconnect_attempt = Some(retry.attempt);
+        entry.snapshot.next_retry_secs = Some(retry.next_retry_secs);
+    } else {
+        match &entry.transport_status {
+            TransportStatus::Reconnecting {
+                attempt,
+                next_retry_secs,
+            } => {
+                entry.was_recovering = true;
+                entry.snapshot.reconnected = false;
+                entry.snapshot.reconnect_attempt = Some(*attempt);
+                entry.snapshot.next_retry_secs = Some(*next_retry_secs);
+            }
+            TransportStatus::Degraded { .. } => {
+                entry.was_recovering = true;
+                entry.snapshot.reconnected = false;
+                entry.snapshot.reconnect_attempt = None;
+                entry.snapshot.next_retry_secs = None;
+            }
+            TransportStatus::Connecting => {
+                entry.snapshot.reconnected = false;
+                entry.snapshot.next_retry_secs = None;
+                if !entry.was_recovering {
+                    entry.snapshot.reconnect_attempt = None;
+                }
+            }
+            TransportStatus::Disconnected => {
+                entry.was_recovering = false;
+                entry.snapshot.reconnected = false;
+                entry.snapshot.reconnect_attempt = None;
+                entry.snapshot.next_retry_secs = None;
+            }
+            TransportStatus::Connected { .. } => {
+                if entry.snapshot.held_clients > 0 {
+                    entry.was_recovering = true;
+                    entry.snapshot.reconnected = false;
+                } else if entry.snapshot.direction != TunnelDirection::Remote || entry.remote_bound
+                {
+                    if entry.was_recovering {
+                        entry.snapshot.reconnected = true;
+                        entry.snapshot.last_error = None;
+                        entry.was_recovering = false;
+                    }
+                    entry.snapshot.reconnect_attempt = None;
+                    entry.snapshot.next_retry_secs = None;
+                }
+            }
+        }
+    }
     entry.snapshot.state = compute_tunnel_state(
         entry.snapshot.direction,
         &entry.transport_status,
@@ -937,6 +1034,7 @@ fn refresh_entry_state(entry: &mut ManagedTunnel) {
         entry.remote_bound,
         entry.retrying.as_ref(),
         entry.fatal_error.as_deref(),
+        entry.was_recovering,
     );
 }
 
@@ -1391,19 +1489,45 @@ async fn run_remote_tunnel(
                 });
             }
             RemoteBindOutcome::TransportError(err_msg) => {
-                failed_transport = snap.transport.clone();
-                retry_attempt = 0;
-                next_retry_deadline = None;
-                retry_reason = None;
-                inner.update_entry(&tunnel_id, task_gen, |entry| {
-                    entry.transport_status = snap.status.clone();
-                    entry.remote_bound = false;
-                    entry.retrying = None;
-                    entry.snapshot.remote_bound_port = None;
-                    entry.snapshot.bound_addr = None;
-                    entry.snapshot.last_error = Some(err_msg);
-                    refresh_entry_state(entry);
-                });
+                let transport_dead = snap.transport.as_ref().is_some_and(|t| t.is_closed());
+                if transport_dead {
+                    failed_transport = snap.transport.clone();
+                    retry_attempt = 0;
+                    next_retry_deadline = None;
+                    retry_reason = None;
+                    inner.update_entry(&tunnel_id, task_gen, |entry| {
+                        entry.transport_status = snap.status.clone();
+                        entry.remote_bound = false;
+                        entry.retrying = None;
+                        entry.was_recovering = true;
+                        entry.snapshot.remote_bound_port = None;
+                        entry.snapshot.bound_addr = None;
+                        entry.snapshot.last_error = Some(err_msg);
+                        refresh_entry_state(entry);
+                    });
+                } else {
+                    retry_attempt = retry_attempt.saturating_add(1).max(1);
+                    let backoff = inner.remote_backoff();
+                    let jitter: f64 = rand::rng().random();
+                    let delay =
+                        compute_reconnect_backoff(retry_attempt, backoff.min, backoff.max, jitter);
+                    next_retry_deadline = Some(TokioInstant::now() + delay);
+                    retry_reason = Some(err_msg.clone());
+                    let secs = ceil_secs(delay);
+                    inner.update_entry(&tunnel_id, task_gen, |entry| {
+                        entry.transport_status = snap.status.clone();
+                        entry.remote_bound = false;
+                        entry.snapshot.remote_bound_port = None;
+                        entry.snapshot.bound_addr = None;
+                        entry.snapshot.last_error = Some(err_msg.clone());
+                        entry.retrying = Some(RetryTelemetry {
+                            attempt: retry_attempt,
+                            next_retry_secs: secs,
+                            reason: err_msg,
+                        });
+                        refresh_entry_state(entry);
+                    });
+                }
             }
             RemoteBindOutcome::StopRequested => {
                 break;
@@ -1983,7 +2107,12 @@ impl StandaloneTransportDriver {
         let mut attempt: u32 = 0;
 
         loop {
-            self.publish_ready(TransportStatus::Connecting, None, None);
+            let retry_err = if attempt > 0 || self.has_connected_once {
+                self.last_error.clone()
+            } else {
+                None
+            };
+            self.publish_ready(TransportStatus::Connecting, None, retry_err);
 
             let connect_res = self.connect_with_cancel().await;
             match connect_res {

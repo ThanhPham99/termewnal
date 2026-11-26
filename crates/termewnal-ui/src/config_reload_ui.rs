@@ -153,7 +153,8 @@ impl ConfigReloadUiState {
                     controls,
                 ]
                 .spacing(10)
-                .align_y(Alignment::Center),
+                .wrap()
+                .vertical_spacing(6),
             )
             .width(Length::Fill)
             .padding([8, 12])
@@ -209,7 +210,7 @@ impl ConfigReloadUiState {
             .color(chrome.text_primary),
             text_input("Master password...", self.vault_password_draft.as_str())
                 .secure(true)
-                .width(Length::Fixed(220.0))
+                .width(Length::Fixed(200.0))
                 .size(12)
                 .padding([5, 8])
                 .style(styled_input_style(chrome))
@@ -220,15 +221,14 @@ impl ConfigReloadUiState {
                 .style(pill_button_style(chrome, PillTone::Primary))
                 .on_press(submit_msg),
         ]
-        .spacing(8)
-        .align_y(Alignment::Center);
+        .spacing(8);
 
         if let Some(err) = &self.vault_error {
             items = items.push(text(err.as_str()).size(12).color(chrome.danger));
         }
 
         Some(
-            container(items)
+            container(items.wrap().vertical_spacing(6))
                 .width(Length::Fill)
                 .padding([7, 12])
                 .style(move |_theme: &Theme| container::Style {

@@ -6,7 +6,7 @@ use termewnal_core::{
 
 #[test]
 fn builtin_themes_resolve_all_six_palettes_with_distinct_colors() {
-    assert_eq!(BuiltinTheme::ALL.len(), 6);
+    assert!(BuiltinTheme::ALL.len() >= 28);
 
     let cases = [
         ("Catppuccin", BuiltinTheme::Catppuccin, false),
@@ -17,6 +17,14 @@ fn builtin_themes_resolve_all_six_palettes_with_distinct_colors() {
         ("Nord", BuiltinTheme::Nord, false),
         ("Dark", BuiltinTheme::Dark, false),
         ("Light", BuiltinTheme::Light, true),
+        ("Solarized Dark", BuiltinTheme::SolarizedDark, false),
+        ("Solarized Light", BuiltinTheme::SolarizedLight, true),
+        ("Gruvbox Dark", BuiltinTheme::GruvboxDark, false),
+        ("Gruvbox Light", BuiltinTheme::GruvboxLight, true),
+        ("One Dark", BuiltinTheme::OneDark, false),
+        ("Monokai", BuiltinTheme::Monokai, false),
+        ("Rose Pine", BuiltinTheme::RosePine, false),
+        ("Kanagawa", BuiltinTheme::Kanagawa, false),
     ];
 
     for (input, expected_theme, expected_light) in cases {
@@ -27,6 +35,13 @@ fn builtin_themes_resolve_all_six_palettes_with_distinct_colors() {
         assert_eq!(palette.is_light, expected_light);
         assert_ne!(palette.background, palette.foreground);
         assert_ne!(palette.match_bg, palette.active_match_bg);
+    }
+
+    for &theme in BuiltinTheme::ALL {
+        let round = BuiltinTheme::from_name(theme.name()).expect("canonical name must resolve");
+        assert_eq!(round, theme);
+        let pal = theme.palette();
+        assert_ne!(pal.background, pal.foreground);
     }
 
     assert_eq!(BuiltinTheme::resolve("nonexistent"), BuiltinTheme::Dark);

@@ -191,6 +191,11 @@ Host agent-box
                 vault_secret_ref: None,
             },
             proxy_jump: vec!["bastion".to_string(), "jump2:2202".to_string()],
+            proxy_command: None,
+            proxy: None,
+            forward_agent: false,
+            forward_x11: false,
+            login_scripts: Vec::new(),
             auto_connect_on_startup: false,
             tmux_reattach: None,
             keepalive_interval_secs: None,
@@ -210,6 +215,11 @@ Host agent-box
             username: "alice".to_string(),
             auth: SshAuthMethod::Agent,
             proxy_jump: Vec::new(),
+            proxy_command: None,
+            proxy: None,
+            forward_agent: false,
+            forward_x11: false,
+            login_scripts: Vec::new(),
             auto_connect_on_startup: false,
             tmux_reattach: None,
             keepalive_interval_secs: None,
@@ -308,6 +318,10 @@ profiles:
     name: Legacy Switch
     options:
       host: 192.168.1.2
+  - id: tabby-unknown
+    type: custom-external-plugin
+    name: Unknown Plugin
+    options: {}
 appearance:
   theme: Dracula
 terminal:
@@ -325,11 +339,13 @@ unknownPluginBlock:
     let report = parse_tabby_config_str(yaml, "fallback").expect("parse tabby yaml");
     assert_eq!(report.imported_ssh_count, 2);
     assert_eq!(report.imported_local_count, 1);
+    assert_eq!(report.imported_serial_count, 1);
+    assert_eq!(report.imported_telnet_count, 1);
     assert_eq!(report.imported_tunnel_count, 3);
-    assert_eq!(report.skipped_unsupported_count, 2);
+    assert_eq!(report.skipped_unsupported_count, 1);
     assert_eq!(report.vault_status, TabbyVaultStatus::None);
     assert!(report.missing_credentials.is_empty());
-    assert_eq!(report.profiles.len(), 3);
+    assert_eq!(report.profiles.len(), 5);
 
     let bastion = &report.profiles[0];
     assert_eq!(bastion.name, "Bastion");
@@ -346,6 +362,11 @@ unknownPluginBlock:
                 vault_secret_ref: None,
             },
             proxy_jump: Vec::new(),
+            proxy_command: None,
+            proxy: None,
+            forward_agent: false,
+            forward_x11: false,
+            login_scripts: Vec::new(),
             auto_connect_on_startup: false,
             tmux_reattach: None,
             keepalive_interval_secs: None,
@@ -370,6 +391,11 @@ unknownPluginBlock:
                 vault_secret_ref: None,
             },
             proxy_jump: vec!["jump@bastion.prod.example:2222".to_string()],
+            proxy_command: None,
+            proxy: None,
+            forward_agent: false,
+            forward_x11: false,
+            login_scripts: Vec::new(),
             auto_connect_on_startup: false,
             tmux_reattach: None,
             keepalive_interval_secs: None,

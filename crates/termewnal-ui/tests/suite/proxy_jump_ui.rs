@@ -11,14 +11,15 @@ use tempfile::TempDir;
 use termewnal_core::{
     AppConfig, ConfigPaths, Profile, ProfileTarget, ProfilesConfig, SecretStore, SshAuthMethod,
     VaultBackend, VaultConfig,
+    load_profiles, save_profiles,
     vault::{EncryptedVault, InMemorySecretStore, VaultSession},
-    save_profiles,
 };
 use termewnal_ssh::{
     JumpHopSpec, SupervisorConfig, TransportStatus, record_known_host_path,
 };
+use termewnal_ui::sidebar::SystemSshProfile;
 use termewnal_ui::{
-    LaunchDisposition, Message, SshTargetSpec, SshUiEvent, drive_ssh_connect,
+    JumpHostKind, LaunchDisposition, Message, SshTargetSpec, SshUiEvent, drive_ssh_connect,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -644,4 +645,166 @@ async fn ui_drive_ssh_connect_executes_multihop_tofu_and_cascade_recovery_throug
         state.ssh_session(sid).unwrap().transport_status(),
         &TransportStatus::Disconnected
     );
+}
+
+#[test]
+fn tabby_jump_host_picker_route_builder_and_view_rendering() {
+    let temp = TempDir::new().expect("temp root");
+    let paths = ConfigPaths::from_root(temp.path());
+
+    let mut bastion = Profile::ssh(
+        "Bastion EU",
+        "eu-bastion.internal",
+        2222,
+        "jump",
+        SshAuthMethod::Agent,
+    );
+    bastion.id = "bastion-eu-id".to_string();
+
+    let mut internal_gw = Profile::ssh(
+        "Internal GW",
+        "gw.internal",
+        22,
+        "ops",
+        SshAuthMethod::Agent,
+    );
+    internal_gw.id = "internal-gw-id".to_string();
+    if let ProfileTarget::Ssh { proxy_jump, .. } = &mut internal_gw.target {
+        *proxy_jump = vec!["Bastion EU".to_string()];
+    }
+
+    let mut profiles_cfg = ProfilesConfig::default();
+    profiles_cfg.profiles = vec![bastion, internal_gw];
+    save_profiles(&paths, &profiles_cfg).expect("save jump host seed profiles");
+
+    let mut state = super::common::boot_test_app(paths.clone()).expect("boot AppState");
+    let win = iced::window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+    let _ = state.update(Message::SetSystemSshProfiles(vec![SystemSshProfile {
+        alias: "edge-ssh".to_string(),
+        host_name: Some("10.80.0.5".to_string()),
+        port: 2200,
+        user: Some("infra".to_string()),
+        identity_file: None,
+        proxy_jump: vec!["Bastion EU".to_string()],
+        forward_agent: None,
+        forward_x11: None,
+        proxy_command: None,
+    }]));
+
+    // 1. Open New Profile modal -> candidates include Saved SSH profiles & System SSH config hosts.
+    let _ = state.update(Message::OpenNewProfileModal);
+    assert_eq!(state.profile_editor().jump_host_candidates.len(), 3);
+    assert_eq!(
+        state.profile_editor().jump_host_candidates[0].kind,
+        JumpHostKind::SavedProfile
+    );
+    assert_eq!(
+        state.profile_editor().jump_host_candidates[2].kind,
+        JumpHostKind::SystemSsh
+    );
+    assert!(state.profile_editor().jump_hops().is_empty());
+    drop(state.view(win)); // Renders empty Direct route cleanly.
+
+    // 2. Select from Tabby dropdown + add custom hop via "+ Custom" controls.
+    let _ = state.update(Message::ProfileFormNameChanged("App Prod".to_string()));
+    let _ = state.update(Message::ProfileFormHostChanged("app.prod.internal".to_string()));
+    let _ = state.update(Message::ProfileFormUsernameChanged("deploy".to_string()));
+    let _ = state.update(Message::ProfileFormJumpDropdownSelected("Bastion EU".to_string()));
+    assert_eq!(state.profile_editor().jump_hops(), vec!["Bastion EU"]);
+
+    let _ = state.update(Message::ProfileFormToggleCustomJumpInput);
+    assert!(state.profile_editor().jump_custom_open);
+    let _ = state.update(Message::ProfileFormCustomJumpDraftChanged(
+        "ops@relay.internal:2222".to_string(),
+    ));
+    let _ = state.update(Message::ProfileFormAddCustomJumpHop);
+    assert!(!state.profile_editor().jump_custom_open);
+    assert_eq!(
+        state.profile_editor().jump_hops(),
+        vec!["Bastion EU", "ops@relay.internal:2222"]
+    );
+
+    // Prevent duplicates and self-cycle references gracefully.
+    let _ = state.update(Message::ProfileFormJumpDropdownSelected("bastion eu".to_string()));
+    assert!(state.profile_editor().validation_error.is_some());
+    let _ = state.update(Message::ProfileFormCustomJumpDraftChanged("App Prod".to_string()));
+    let _ = state.update(Message::ProfileFormAddCustomJumpHop);
+    assert!(
+        state
+            .profile_editor()
+            .validation_error
+            .as_deref()
+            .is_some_and(|e| e.contains("cycle"))
+    );
+
+    // 3. Reorder hops in the route diagram and verify compact + wide rendering.
+    let _ = state.update(Message::ProfileFormMoveJumpHop {
+        index: 1,
+        delta: -1,
+    });
+    assert_eq!(
+        state.profile_editor().jump_hops(),
+        vec!["ops@relay.internal:2222", "Bastion EU"]
+    );
+    drop(state.view(win));
+    let _ = state.update(Message::WindowResized(win, iced::Size::new(620.0, 480.0)));
+    drop(state.view(win));
+    let _ = state.update(Message::WindowResized(win, iced::Size::new(1280.0, 800.0)));
+
+    // Remove one hop, append System SSH host, then save to profiles.toml.
+    let _ = state.update(Message::ProfileFormRemoveJumpHop(0));
+    let _ = state.update(Message::ProfileFormJumpDropdownSelected("edge-ssh".to_string()));
+    assert_eq!(
+        state.profile_editor().jump_hops(),
+        vec!["Bastion EU", "edge-ssh"]
+    );
+    let _ = state.update(Message::ProfileSave);
+    assert!(!state.profile_editor().is_open());
+
+    let persisted = load_profiles(&paths).expect("reload saved profiles");
+    let app_prod = persisted
+        .profiles
+        .iter()
+        .find(|p| p.name == "App Prod")
+        .expect("saved App Prod profile");
+    match &app_prod.target {
+        ProfileTarget::Ssh { proxy_jump, .. } => {
+            assert_eq!(proxy_jump, &vec!["Bastion EU", "edge-ssh"]);
+        }
+        other => panic!("expected SSH target, got {other:?}"),
+    }
+
+    // 4. Launch App Prod and verify Sidebar + Active SSH Toolbar render with jump route badges cleanly.
+    let _ = state.update(Message::LaunchProfile {
+        profile_id: app_prod.id.clone(),
+        disposition: LaunchDisposition::NewTab,
+    });
+    drop(state.view(win));
+
+    // 5. Re-open Edit modal on App Prod -> excludes itself from candidates and allows Clear to Direct.
+    let _ = state.update(Message::OpenEditProfileModal(app_prod.id.clone()));
+    assert!(
+        state
+            .profile_editor()
+            .jump_host_candidates
+            .iter()
+            .all(|c| c.token != "App Prod")
+    );
+    assert_eq!(
+        state.profile_editor().jump_hops(),
+        vec!["Bastion EU", "edge-ssh"]
+    );
+    let _ = state.update(Message::ProfileFormClearJumpHops);
+    assert!(state.profile_editor().jump_hops().is_empty());
+    let _ = state.update(Message::ProfileSave);
+    let after_clear = load_profiles(&paths).expect("reload profiles after clearing jump");
+    let cleared = after_clear
+        .profiles
+        .iter()
+        .find(|p| p.id == app_prod.id)
+        .unwrap();
+    if let ProfileTarget::Ssh { proxy_jump, .. } = &cleared.target {
+        assert!(proxy_jump.is_empty());
+    }
 }

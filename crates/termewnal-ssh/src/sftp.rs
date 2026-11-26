@@ -1,12 +1,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use russh_sftp::client::SftpSession;
 use russh_sftp::client::fs::Metadata;
-use russh_sftp::protocol::{FileAttributes, FileType};
+use russh_sftp::protocol::{FileAttributes, FileType, OpenFlags};
 use termewnal_core::vault::SecretStore;
-use tokio::sync::{Mutex as AsyncMutex, Notify};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::{Mutex as AsyncMutex, Notify, watch};
 use zeroize::Zeroizing;
 
 use crate::auth::{
@@ -109,6 +111,26 @@ impl SftpTransportMode {
 pub struct SftpStatusNotice {
     pub mode: SftpTransportMode,
     pub message: Option<String>,
+}
+
+/// Live connection & recovery lifecycle state of an SFTP endpoint in [`SftpManager`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum SftpTransportStatus {
+    #[default]
+    Idle,
+    Connected {
+        mode: SftpTransportMode,
+    },
+    AutoReconnecting {
+        attempt: u32,
+        reason: String,
+    },
+    Reconnected {
+        mode: SftpTransportMode,
+    },
+    Error {
+        reason: String,
+    },
 }
 
 /// Classification of a remote filesystem entry returned by SFTP directory listings or `stat`.
@@ -576,10 +598,21 @@ fn is_silent_auth_blocked(err: &SshError) -> bool {
     )
 }
 
+const DEFAULT_SFTP_OP_RETRY_DELAY: Duration = Duration::from_millis(200);
+const DEFAULT_SFTP_OP_MAX_RETRIES: u32 = 2;
+
 /// Non-blocking SFTP File Browser & transport coordinator built on [`TransferTransportPool`].
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SftpManager {
     pool: Arc<TransferTransportPool>,
+    status_tx: Arc<watch::Sender<HashMap<ProfileTransportKey, SftpTransportStatus>>>,
+    retry_delay: Duration,
+}
+
+impl Default for SftpManager {
+    fn default() -> Self {
+        Self::with_pool(Arc::new(TransferTransportPool::new()))
+    }
 }
 
 impl SftpManager {
@@ -590,12 +623,65 @@ impl SftpManager {
 
     /// Creates an [`SftpManager`] sharing an existing [`TransferTransportPool`].
     pub fn with_pool(pool: Arc<TransferTransportPool>) -> Self {
-        Self { pool }
+        let (status_tx, _) = watch::channel(HashMap::new());
+        Self {
+            pool,
+            status_tx: Arc::new(status_tx),
+            retry_delay: DEFAULT_SFTP_OP_RETRY_DELAY,
+        }
+    }
+
+    /// Overrides the retry backoff delay used when an SFTP browser operation encounters a connection drop.
+    pub fn with_retry_delay(mut self, delay: Duration) -> Self {
+        self.retry_delay = delay.max(Duration::from_millis(1));
+        self
     }
 
     /// Returns the underlying [`TransferTransportPool`].
     pub fn pool(&self) -> &Arc<TransferTransportPool> {
         &self.pool
+    }
+
+    /// Subscribes to per-endpoint [`SftpTransportStatus`] transitions.
+    pub fn subscribe_status(
+        &self,
+    ) -> watch::Receiver<HashMap<ProfileTransportKey, SftpTransportStatus>> {
+        self.status_tx.subscribe()
+    }
+
+    /// Returns the current [`SftpTransportStatus`] for `key`.
+    pub fn transport_status(&self, key: &ProfileTransportKey) -> SftpTransportStatus {
+        self.status_tx
+            .borrow()
+            .get(key)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn set_transport_status(&self, key: &ProfileTransportKey, status: SftpTransportStatus) {
+        self.status_tx.send_if_modified(|map| {
+            if map.get(key) == Some(&status) {
+                false
+            } else {
+                map.insert(key.clone(), status);
+                true
+            }
+        });
+    }
+
+    /// Records an external reconnect state (e.g., when the primary SSH transport drops).
+    pub fn mark_reconnecting(&self, key: &ProfileTransportKey, attempt: u32, reason: String) {
+        self.pool.invalidate(key);
+        self.set_transport_status(
+            key,
+            SftpTransportStatus::AutoReconnecting { attempt, reason },
+        );
+    }
+
+    /// Clears SFTP connection status back to [`SftpTransportStatus::Idle`].
+    pub fn mark_disconnected(&self, key: &ProfileTransportKey) {
+        self.pool.invalidate(key);
+        self.set_transport_status(key, SftpTransportStatus::Idle);
     }
 
     /// Registers an active `Primary Transport` for automatic 2FA mux fallback.
@@ -625,39 +711,141 @@ impl SftpManager {
         self.pool.acquire(endpoint, SftpChannelRole::Transfer).await
     }
 
+    async fn run_browser_with_reconnect<'a, T, F>(
+        &'a self,
+        endpoint: &'a SftpEndpoint,
+        mut op: F,
+    ) -> Result<(T, AcquiredSftpSession), SshError>
+    where
+        F: FnMut(Arc<SftpSession>) -> BoxFuture<'a, Result<T, SshError>>,
+    {
+        let notifier = self.pool.reconnect_notifier();
+        let mut retry: u32 = 0;
+
+        loop {
+            let acquired = match self.pool.acquire(endpoint, SftpChannelRole::Browser).await {
+                Ok(acq) => acq,
+                Err(err) => {
+                    if err.is_connection_error() && retry < DEFAULT_SFTP_OP_MAX_RETRIES {
+                        retry += 1;
+                        self.pool.invalidate(&endpoint.key);
+                        self.set_transport_status(
+                            &endpoint.key,
+                            SftpTransportStatus::AutoReconnecting {
+                                attempt: retry,
+                                reason: err.to_string(),
+                            },
+                        );
+                        tokio::select! {
+                            _ = notifier.notified() => {}
+                            _ = tokio::time::sleep(self.retry_delay.saturating_mul(retry)) => {}
+                        }
+                        continue;
+                    }
+                    if err.is_connection_error() {
+                        self.set_transport_status(
+                            &endpoint.key,
+                            SftpTransportStatus::Error {
+                                reason: err.to_string(),
+                            },
+                        );
+                    }
+                    return Err(err);
+                }
+            };
+
+            let session = Arc::clone(&acquired.session);
+            match op(session).await {
+                Ok(val) => {
+                    let was_recovering = retry > 0
+                        || matches!(
+                            self.transport_status(&endpoint.key),
+                            SftpTransportStatus::AutoReconnecting { .. }
+                                | SftpTransportStatus::Error { .. }
+                        );
+                    let next_status = if was_recovering {
+                        SftpTransportStatus::Reconnected {
+                            mode: acquired.mode,
+                        }
+                    } else {
+                        SftpTransportStatus::Connected {
+                            mode: acquired.mode,
+                        }
+                    };
+                    self.set_transport_status(&endpoint.key, next_status);
+                    return Ok((val, acquired));
+                }
+                Err(err) => {
+                    if err.is_connection_error() && retry < DEFAULT_SFTP_OP_MAX_RETRIES {
+                        retry += 1;
+                        self.pool.invalidate(&endpoint.key);
+                        self.set_transport_status(
+                            &endpoint.key,
+                            SftpTransportStatus::AutoReconnecting {
+                                attempt: retry,
+                                reason: err.to_string(),
+                            },
+                        );
+                        tokio::select! {
+                            _ = notifier.notified() => {}
+                            _ = tokio::time::sleep(self.retry_delay.saturating_mul(retry)) => {}
+                        }
+                        continue;
+                    }
+                    if err.is_connection_error() {
+                        self.set_transport_status(
+                            &endpoint.key,
+                            SftpTransportStatus::Error {
+                                reason: err.to_string(),
+                            },
+                        );
+                    }
+                    return Err(err);
+                }
+            }
+        }
+    }
+
     /// Lists `path` (or `"."` if empty), sorting directories first alphabetically.
     pub async fn list_dir(
         &self,
         endpoint: &SftpEndpoint,
         path: &str,
     ) -> Result<RemoteListing, SshError> {
-        let acquired = self.pool.acquire(endpoint, SftpChannelRole::Browser).await?;
         let requested = if path.trim().is_empty() { "." } else { path };
-        let resolved_path = match acquired.session.canonicalize(requested).await {
-            Ok(resolved) => resolved,
-            Err(_) => requested.to_string(),
-        };
+        let ((resolved_path, entries), acquired) = self
+            .run_browser_with_reconnect(endpoint, |session| {
+                Box::pin(async move {
+                    let resolved_path = match session.canonicalize(requested).await {
+                        Ok(resolved) => resolved,
+                        Err(_) => requested.to_string(),
+                    };
 
-        let read_dir = acquired.session.read_dir(resolved_path.as_str()).await?;
-        let mut entries: Vec<RemoteDirEntry> = read_dir
-            .map(|entry| {
-                let name = entry.file_name();
-                let full_path = entry.path();
-                let meta = entry.metadata();
-                RemoteDirEntry::from_metadata(name, full_path, &meta)
-            })
-            .collect();
+                    let read_dir = session.read_dir(resolved_path.as_str()).await?;
+                    let mut entries: Vec<RemoteDirEntry> = read_dir
+                        .map(|entry| {
+                            let name = entry.file_name();
+                            let full_path = entry.path();
+                            let meta = entry.metadata();
+                            RemoteDirEntry::from_metadata(name, full_path, &meta)
+                        })
+                        .collect();
 
-        entries.sort_by(|a, b| {
-            b.is_dir()
-                .cmp(&a.is_dir())
-                .then_with(|| {
-                    a.name
-                        .to_ascii_lowercase()
-                        .cmp(&b.name.to_ascii_lowercase())
+                    entries.sort_by(|a, b| {
+                        b.is_dir()
+                            .cmp(&a.is_dir())
+                            .then_with(|| {
+                                a.name
+                                    .to_ascii_lowercase()
+                                    .cmp(&b.name.to_ascii_lowercase())
+                            })
+                            .then_with(|| a.name.cmp(&b.name))
+                    });
+
+                    Ok((resolved_path, entries))
                 })
-                .then_with(|| a.name.cmp(&b.name))
-        });
+            })
+            .await?;
 
         Ok(RemoteListing {
             resolved_path,
@@ -673,8 +861,12 @@ impl SftpManager {
         endpoint: &SftpEndpoint,
         path: &str,
     ) -> Result<String, SshError> {
-        let acquired = self.pool.acquire(endpoint, SftpChannelRole::Browser).await?;
-        Ok(acquired.session.canonicalize(path).await?)
+        let (resolved, _) = self
+            .run_browser_with_reconnect(endpoint, |session| {
+                Box::pin(async move { Ok(session.canonicalize(path).await?) })
+            })
+            .await?;
+        Ok(resolved)
     }
 
     /// Queries metadata (`stat`, following symlinks) for `path`.
@@ -683,8 +875,11 @@ impl SftpManager {
         endpoint: &SftpEndpoint,
         path: &str,
     ) -> Result<RemoteDirEntry, SshError> {
-        let acquired = self.pool.acquire(endpoint, SftpChannelRole::Browser).await?;
-        let meta = acquired.session.metadata(path).await?;
+        let (meta, _) = self
+            .run_browser_with_reconnect(endpoint, |session| {
+                Box::pin(async move { Ok(session.metadata(path).await?) })
+            })
+            .await?;
         let name = path_leaf_name(path);
         Ok(RemoteDirEntry::from_metadata(name, path.to_string(), &meta))
     }
@@ -695,28 +890,40 @@ impl SftpManager {
         endpoint: &SftpEndpoint,
         path: &str,
     ) -> Result<RemoteDirEntry, SshError> {
-        let acquired = self.pool.acquire(endpoint, SftpChannelRole::Browser).await?;
-        let meta = acquired.session.symlink_metadata(path).await?;
+        let (meta, _) = self
+            .run_browser_with_reconnect(endpoint, |session| {
+                Box::pin(async move { Ok(session.symlink_metadata(path).await?) })
+            })
+            .await?;
         let name = path_leaf_name(path);
         Ok(RemoteDirEntry::from_metadata(name, path.to_string(), &meta))
     }
 
     /// Creates a remote directory at `path`.
     pub async fn mkdir(&self, endpoint: &SftpEndpoint, path: &str) -> Result<(), SshError> {
-        let acquired = self.pool.acquire(endpoint, SftpChannelRole::Browser).await?;
-        Ok(acquired.session.create_dir(path).await?)
+        self.run_browser_with_reconnect(endpoint, |session| {
+            Box::pin(async move { Ok(session.create_dir(path).await?) })
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Deletes a remote regular file or symlink at `path`.
     pub async fn remove_file(&self, endpoint: &SftpEndpoint, path: &str) -> Result<(), SshError> {
-        let acquired = self.pool.acquire(endpoint, SftpChannelRole::Browser).await?;
-        Ok(acquired.session.remove_file(path).await?)
+        self.run_browser_with_reconnect(endpoint, |session| {
+            Box::pin(async move { Ok(session.remove_file(path).await?) })
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Deletes an empty remote directory at `path`.
     pub async fn remove_dir(&self, endpoint: &SftpEndpoint, path: &str) -> Result<(), SshError> {
-        let acquired = self.pool.acquire(endpoint, SftpChannelRole::Browser).await?;
-        Ok(acquired.session.remove_dir(path).await?)
+        self.run_browser_with_reconnect(endpoint, |session| {
+            Box::pin(async move { Ok(session.remove_dir(path).await?) })
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Renames or moves a remote file or directory from `old_path` to `new_path`.
@@ -726,8 +933,11 @@ impl SftpManager {
         old_path: &str,
         new_path: &str,
     ) -> Result<(), SshError> {
-        let acquired = self.pool.acquire(endpoint, SftpChannelRole::Browser).await?;
-        Ok(acquired.session.rename(old_path, new_path).await?)
+        self.run_browser_with_reconnect(endpoint, |session| {
+            Box::pin(async move { Ok(session.rename(old_path, new_path).await?) })
+        })
+        .await
+        .map(|_| ())
     }
 
     /// Updates POSIX permissions on `path` (`setstat`), used by recursive permission preservation.
@@ -737,12 +947,183 @@ impl SftpManager {
         path: &str,
         permissions: u32,
     ) -> Result<(), SshError> {
-        let acquired = self.pool.acquire(endpoint, SftpChannelRole::Browser).await?;
-        let attrs = FileAttributes {
-            permissions: Some(permissions),
-            ..Default::default()
-        };
-        Ok(acquired.session.set_metadata(path, attrs).await?)
+        self.run_browser_with_reconnect(endpoint, |session| {
+            Box::pin(async move {
+                let attrs = FileAttributes {
+                    permissions: Some(permissions),
+                    ..Default::default()
+                };
+                Ok(session.set_metadata(path, attrs).await?)
+            })
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Reads up to `max_bytes` UTF-8 text from remote `path` for the SFTP+ file viewer/editor.
+    pub async fn read_text_file(
+        &self,
+        endpoint: &SftpEndpoint,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<String, SshError> {
+        let (content, _) = self
+            .run_browser_with_reconnect(endpoint, |session| {
+                Box::pin(async move {
+                    let mut remote_file = session.open_with_flags(path, OpenFlags::READ).await?;
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 32 * 1024];
+                    loop {
+                        let n = remote_file.read(&mut chunk).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        if buf.len() + n > max_bytes {
+                            return Err(SshError::Sftp(format!(
+                                "File exceeds {max_bytes} byte viewer limit; download instead."
+                            )));
+                        }
+                        if chunk[..n].contains(&0) {
+                            return Err(SshError::Sftp(
+                                "Binary file detected (contains NUL bytes); download to inspect."
+                                    .to_string(),
+                            ));
+                        }
+                        buf.extend_from_slice(&chunk[..n]);
+                    }
+                    String::from_utf8(buf).map_err(|_| {
+                        SshError::Sftp(
+                            "File is not valid UTF-8 text; download to inspect.".to_string(),
+                        )
+                    })
+                })
+            })
+            .await?;
+        Ok(content)
+    }
+
+    /// Writes `content` UTF-8 bytes back to remote `path` (creating or truncating).
+    pub async fn write_text_file(
+        &self,
+        endpoint: &SftpEndpoint,
+        path: &str,
+        content: &str,
+    ) -> Result<(), SshError> {
+        self.run_browser_with_reconnect(endpoint, |session| {
+            Box::pin(async move {
+                let mut remote_file = session
+                    .open_with_flags(
+                        path,
+                        OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                    )
+                    .await?;
+                remote_file.write_all(content.as_bytes()).await?;
+                remote_file.flush().await?;
+                remote_file.shutdown().await?;
+                Ok(())
+            })
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Creates an empty regular file at `path` if it does not already exist.
+    pub async fn create_empty_file(
+        &self,
+        endpoint: &SftpEndpoint,
+        path: &str,
+    ) -> Result<(), SshError> {
+        self.run_browser_with_reconnect(endpoint, |session| {
+            Box::pin(async move {
+                if session.symlink_metadata(path).await.is_ok() {
+                    return Err(SshError::Sftp(format!("Target already exists: {path}")));
+                }
+                let mut remote_file = session
+                    .open_with_flags(path, OpenFlags::CREATE | OpenFlags::WRITE)
+                    .await?;
+                remote_file.flush().await?;
+                remote_file.shutdown().await?;
+                Ok(())
+            })
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Copies a regular remote file at `src_path` to `dst_path` on the same SFTP endpoint.
+    pub async fn copy_file(
+        &self,
+        endpoint: &SftpEndpoint,
+        src_path: &str,
+        dst_path: &str,
+    ) -> Result<(), SshError> {
+        if src_path == dst_path {
+            return Ok(());
+        }
+        self.run_browser_with_reconnect(endpoint, |session| {
+            Box::pin(async move {
+                let mut src = session.open_with_flags(src_path, OpenFlags::READ).await?;
+                let mut dst = session
+                    .open_with_flags(
+                        dst_path,
+                        OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                    )
+                    .await?;
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    let n = src.read(&mut buf).await?;
+                    if n == 0 {
+                        break;
+                    }
+                    dst.write_all(&buf[..n]).await?;
+                }
+                dst.flush().await?;
+                dst.shutdown().await?;
+                Ok(())
+            })
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Deletes a remote directory and all nested contents safely without following symlinks.
+    pub async fn remove_dir_recursive(
+        &self,
+        endpoint: &SftpEndpoint,
+        path: &str,
+    ) -> Result<(), SshError> {
+        let clean = path.trim_end_matches('/');
+        if clean.is_empty() || path == "/" {
+            return Err(SshError::Sftp("refusing to recursively remove '/'".to_string()));
+        }
+        self.run_browser_with_reconnect(endpoint, |session| {
+            Box::pin(async move {
+                let mut pending = vec![path.to_string()];
+                let mut dirs_bottom_up = Vec::new();
+                while let Some(dir) = pending.pop() {
+                    dirs_bottom_up.push(dir.clone());
+                    let entries = session.read_dir(dir.as_str()).await?;
+                    for entry in entries {
+                        let name = entry.file_name();
+                        if name == "." || name == ".." {
+                            continue;
+                        }
+                        let child_path = entry.path();
+                        if entry.metadata().file_type() == FileType::Dir {
+                            pending.push(child_path);
+                        } else {
+                            session.remove_file(child_path.as_str()).await?;
+                        }
+                    }
+                }
+                while let Some(dir) = dirs_bottom_up.pop() {
+                    session.remove_dir(dir.as_str()).await?;
+                }
+                Ok(())
+            })
+        })
+        .await
+        .map(|_| ())
     }
 }
 

@@ -1,21 +1,27 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use iced::widget::{Id, button, column, container, row, rule, scrollable, space, text, text_input};
-use iced::{Alignment, Background, Color, Element, Length, Theme};
+use iced::advanced::layout::{self, Layout};
+use iced::advanced::renderer::{self, Quad};
+use iced::advanced::widget::{Tree, tree};
+use iced::advanced::Widget;
+use iced::widget::{Id, button, column, container, row, scrollable, space, text, text_input};
+use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Rectangle, Shadow, Size, Theme, mouse};
 use termewnal_core::{OpenSshHost, Profile, ProfileTarget, ThemePalette, TunnelDirection};
 
 use crate::app::{LaunchDisposition, Message, SessionId};
+use crate::context_menu::{SidebarRightClickCapture, TunnelRightClickCapture};
+use crate::drag_drop::{DragDropState, DragPayload, DragSource, DropTarget, DropTargetZone, DropZoneKind};
 use crate::ui_theme::{
-    ChromePalette, PillTone, badge_pill, card_container_style, pill_button_style, status_dot,
-    styled_input_style,
+    ChromePalette, FONT_BODY, FONT_META, badge_pill, hairline_h, hairline_v,
+    list_row_button_style, mono_font, settings_nav_pill_style, sidebar_width_for_window,
+    status_dot, styled_input_style, tab_bar_button_style, tabby_scrollable_style, ui_font,
+    ui_font_medium, ui_font_semibold,
 };
-use crate::workspace::SplitAxis;
+use crate::workspace::TabId;
 
 /// Group heading used when a saved `Profile` has no explicit group assigned.
 pub const UNGROUPED_LABEL: &str = "Ungrouped";
-
-const SIDEBAR_WIDTH: f32 = 280.0;
 
 /// Returns the static widget [`Id`] for the Left Sidebar profile filter input.
 pub const fn sidebar_filter_input_id() -> Id {
@@ -25,9 +31,32 @@ pub const fn sidebar_filter_input_id() -> Id {
 /// Top-level collapsible sections inside the Left Sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum SidebarSection {
+    ActiveSessions,
     SavedProfiles,
     SystemSshProfiles,
     ActiveTunnels,
+}
+
+/// Filter scope for the saved profiles tree (`All` profiles or only `Active` sessions).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SidebarFilterScope {
+    #[default]
+    All,
+    Active,
+}
+
+/// Running session summary displayed in the sidebar `ACTIVE SESSIONS` section.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidebarSessionEntry {
+    pub session_id: SessionId,
+    pub tab_id: TabId,
+    pub profile_id: Option<String>,
+    pub title: String,
+    pub connected: bool,
+    pub connecting: bool,
+    pub auto_reconnecting: bool,
+    pub reconnected: bool,
+    pub active_tab: bool,
 }
 
 /// A named group of saved `Profile`s prepared for sidebar rendering.
@@ -47,6 +76,9 @@ pub struct SystemSshProfile {
     pub user: Option<String>,
     pub identity_file: Option<String>,
     pub proxy_jump: Vec<String>,
+    pub forward_agent: Option<bool>,
+    pub forward_x11: Option<bool>,
+    pub proxy_command: Option<String>,
 }
 
 impl SystemSshProfile {
@@ -74,7 +106,9 @@ impl SystemSshProfile {
                 .map(|p| vec![PathBuf::from(p)])
                 .unwrap_or_default(),
             proxy_jump: self.proxy_jump.clone(),
-            forward_agent: None,
+            forward_agent: self.forward_agent,
+            forward_x11: self.forward_x11,
+            proxy_command: self.proxy_command.clone(),
         }
     }
 }
@@ -90,6 +124,9 @@ impl From<&OpenSshHost> for SystemSshProfile {
                 .primary_identity_file()
                 .map(|p| p.to_string_lossy().into_owned()),
             proxy_jump: host.proxy_jump.clone(),
+            forward_agent: host.forward_agent,
+            forward_x11: host.forward_x11,
+            proxy_command: host.proxy_command.clone(),
         }
     }
 }
@@ -118,8 +155,8 @@ impl TunnelRuntimeState {
             Self::Starting => "Starting",
             Self::Active => "Active",
             Self::Holding => "Holding",
-            Self::Reconnecting => "Reconnecting",
-            Self::Retrying { .. } => "Retrying",
+            Self::Reconnecting => "Auto-reconnecting",
+            Self::Retrying { .. } => "Auto-reconnecting",
             Self::Error(_) => "Error",
         }
     }
@@ -131,7 +168,7 @@ impl TunnelRuntimeState {
                 attempt,
                 next_retry_secs,
                 ..
-            } => format!("Retrying #{attempt} ({next_retry_secs}s)"),
+            } => format!("Auto-reconnecting #{attempt} ({next_retry_secs}s)"),
             _ => self.label().to_string(),
         }
     }
@@ -148,12 +185,17 @@ pub struct ActiveTunnelEntry {
     pub state: TunnelRuntimeState,
     pub standalone: bool,
     pub session_id: Option<SessionId>,
+    pub reconnect_attempt: Option<u32>,
+    pub next_retry_secs: Option<u64>,
+    pub last_error: Option<String>,
+    pub reconnected_notice: Option<String>,
 }
 
-/// State backing the collapsible Left Sidebar (`Ctrl+B`).
-#[derive(Debug, Clone, Default)]
+/// State backing the always-visible Left Sidebar.
+#[derive(Debug, Clone)]
 pub struct SidebarState {
     open: bool,
+    filter_scope: SidebarFilterScope,
     filter_query: String,
     selected_tag: Option<String>,
     collapsed_groups: BTreeSet<String>,
@@ -162,26 +204,51 @@ pub struct SidebarState {
     active_tunnels: Vec<ActiveTunnelEntry>,
 }
 
+impl Default for SidebarState {
+    fn default() -> Self {
+        Self {
+            open: true,
+            filter_scope: SidebarFilterScope::All,
+            filter_query: String::new(),
+            selected_tag: None,
+            collapsed_groups: BTreeSet::new(),
+            collapsed_sections: BTreeSet::new(),
+            system_ssh_profiles: Vec::new(),
+            active_tunnels: Vec::new(),
+        }
+    }
+}
+
 impl SidebarState {
-    /// Creates a new collapsed [`SidebarState`].
+    /// Creates a new [`SidebarState`] (always expanded).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Returns `true` when the Left Sidebar is expanded.
+    /// Returns `true` (the Left Sidebar is always visible).
     pub fn is_open(&self) -> bool {
         self.open
     }
 
-    /// Explicitly opens or collapses the Left Sidebar.
-    pub fn set_open(&mut self, open: bool) {
-        self.open = open;
+    /// Keeps the Left Sidebar open (toggling/collapsing is disabled).
+    pub fn set_open(&mut self, _open: bool) {
+        self.open = true;
     }
 
-    /// Toggles Left Sidebar visibility and returns the updated state.
+    /// Keeps the Left Sidebar open (toggling/collapsing is disabled).
     pub fn toggle(&mut self) -> bool {
-        self.open = !self.open;
-        self.open
+        self.open = true;
+        true
+    }
+
+    /// Returns the active profile tree filter scope (`All` or `Active`).
+    pub fn filter_scope(&self) -> SidebarFilterScope {
+        self.filter_scope
+    }
+
+    /// Sets the profile tree filter scope (`All` or `Active`).
+    pub fn set_filter_scope(&mut self, scope: SidebarFilterScope) {
+        self.filter_scope = scope;
     }
 
     /// Returns the active text filter query inside the Left Sidebar.
@@ -222,6 +289,15 @@ impl SidebarState {
     pub fn toggle_group_collapsed(&mut self, group_name: &str) {
         if !self.collapsed_groups.remove(group_name) {
             self.collapsed_groups.insert(group_name.to_string());
+        }
+    }
+
+    /// Explicitly expands or collapses saved `Profile` group `group_name`.
+    pub fn set_group_collapsed(&mut self, group_name: &str, collapsed: bool) {
+        if collapsed {
+            self.collapsed_groups.insert(group_name.to_string());
+        } else {
+            self.collapsed_groups.remove(group_name);
         }
     }
 
@@ -287,10 +363,29 @@ impl SidebarState {
         &self,
         profiles: &'a [Profile],
     ) -> Vec<ProfileGroupView<'a>> {
+        self.grouped_saved_profiles_with_groups(profiles, &[])
+    }
+
+    /// Groups saved `Profile`s together with explicit empty `saved_groups` when unfiltered.
+    pub fn grouped_saved_profiles_with_groups<'a>(
+        &self,
+        profiles: &'a [Profile],
+        saved_groups: &[String],
+    ) -> Vec<ProfileGroupView<'a>> {
         let needle = self.filter_query.trim().to_ascii_lowercase();
         let active_tag = self.selected_tag.as_deref().map(str::to_ascii_lowercase);
 
         let mut grouped: BTreeMap<(bool, String, String), Vec<&'a Profile>> = BTreeMap::new();
+        if needle.is_empty() && active_tag.is_none() {
+            for group in saved_groups {
+                let trimmed = group.trim();
+                if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case(UNGROUPED_LABEL) {
+                    let key = (false, trimmed.to_ascii_lowercase(), trimmed.to_string());
+                    grouped.entry(key).or_default();
+                }
+            }
+        }
+
         for profile in profiles {
             if let Some(tag_filter) = active_tag.as_deref()
                 && !profile
@@ -364,6 +459,11 @@ fn profile_matches_query(profile: &Profile, needle_lower: &str) -> bool {
             host.to_ascii_lowercase().contains(needle_lower)
                 || username.to_ascii_lowercase().contains(needle_lower)
         }
+        ProfileTarget::Serial { port, .. } => port.to_ascii_lowercase().contains(needle_lower),
+        ProfileTarget::Telnet { host, .. } => host.to_ascii_lowercase().contains(needle_lower),
+        ProfileTarget::Docker { container, .. } => {
+            container.to_ascii_lowercase().contains(needle_lower)
+        }
     }
 }
 
@@ -381,6 +481,19 @@ pub fn profile_target_summary(profile: &Profile) -> String {
             username,
             ..
         } => format!("{username}@{host}:{port}"),
+        ProfileTarget::Serial {
+            port, baud_rate, ..
+        } => format!("{port} @ {baud_rate}"),
+        ProfileTarget::Telnet { host, port, .. } => format!("telnet://{host}:{port}"),
+        ProfileTarget::Docker {
+            runtime, container, ..
+        } => {
+            let prefix = match runtime {
+                termewnal_core::DockerRuntime::Docker => "docker",
+                termewnal_core::DockerRuntime::Podman => "podman",
+            };
+            format!("{prefix}:{container}")
+        }
     }
 }
 
@@ -390,48 +503,244 @@ pub fn render_sidebar<'a>(
     profiles: &'a [Profile],
     palette: &ThemePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
-    let chrome = ChromePalette::from_palette(palette);
+    render_sidebar_responsive(state, profiles, palette, 1280.0)
+}
 
-    let header = row![
-        text("Profiles & Tunnels")
-            .size(13)
-            .color(chrome.text_primary),
+/// Renders the Left Sidebar with width and controls adapted to `window_width`.
+pub fn render_sidebar_responsive<'a>(
+    state: &'a SidebarState,
+    profiles: &'a [Profile],
+    palette: &ThemePalette,
+    window_width: f32,
+) -> Element<'a, Message, Theme, iced::Renderer> {
+    render_sidebar_responsive_with_dnd(
+        state,
+        profiles,
+        &[],
+        None,
+        true,
+        palette,
+        window_width,
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidebarGlyph {
+    Folder,
+    Terminal,
+}
+
+struct SidebarIcon {
+    glyph: SidebarGlyph,
+    color: Color,
+}
+
+impl SidebarIcon {
+    fn new<'a>(glyph: SidebarGlyph, color: Color) -> Element<'a, Message, Theme, iced::Renderer> {
+        Element::new(Self { glyph, color })
+    }
+}
+
+impl Widget<Message, Theme, iced::Renderer> for SidebarIcon {
+    fn children(&self) -> Vec<Tree> {
+        Vec::new()
+    }
+
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::stateless()
+    }
+
+    fn size(&self) -> Size<Length> {
+        Size::new(Length::Fixed(13.0), Length::Fixed(12.0))
+    }
+
+    fn layout(
+        &mut self,
+        _tree: &mut Tree,
+        _renderer: &iced::Renderer,
+        limits: &layout::Limits,
+    ) -> layout::Node {
+        let size = limits.resolve(Length::Fixed(13.0), Length::Fixed(12.0), Size::ZERO);
+        layout::Node::new(size)
+    }
+
+    fn draw(
+        &self,
+        _tree: &Tree,
+        renderer: &mut iced::Renderer,
+        _theme: &Theme,
+        _style: &renderer::Style,
+        layout: Layout<'_>,
+        _cursor: mouse::Cursor,
+        viewport: &Rectangle,
+    ) {
+        let bounds = layout.bounds();
+        if !bounds.intersects(viewport) {
+            return;
+        }
+        let x0 = bounds.x.round() + 1.0;
+        let y0 = bounds.y.round() + 1.0;
+        let c = self.color;
+
+        match self.glyph {
+            SidebarGlyph::Folder => {
+                sb_fill(renderer, Rectangle::new([x0, y0 + 1.0].into(), [5.0, 2.0].into()), c);
+                sb_stroke(renderer, Rectangle::new([x0, y0 + 2.5].into(), [11.0, 7.5].into()), c);
+            }
+            SidebarGlyph::Terminal => {
+                sb_stroke(renderer, Rectangle::new([x0, y0 + 1.0].into(), [11.0, 8.5].into()), c);
+                sb_fill(renderer, Rectangle::new([x0 + 2.5, y0 + 3.5].into(), [2.0, 1.2].into()), c);
+                sb_fill(renderer, Rectangle::new([x0 + 3.5, y0 + 4.5].into(), [1.5, 1.2].into()), c);
+                sb_fill(renderer, Rectangle::new([x0 + 2.5, y0 + 5.5].into(), [2.0, 1.2].into()), c);
+                sb_fill(renderer, Rectangle::new([x0 + 5.5, y0 + 6.0].into(), [3.0, 1.2].into()), c);
+            }
+        }
+    }
+}
+
+fn sb_fill(renderer: &mut iced::Renderer, bounds: Rectangle, color: Color) {
+    use iced::advanced::renderer::Renderer as _;
+    renderer.fill_quad(
+        Quad {
+            bounds,
+            border: Border::default(),
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        Background::Color(color),
+    );
+}
+
+fn sb_stroke(renderer: &mut iced::Renderer, bounds: Rectangle, color: Color) {
+    use iced::advanced::renderer::Renderer as _;
+    renderer.fill_quad(
+        Quad {
+            bounds,
+            border: Border {
+                color,
+                width: 1.0,
+                radius: 1.5.into(),
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        },
+        Background::Color(Color::TRANSPARENT),
+    );
+}
+
+/// Renders the Left Sidebar with explicit custom groups, right-click targets, and Drag & Drop.
+pub fn render_sidebar_responsive_with_dnd<'a>(
+    state: &'a SidebarState,
+    profiles: &'a [Profile],
+    saved_groups: &'a [String],
+    drag_drop: Option<&'a DragDropState>,
+    drag_enabled: bool,
+    palette: &ThemePalette,
+    window_width: f32,
+) -> Element<'a, Message, Theme, iced::Renderer> {
+    render_sidebar_full(
+        state,
+        profiles,
+        saved_groups,
+        &[],
+        drag_drop,
+        drag_enabled,
+        palette,
+        window_width,
+    )
+}
+
+/// Renders the full Tabby-inspired Left Sidebar (Active Sessions, `[Active][All][+]`,
+/// clean folder tree, SSH config, Tunnels, and compact footer).
+#[allow(clippy::too_many_arguments)]
+pub fn render_sidebar_full<'a>(
+    state: &'a SidebarState,
+    profiles: &'a [Profile],
+    saved_groups: &'a [String],
+    sessions: &[SidebarSessionEntry],
+    drag_drop: Option<&'a DragDropState>,
+    drag_enabled: bool,
+    palette: &ThemePalette,
+    window_width: f32,
+) -> Element<'a, Message, Theme, iced::Renderer> {
+    let chrome = ChromePalette::from_palette(palette);
+    let sidebar_w = sidebar_width_for_window(window_width);
+
+    let mut content = column![]
+        .spacing(0)
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+    if !sessions.is_empty() {
+        content = content.push(render_active_sessions_section(state, sessions, chrome));
+        content = content.push(hairline_h(chrome));
+    }
+
+    let scope = state.filter_scope();
+    let filter_scope_row = row![
+        button(
+            text("Active")
+                .size(FONT_META)
+                .font(if scope == SidebarFilterScope::Active {
+                    ui_font_medium()
+                } else {
+                    ui_font()
+                }),
+        )
+        .padding([3, 9])
+        .style(settings_nav_pill_style(
+            chrome,
+            scope == SidebarFilterScope::Active,
+        ))
+        .on_press(Message::SetSidebarFilterScope(SidebarFilterScope::Active)),
+        button(
+            text("All")
+                .size(FONT_META)
+                .font(if scope == SidebarFilterScope::All {
+                    ui_font_medium()
+                } else {
+                    ui_font()
+                }),
+        )
+        .padding([3, 10])
+        .style(settings_nav_pill_style(
+            chrome,
+            scope == SidebarFilterScope::All,
+        ))
+        .on_press(Message::SetSidebarFilterScope(SidebarFilterScope::All)),
+        button(text("+").size(13.0).font(ui_font_semibold()))
+            .padding([2, 8])
+            .style(tab_bar_button_style(chrome, false, false))
+            .on_press(Message::OpenNewProfileModal),
         space::horizontal(),
-        button(text("Import").size(11))
-            .padding([3, 8])
-            .style(pill_button_style(chrome, PillTone::Ghost))
-            .on_press(Message::OpenTabbyImportModal),
-        button(text("×").size(13))
-            .padding([2, 7])
-            .style(pill_button_style(chrome, PillTone::Ghost))
-            .on_press(Message::SetSidebarOpen(false)),
+        button(text("+ Group").size(FONT_META).color(chrome.text_muted))
+            .padding([3, 6])
+            .style(tab_bar_button_style(chrome, false, false))
+            .on_press(Message::BeginCreateGroup {
+                assign_profile_id: None,
+            }),
     ]
     .spacing(4)
+    .padding(Padding {
+        top: 6.0,
+        right: 8.0,
+        bottom: 4.0,
+        left: 8.0,
+    })
     .align_y(Alignment::Center);
 
-    let quick_row = row![
-        button(text("+ New Profile").size(11))
+    let filter_input = container(
+        text_input("Filter profiles...", state.filter_query())
+            .id(sidebar_filter_input_id())
+            .on_input(Message::SidebarFilterChanged)
+            .size(FONT_BODY)
             .padding([5, 8])
             .width(Length::Fill)
-            .style(pill_button_style(chrome, PillTone::Primary))
-            .on_press(Message::OpenNewProfileModal),
-        button(text("+ Quick SSH").size(11))
-            .padding([5, 8])
-            .width(Length::Fill)
-            .style(pill_button_style(chrome, PillTone::Subtle))
-            .on_press(Message::OpenQuickConnectPalette),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
+            .style(styled_input_style(chrome)),
+    )
+    .padding([2, 8]);
 
-    let filter_input = text_input("Filter profiles...", state.filter_query())
-        .id(sidebar_filter_input_id())
-        .on_input(Message::SidebarFilterChanged)
-        .size(12)
-        .padding([6, 9])
-        .style(styled_input_style(chrome));
-
-    let mut content = column![header, quick_row, filter_input].spacing(8);
+    content = content.push(filter_scope_row).push(filter_input);
 
     let tags = state.available_tags(profiles);
     if !tags.is_empty() {
@@ -439,40 +748,95 @@ pub fn render_sidebar<'a>(
         for tag in tags {
             let active = state.selected_tag() == Some(tag.as_str());
             tag_row = tag_row.push(
-                button(text(format!("#{tag}")).size(11))
-                    .padding([2, 7])
-                    .style(pill_button_style(
-                        chrome,
-                        if active {
-                            PillTone::ActiveAccent
-                        } else {
-                            PillTone::Subtle
-                        },
-                    ))
-                    .on_press(Message::SidebarToggleTagFilter(tag)),
+                button(
+                    text(format!("#{tag}"))
+                        .size(FONT_META)
+                        .font(if active { ui_font_medium() } else { ui_font() }),
+                )
+                .padding([2, 7])
+                .style(tab_bar_button_style(chrome, active, false))
+                .on_press(Message::SidebarToggleTagFilter(tag)),
             );
         }
-        let tags_scroll = scrollable(tag_row).direction(scrollable::Direction::Horizontal(
-            scrollable::Scrollbar::new().width(2).scroller_width(2),
-        ));
+        let tags_scroll = container(
+            scrollable(tag_row).direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().width(2).scroller_width(2),
+            )),
+        )
+        .padding([4, 8]);
         content = content.push(tags_scroll);
     }
 
-    let mut sections = column![].spacing(10);
-    sections = sections.push(render_saved_profiles_section(state, profiles, chrome));
-    sections = sections.push(rule::horizontal(1));
-    sections = sections.push(render_system_ssh_section(state, chrome));
-    sections = sections.push(rule::horizontal(1));
+    let mut sections = column![].spacing(4).width(Length::Fill);
+    sections = sections.push(render_saved_profiles_section(
+        state,
+        profiles,
+        saved_groups,
+        sessions,
+        drag_drop,
+        drag_enabled,
+        chrome,
+    ));
+    sections = sections.push(hairline_h(chrome));
+    sections = sections.push(render_system_ssh_section(
+        state,
+        drag_drop,
+        drag_enabled,
+        chrome,
+    ));
+    sections = sections.push(hairline_h(chrome));
     sections = sections.push(render_tunnels_section(state, chrome));
 
     content = content.push(
-        scrollable(sections)
-            .width(Length::Fill)
-            .height(Length::Fill),
+        scrollable(sections.padding(Padding {
+            top: 4.0,
+            right: 2.0,
+            bottom: 8.0,
+            left: 2.0,
+        }))
+        .style(tabby_scrollable_style(chrome))
+        .width(Length::Fill)
+        .height(Length::Fill),
     );
 
-    let body = container(content.padding(10))
-        .width(Length::Fixed(SIDEBAR_WIDTH))
+    let footer = container(
+        row![
+            button(text("SSH").size(10.5).color(chrome.text_muted))
+                .padding([2, 5])
+                .style(tab_bar_button_style(chrome, false, false))
+                .on_press(Message::OpenQuickConnectPalette),
+            button(text("Import").size(10.5).color(chrome.text_muted))
+                .padding([2, 5])
+                .style(tab_bar_button_style(chrome, false, false))
+                .on_press(Message::OpenTabbyImportModal),
+            button(text("Cmds").size(10.5).color(chrome.text_muted))
+                .padding([2, 5])
+                .style(tab_bar_button_style(chrome, false, false))
+                .on_press(Message::OpenQuickCommandsModal),
+            button(text("Spaces").size(10.5).color(chrome.text_muted))
+                .padding([2, 5])
+                .style(tab_bar_button_style(chrome, false, false))
+                .on_press(Message::OpenWorkspacesModal),
+            space::horizontal(),
+            button(text("⚙").size(12.5).color(chrome.text_secondary))
+                .padding([2, 6])
+                .style(tab_bar_button_style(chrome, false, false))
+                .on_press(Message::OpenSettingsModal),
+        ]
+        .spacing(2)
+        .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding([4, 6])
+    .style(move |_| container::Style {
+        background: Some(Background::Color(chrome.bg_more)),
+        ..Default::default()
+    });
+
+    content = content.push(hairline_h(chrome)).push(footer);
+
+    let body = container(content)
+        .width(Length::Fixed(sidebar_w))
         .height(Length::Fill)
         .style(move |_theme: &Theme| container::Style {
             background: Some(Background::Color(chrome.chrome_bg)),
@@ -480,174 +844,436 @@ pub fn render_sidebar<'a>(
             ..Default::default()
         });
 
-    let right_hairline = container(space::vertical().width(1))
-        .height(Length::Fill)
-        .style(move |_| container::Style {
-            background: Some(Background::Color(chrome.border_subtle)),
-            ..Default::default()
-        });
-
-    row![body, right_hairline]
+    let body_with_menu = SidebarRightClickCapture::new(None, None, body.into());
+    row![body_with_menu, hairline_v(chrome)]
         .height(Length::Fill)
         .into()
+}
+
+fn render_active_sessions_section<'a>(
+    state: &'a SidebarState,
+    sessions: &[SidebarSessionEntry],
+    chrome: ChromePalette,
+) -> Element<'a, Message, Theme, iced::Renderer> {
+    let collapsed = state.is_section_collapsed(SidebarSection::ActiveSessions);
+    let prefix = if collapsed { "▸" } else { "▾" };
+    let header_btn = button(
+        row![
+            text(format!("{prefix} ACTIVE SESSIONS"))
+                .size(10.5)
+                .font(ui_font_semibold())
+                .color(chrome.text_muted),
+            space::horizontal(),
+            container(
+                text(format!("{}", sessions.len()))
+                    .size(10.0)
+                    .font(ui_font_semibold())
+                    .color(chrome.text_secondary),
+            )
+            .padding([1, 6])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(chrome.secondary)),
+                border: Border {
+                    radius: 999.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
+    )
+    .padding([5, 10])
+    .width(Length::Fill)
+    .style(list_row_button_style(chrome, false))
+    .on_press(Message::SidebarToggleSection(SidebarSection::ActiveSessions));
+
+    let mut col = column![header_btn].spacing(2).width(Length::Fill);
+    if collapsed {
+        return col.into();
+    }
+
+    for entry in sessions {
+        let dot_color = if entry.auto_reconnecting || entry.connecting {
+            chrome.warning
+        } else if entry.connected {
+            chrome.success
+        } else {
+            chrome.text_muted
+        };
+        let is_active = entry.active_tab;
+        let accent_bar = container(space::vertical().width(2).height(16))
+            .width(2)
+            .height(16)
+            .style(move |_| container::Style {
+                background: is_active.then_some(Background::Color(chrome.accent)),
+                ..Default::default()
+            });
+        let mut row_items = row![
+            accent_bar,
+            SidebarIcon::new(
+                SidebarGlyph::Terminal,
+                if entry.active_tab {
+                    chrome.text_primary
+                } else {
+                    chrome.text_secondary
+                },
+            ),
+            status_dot(dot_color),
+            container(
+                text(entry.title.clone())
+                    .size(FONT_BODY)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .color(if entry.active_tab {
+                        chrome.text_primary
+                    } else {
+                        chrome.text_secondary
+                    }),
+            )
+            .width(Length::Fill)
+            .clip(true),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center);
+
+        if entry.auto_reconnecting {
+            row_items = row_items.push(badge_pill(
+                "Auto-reconnecting",
+                chrome.warning,
+                chrome.warning_soft,
+                Color::TRANSPARENT,
+            ));
+        } else if entry.reconnected {
+            row_items = row_items.push(badge_pill(
+                "Reconnected successfully",
+                chrome.success,
+                chrome.success_soft,
+                Color::TRANSPARENT,
+            ));
+        }
+
+        let row_btn = button(row_items)
+            .padding([4, 8])
+            .width(Length::Fill)
+            .style(list_row_button_style(chrome, entry.active_tab))
+            .on_press(Message::SelectTab(entry.tab_id));
+
+        col = col.push(row_btn);
+    }
+
+    col.padding(Padding {
+        top: 2.0,
+        right: 0.0,
+        bottom: 6.0,
+        left: 0.0,
+    })
+    .into()
 }
 
 fn render_saved_profiles_section<'a>(
     state: &'a SidebarState,
     profiles: &'a [Profile],
+    saved_groups: &'a [String],
+    sessions: &[SidebarSessionEntry],
+    drag_drop: Option<&'a DragDropState>,
+    drag_enabled: bool,
     chrome: ChromePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
-    let collapsed = state.is_section_collapsed(SidebarSection::SavedProfiles);
-    let prefix = if collapsed { "▸" } else { "▾" };
-    let header = button(
-        text(format!("{prefix} SAVED PROFILES ({})", profiles.len()))
-            .size(11)
-            .color(chrome.text_muted),
-    )
-    .padding([3, 4])
-    .width(Length::Fill)
-    .style(pill_button_style(chrome, PillTone::Ghost))
-    .on_press(Message::SidebarToggleSection(SidebarSection::SavedProfiles));
+    let mut col = column![].spacing(2).width(Length::Fill);
 
-    let mut col = column![header].spacing(6);
-    if collapsed {
-        return col.into();
+    let active_profile_ids: BTreeSet<&str> = sessions
+        .iter()
+        .filter_map(|s| s.profile_id.as_deref())
+        .collect();
+
+    let mut groups = state.grouped_saved_profiles_with_groups(profiles, saved_groups);
+    if state.filter_scope() == SidebarFilterScope::Active {
+        for group in &mut groups {
+            group
+                .profiles
+                .retain(|p| active_profile_ids.contains(p.id.as_str()));
+        }
+        groups.retain(|g| !g.profiles.is_empty());
     }
 
-    let groups = state.grouped_saved_profiles(profiles);
-    if groups.is_empty() {
+    let has_ungrouped = groups.iter().any(|g| g.name == UNGROUPED_LABEL);
+    let dragging_to_group = drag_drop.is_some_and(|dd| {
+        matches!(
+            dd.active_payload(),
+            Some(DragPayload::SavedProfile { .. } | DragPayload::SystemSsh { .. })
+        )
+    });
+
+    if groups.is_empty() && !dragging_to_group {
+        let msg = if state.filter_scope() == SidebarFilterScope::Active {
+            "No active saved profiles"
+        } else {
+            "No saved profiles · Click + or right-click"
+        };
         col = col.push(
-            text("No matching saved profiles")
-                .size(11)
-                .color(chrome.text_muted),
+            container(text(msg).size(FONT_META).color(chrome.text_muted)).padding([8, 12]),
         );
         return col.into();
     }
+
+    let active_dragged_profile_id = drag_drop.and_then(|dd| match dd.active_payload() {
+        Some(DragPayload::SavedProfile { profile_id, .. }) => Some(profile_id.as_str()),
+        _ => None,
+    });
+    let hovered_drop_group = drag_drop.and_then(|dd| match dd.hovered_target() {
+        Some(DropTarget::ProfileGroup(g)) => Some(g.as_deref()),
+        _ => None,
+    });
 
     for group in groups {
         let group_prefix = if group.collapsed { "▸" } else { "▾" };
-        let group_title = format!("{group_prefix} {} ({})", group.name, group.profiles.len());
-        col = col.push(
-            button(text(group_title).size(11).color(chrome.text_secondary))
-                .padding([4, 6])
-                .width(Length::Fill)
-                .style(pill_button_style(chrome, PillTone::Subtle))
-                .on_press(Message::SidebarToggleGroup(group.name.clone())),
-        );
+        let group_target: Option<String> =
+            (!group.name.eq_ignore_ascii_case(UNGROUPED_LABEL)).then(|| group.name.clone());
+        let is_drop_hovered = hovered_drop_group
+            .is_some_and(|target| target == group_target.as_deref());
+        let folder_color = if is_drop_hovered {
+            chrome.accent
+        } else {
+            chrome.text_secondary
+        };
 
-        if group.collapsed {
-            continue;
-        }
-
-        for profile in group.profiles {
-            let is_ssh = matches!(profile.target, ProfileTarget::Ssh { .. });
-            let (kind_badge, dot_color, badge_fg, badge_bg) = if is_ssh {
-                ("SSH", chrome.accent, chrome.accent, chrome.accent_soft)
-            } else {
-                ("LOCAL", chrome.success, chrome.success, chrome.success_soft)
-            };
-            let subtitle = profile_target_summary(profile);
-            let tags_suffix = if profile.tags.is_empty() {
-                String::new()
-            } else {
-                format!(
-                    " · {}",
-                    profile
-                        .tags
-                        .iter()
-                        .map(|t| format!("#{t}"))
-                        .collect::<Vec<_>>()
-                        .join(" ")
-                )
-            };
-
-            let item_label = column![
+        let mut group_col = column![
+            button(
                 row![
-                    status_dot(dot_color),
-                    badge_pill(kind_badge, badge_fg, badge_bg, Color::TRANSPARENT),
-                    text(profile.name.as_str())
-                        .size(12)
-                        .color(chrome.text_primary),
+                    text(group_prefix)
+                        .size(FONT_META)
+                        .font(ui_font())
+                        .color(chrome.text_muted),
+                    SidebarIcon::new(SidebarGlyph::Folder, folder_color),
+                    text(group.name.clone())
+                        .size(FONT_META)
+                        .font(ui_font_medium())
+                        .color(folder_color),
                 ]
-                .spacing(5)
+                .spacing(6)
                 .align_y(Alignment::Center),
-                text(format!("{subtitle}{tags_suffix}"))
-                    .size(11)
-                    .color(chrome.text_muted),
-            ]
-            .spacing(3);
+            )
+            .padding([4, 10])
+            .width(Length::Fill)
+            .style(list_row_button_style(chrome, false))
+            .on_press(Message::SidebarToggleGroup(group.name.clone())),
+        ]
+        .spacing(1)
+        .width(Length::Fill);
 
-            let launch_btn = button(item_label)
-                .padding([5, 6])
-                .width(Length::Fill)
-                .style(pill_button_style(chrome, PillTone::Ghost))
-                .on_press(Message::LaunchProfile {
-                    profile_id: profile.id.clone(),
-                    disposition: LaunchDisposition::NewTab,
-                });
+        if !group.collapsed {
+            let mut rows_col = column![].spacing(1).width(Length::Fill);
+            let group_len = group.profiles.len();
+            if group_len == 0 {
+                rows_col = rows_col.push(
+                    container(
+                        text("Drop profiles here or right-click")
+                            .size(FONT_META)
+                            .color(chrome.text_muted),
+                    )
+                    .padding([4, 18]),
+                );
+            } else {
+                for profile in group.profiles.into_iter() {
+                    let matching_session = sessions
+                        .iter()
+                        .find(|s| s.profile_id.as_deref() == Some(profile.id.as_str()));
+                    let is_live = matching_session.is_some();
+                    let dot_color = match matching_session {
+                        Some(s) if s.connected => chrome.success,
+                        Some(s) if s.connecting => chrome.warning,
+                        _ => match &profile.target {
+                            ProfileTarget::Ssh { .. } | ProfileTarget::Docker { .. } => {
+                                chrome.text_muted
+                            }
+                            ProfileTarget::LocalShell { .. } => chrome.success,
+                            ProfileTarget::Serial { .. } | ProfileTarget::Telnet { .. } => {
+                                chrome.warning
+                            }
+                        },
+                    };
 
-            let action_col = column![
-                row![
-                    button(text("|").size(10))
-                        .padding([2, 6])
-                        .style(pill_button_style(chrome, PillTone::Ghost))
+                    // Single-line compact Tabby better-sidebar row with terminal icon + status dot.
+                    let item_row = row![
+                        SidebarIcon::new(
+                            SidebarGlyph::Terminal,
+                            if is_live {
+                                chrome.text_primary
+                            } else {
+                                chrome.text_secondary
+                            },
+                        ),
+                        status_dot(dot_color),
+                        container(
+                            text(profile.name.as_str())
+                                .size(FONT_BODY)
+                                .wrapping(iced::widget::text::Wrapping::None)
+                                .color(chrome.text_primary),
+                        )
+                        .width(Length::Fill)
+                        .clip(true),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+
+                    let launch_btn = button(item_row)
+                        .padding([4, 6])
+                        .width(Length::Fill)
+                        .style(list_row_button_style(chrome, false))
                         .on_press(Message::LaunchProfile {
                             profile_id: profile.id.clone(),
-                            disposition: LaunchDisposition::Split(SplitAxis::Vertical),
-                        }),
-                    button(text("-").size(10))
-                        .padding([2, 6])
-                        .style(pill_button_style(chrome, PillTone::Ghost))
-                        .on_press(Message::LaunchProfile {
+                            disposition: LaunchDisposition::NewTab,
+                        });
+                    let draggable_launch = DragSource::new(
+                        DragPayload::SavedProfile {
                             profile_id: profile.id.clone(),
-                            disposition: LaunchDisposition::Split(SplitAxis::Horizontal),
-                        }),
-                ]
-                .spacing(2),
-                button(text("Edit").size(10))
-                    .padding([2, 6])
-                    .style(pill_button_style(chrome, PillTone::Subtle))
-                    .on_press(Message::OpenEditProfileModal(profile.id.clone())),
-            ]
-            .spacing(3)
-            .align_x(Alignment::End);
+                            label: profile.name.clone(),
+                        },
+                        drag_enabled,
+                        active_dragged_profile_id == Some(profile.id.as_str()),
+                        launch_btn.into(),
+                    );
 
-            col = col.push(
-                container(
-                    row![launch_btn, action_col]
-                        .spacing(4)
-                        .align_y(Alignment::Center),
-                )
-                .padding([3, 6])
-                .width(Length::Fill)
-                .style(move |_| card_container_style(chrome, false)),
+                    let edit_btn = button(text("⋯").size(FONT_BODY))
+                        .padding([2, 6])
+                        .style(tab_bar_button_style(chrome, false, false))
+                        .on_press(Message::OpenEditProfileModal(profile.id.clone()));
+
+                    let row_el: Element<'a, Message, Theme, iced::Renderer> =
+                        row![draggable_launch, edit_btn]
+                            .spacing(2)
+                            .padding(Padding {
+                                top: 0.0,
+                                right: 4.0,
+                                bottom: 0.0,
+                                left: 10.0,
+                            })
+                            .align_y(Alignment::Center)
+                            .into();
+                    rows_col = rows_col.push(SidebarRightClickCapture::new(
+                        profile.group.clone(),
+                        Some(profile.id.clone()),
+                        row_el,
+                    ));
+                }
+            }
+
+            group_col = group_col.push(
+                container(rows_col)
+                    .width(Length::Fill)
+                    .style(move |_| container::Style {
+                        background: is_drop_hovered.then_some(Background::Color(chrome.accent_soft)),
+                        border: iced::Border {
+                            color: if is_drop_hovered {
+                                chrome.accent
+                            } else {
+                                Color::TRANSPARENT
+                            },
+                            width: if is_drop_hovered { 1.0 } else { 0.0 },
+                            radius: 0.0.into(),
+                        },
+                        ..Default::default()
+                    }),
             );
         }
+
+        let group_drop_wrapped = DropTargetZone::new(
+            DropZoneKind::ProfileGroup {
+                group: group_target,
+                accepting_drag: dragging_to_group,
+                is_hovered: is_drop_hovered,
+            },
+            group_col.into(),
+        );
+        col = col.push(SidebarRightClickCapture::new(
+            Some(group.name),
+            None,
+            group_drop_wrapped,
+        ));
+    }
+
+    if dragging_to_group && !has_ungrouped {
+        let is_drop_hovered = hovered_drop_group == Some(None);
+        let ungrouped_drop = DropTargetZone::new(
+            DropZoneKind::ProfileGroup {
+                group: None,
+                accepting_drag: true,
+                is_hovered: is_drop_hovered,
+            },
+            container(
+                text(format!("Drop here for {UNGROUPED_LABEL}"))
+                    .size(FONT_META)
+                    .color(if is_drop_hovered {
+                        chrome.accent
+                    } else {
+                        chrome.text_muted
+                    }),
+            )
+            .padding([6, 12])
+            .width(Length::Fill)
+            .style(move |_| container::Style {
+                background: is_drop_hovered.then_some(Background::Color(chrome.accent_soft)),
+                border: iced::Border {
+                    color: if is_drop_hovered {
+                        chrome.accent
+                    } else {
+                        chrome.border_subtle
+                    },
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                ..Default::default()
+            })
+            .into(),
+        );
+        col = col.push(ungrouped_drop);
     }
 
     col.into()
 }
 
-fn render_system_ssh_section(
-    state: &SidebarState,
+fn render_system_ssh_section<'a>(
+    state: &'a SidebarState,
+    drag_drop: Option<&'a DragDropState>,
+    drag_enabled: bool,
     chrome: ChromePalette,
-) -> Element<'_, Message, Theme, iced::Renderer> {
+) -> Element<'a, Message, Theme, iced::Renderer> {
     let collapsed = state.is_section_collapsed(SidebarSection::SystemSshProfiles);
     let prefix = if collapsed { "▸" } else { "▾" };
     let count = state.system_ssh_profiles().len();
+    let label = if count > 0 {
+        format!("Imported from ~/.ssh/config ({count})")
+    } else {
+        "Imported from ~/.ssh/config".to_string()
+    };
     let header = button(
-        text(format!("{prefix} SYSTEM SSH ({count})"))
-            .size(11)
-            .color(chrome.text_muted),
+        row![
+            text(prefix)
+                .size(FONT_META)
+                .font(ui_font())
+                .color(chrome.text_muted),
+            SidebarIcon::new(SidebarGlyph::Folder, chrome.text_secondary),
+            container(
+                text(label)
+                    .size(FONT_META)
+                    .font(ui_font_medium())
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .color(chrome.text_secondary),
+            )
+            .width(Length::Fill)
+            .clip(true),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
     )
-    .padding([3, 4])
+    .padding([4, 10])
     .width(Length::Fill)
-    .style(pill_button_style(chrome, PillTone::Ghost))
+    .style(list_row_button_style(chrome, false))
     .on_press(Message::SidebarToggleSection(
         SidebarSection::SystemSshProfiles,
     ));
 
-    let mut col = column![header].spacing(6);
+    let mut col = column![header].spacing(2).width(Length::Fill);
     if collapsed {
         return col.into();
     }
@@ -676,56 +1302,88 @@ fn render_system_ssh_section(
 
     if matching.is_empty() {
         let empty_msg = if state.system_ssh_profiles().is_empty() {
-            "Read-only ~/.ssh/config hosts appear here"
+            "~/.ssh/config hosts appear here"
         } else {
-            "No matching System SSH hosts"
+            "No matching SSH config hosts"
         };
-        col = col.push(text(empty_msg).size(11).color(chrome.text_muted));
+        col = col.push(
+            container(text(empty_msg).size(FONT_META).color(chrome.text_muted)).padding([4, 12]),
+        );
         return col.into();
     }
 
-    for host in matching {
+    let active_dragged_alias = drag_drop.and_then(|dd| match dd.active_payload() {
+        Some(DragPayload::SystemSsh { alias, .. }) => Some(alias.as_str()),
+        _ => None,
+    });
+
+    let mut rows_col = column![].spacing(1).width(Length::Fill);
+    for host in matching.into_iter() {
         let subtitle = if host.proxy_jump.is_empty() {
             host.display_target()
         } else {
-            format!("{} · via {}", host.display_target(), host.proxy_jump.join(","))
+            format!(
+                "{} · via {}",
+                host.display_target(),
+                host.proxy_jump.join(" → ")
+            )
         };
-        let item = column![
-            row![
-                badge_pill("SSH CFG", chrome.text_secondary, chrome.card_hover, Color::TRANSPARENT),
-                text(host.alias.as_str())
-                    .size(12)
-                    .color(chrome.text_primary),
+        let item = container(
+            column![
+                row![
+                    status_dot(chrome.text_muted),
+                    text(host.alias.as_str())
+                        .size(FONT_BODY)
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .color(chrome.text_primary),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+                text(subtitle)
+                    .size(FONT_META)
+                    .font(mono_font())
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .color(chrome.text_muted),
             ]
-            .spacing(5)
-            .align_y(Alignment::Center),
-            text(subtitle).size(11).color(chrome.text_muted),
-        ]
-        .spacing(3);
+            .spacing(1),
+        )
+        .width(Length::Fill)
+        .clip(true);
         let launch_btn = button(item)
-            .padding([5, 6])
+            .padding([4, 8])
             .width(Length::Fill)
-            .style(pill_button_style(chrome, PillTone::Ghost))
+            .style(list_row_button_style(chrome, false))
             .on_press(Message::LaunchSystemSsh {
                 alias: host.alias.clone(),
                 disposition: LaunchDisposition::NewTab,
             });
-        let clone_btn = button(text("Clone").size(10))
-            .padding([3, 7])
-            .style(pill_button_style(chrome, PillTone::Subtle))
+        let draggable_launch = DragSource::new(
+            DragPayload::SystemSsh {
+                alias: host.alias.clone(),
+                label: host.alias.clone(),
+            },
+            drag_enabled,
+            active_dragged_alias == Some(host.alias.as_str()),
+            launch_btn.into(),
+        );
+        let clone_btn = button(text("Clone").size(FONT_META))
+            .padding([2, 6])
+            .style(tab_bar_button_style(chrome, false, false))
             .on_press(Message::CloneSystemSshToProfile(host.alias.clone()));
-        col = col.push(
-            container(
-                row![launch_btn, clone_btn]
-                    .spacing(4)
-                    .align_y(Alignment::Center),
-            )
-            .padding([3, 6])
-            .width(Length::Fill)
-            .style(move |_| card_container_style(chrome, false)),
+        rows_col = rows_col.push(
+            row![draggable_launch, clone_btn]
+                .spacing(2)
+                .padding(Padding {
+                    top: 0.0,
+                    right: 4.0,
+                    bottom: 0.0,
+                    left: 12.0,
+                })
+                .align_y(Alignment::Center),
         );
     }
 
+    col = col.push(rows_col);
     col.into()
 }
 
@@ -737,33 +1395,44 @@ fn render_tunnels_section(
     let prefix = if collapsed { "▸" } else { "▾" };
     let count = state.active_tunnels().len();
     let header_btn = button(
-        text(format!("{prefix} ACTIVE TUNNELS ({count})"))
-            .size(11)
-            .color(chrome.text_muted),
+        text(format!("{prefix} Tunnels ({count})"))
+            .size(FONT_META)
+            .font(ui_font_medium())
+            .color(chrome.text_secondary),
     )
-    .padding([3, 4])
+    .padding([4, 8])
     .width(Length::Fill)
-    .style(pill_button_style(chrome, PillTone::Ghost))
+    .style(list_row_button_style(chrome, false))
     .on_press(Message::SidebarToggleSection(SidebarSection::ActiveTunnels));
-    let new_btn = button(text("+ Tunnel").size(10))
-        .padding([3, 8])
-        .style(pill_button_style(chrome, PillTone::Subtle))
+    let new_btn = button(text("+ Tunnel").size(FONT_META).color(chrome.text_muted))
+        .padding([3, 6])
+        .style(tab_bar_button_style(chrome, false, false))
         .on_press(Message::OpenTunnelCreateModal);
     let header = row![header_btn, new_btn]
-        .spacing(4)
+        .spacing(2)
+        .padding([0, 2])
+        .width(Length::Fill)
         .align_y(Alignment::Center);
 
-    let mut col = column![header].spacing(6);
+    let mut col = column![header].spacing(2).width(Length::Fill);
     if collapsed {
         return col.into();
     }
 
     if state.active_tunnels().is_empty() {
-        col = col.push(text("No active tunnels").size(11).color(chrome.text_muted));
+        col = col.push(
+            container(
+                text("No active tunnels")
+                    .size(FONT_META)
+                    .color(chrome.text_muted),
+            )
+            .padding([4, 12]),
+        );
         return col.into();
     }
 
-    for tunnel in state.active_tunnels() {
+    let mut rows_col = column![].spacing(2).width(Length::Fill);
+    for tunnel in state.active_tunnels().iter() {
         let dir = match tunnel.direction {
             TunnelDirection::Local => "L",
             TunnelDirection::Remote => "R",
@@ -791,26 +1460,56 @@ fn render_tunnels_section(
             TunnelRuntimeState::Error(_) => (chrome.danger, chrome.danger_soft),
             TunnelRuntimeState::Stopped => (chrome.text_muted, chrome.card_hover),
         };
-        let toggle_btn = button(text(if is_running { "Stop" } else { "Start" }).size(10))
-            .padding([3, 7])
-            .style(pill_button_style(
-                chrome,
-                if is_running {
-                    PillTone::Subtle
-                } else {
-                    PillTone::Primary
-                },
-            ))
+        let toggle_btn = button(text(if is_running { "Stop" } else { "Start" }).size(FONT_META))
+            .padding([2, 7])
+            .style(tab_bar_button_style(chrome, !is_running, false))
             .on_press(Message::ToggleTunnel(tunnel.id.clone()));
 
-        let mut action_row = row![
+        let edit_btn = button(text("⋯").size(FONT_BODY))
+            .padding([2, 6])
+            .style(tab_bar_button_style(chrome, false, false))
+            .on_press(Message::OpenEditTunnelModal(tunnel.id.clone()));
+
+        let badge = match (&tunnel.state, tunnel.reconnect_attempt, tunnel.next_retry_secs) {
+            (TunnelRuntimeState::Reconnecting, Some(attempt), Some(secs)) => {
+                format!("Auto-reconnecting #{attempt} ({secs}s)")
+            }
+            (TunnelRuntimeState::Reconnecting, Some(attempt), None) => {
+                format!("Auto-reconnecting #{attempt}")
+            }
+            _ => tunnel.state.status_badge(),
+        };
+
+        let title_row = row![
             status_dot(state_fg),
-            badge_pill(dir, chrome.accent, chrome.accent_soft, Color::TRANSPARENT),
-            text(tunnel.name.as_str())
-                .size(12)
-                .color(chrome.text_primary),
-            space::horizontal(),
-            badge_pill(tunnel.state.status_badge(), state_fg, state_bg, Color::TRANSPARENT),
+            text(format!("[{dir}]"))
+                .size(FONT_META)
+                .font(mono_font())
+                .color(chrome.accent),
+            container(
+                text(tunnel.name.as_str())
+                    .size(FONT_BODY)
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .color(chrome.text_primary),
+            )
+            .width(Length::Fill)
+            .clip(true),
+            badge_pill(badge, state_fg, state_bg, Color::TRANSPARENT),
+            edit_btn,
+        ]
+        .spacing(5)
+        .align_y(Alignment::Center);
+
+        let mut controls_row = row![
+            container(
+                text(format!("{} -> {} ({scope})", tunnel.bind_addr, tunnel.target_addr))
+                    .size(FONT_META)
+                    .font(mono_font())
+                    .wrapping(iced::widget::text::Wrapping::None)
+                    .color(chrome.text_muted),
+            )
+            .width(Length::Fill)
+            .clip(true),
             toggle_btn,
         ]
         .spacing(4)
@@ -824,39 +1523,51 @@ fn render_tunnels_section(
                 | TunnelRuntimeState::Retrying { .. }
                 | TunnelRuntimeState::Error(_)
         ) {
-            action_row = action_row.push(
-                button(text("Reconnect").size(10))
-                    .padding([3, 7])
-                    .style(pill_button_style(chrome, PillTone::Ghost))
+            controls_row = controls_row.push(
+                button(text("Retry").size(FONT_META))
+                    .padding([2, 6])
+                    .style(tab_bar_button_style(chrome, false, false))
                     .on_press(Message::ReconnectTunnel(tunnel.id.clone())),
             );
         }
 
-        let mut item = column![
-            action_row,
-            text(format!("{} -> {} ({scope})", tunnel.bind_addr, tunnel.target_addr))
-                .size(11)
-                .color(chrome.text_muted),
-        ]
-        .spacing(3);
+        let mut item = column![title_row, controls_row].spacing(3);
+
+        if let Some(notice) = &tunnel.reconnected_notice {
+            item = item.push(badge_pill(
+                notice.clone(),
+                chrome.success,
+                chrome.success_soft,
+                Color::TRANSPARENT,
+            ));
+        }
 
         match &tunnel.state {
             TunnelRuntimeState::Retrying { reason, .. } => {
-                item = item.push(text(reason.as_str()).size(10).color(chrome.warning));
+                item = item.push(
+                    text(format!("Auto-reconnecting: {reason}"))
+                        .size(FONT_META)
+                        .color(chrome.warning),
+                );
+            }
+            TunnelRuntimeState::Reconnecting | TunnelRuntimeState::Holding => {
+                let msg = tunnel
+                    .last_error
+                    .as_deref()
+                    .map(|err| format!("Auto-reconnecting: {err}"))
+                    .unwrap_or_else(|| "Auto-reconnecting tunnel...".to_string());
+                item = item.push(text(msg).size(FONT_META).color(chrome.warning));
             }
             TunnelRuntimeState::Error(err) => {
-                item = item.push(text(err.as_str()).size(10).color(chrome.danger));
+                item = item.push(text(err.as_str()).size(FONT_META).color(chrome.danger));
             }
             _ => {}
         }
 
-        col = col.push(
-            container(item)
-                .padding([6, 8])
-                .width(Length::Fill)
-                .style(move |_| card_container_style(chrome, false)),
-        );
+        let row_card = container(item).padding([4, 10]).width(Length::Fill).into();
+        rows_col = rows_col.push(TunnelRightClickCapture::new(tunnel.id.clone(), row_card));
     }
 
+    col = col.push(rows_col);
     col.into()
 }

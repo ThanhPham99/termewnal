@@ -64,6 +64,12 @@ impl JumpHopSpec {
                 .clone()
                 .or_else(|| fallback_known_hosts.map(Path::to_path_buf)),
             proxy_jump: Vec::new(),
+            proxy_command: None,
+            proxy: None,
+            forward_agent: false,
+            forward_x11: false,
+            x11_display: None,
+            login_scripts: Vec::new(),
             nodelay: self.nodelay,
             term_name: "xterm-256color".to_string(),
             cols: 80,

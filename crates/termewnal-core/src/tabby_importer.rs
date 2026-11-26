@@ -9,11 +9,13 @@ use thiserror::Error;
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
+use crate::collections::{QuickCommand, load_quick_commands, save_quick_commands};
 use crate::config::ConfigPaths;
 use crate::error::CoreError;
 use crate::profile::{
-    Profile, ProfileTarget, ProfilesConfig, SshAuthMethod, TunnelDirection, TunnelRule,
-    load_profiles, save_profiles, unique_profile_name,
+    DockerRuntime, LoginScriptStep, NewlineMode, Profile, ProfileTarget, ProfilesConfig,
+    SerialFlowControl, SerialInputMode, SerialOutputMode, SerialParity, SshAuthMethod,
+    TunnelDirection, TunnelRule, load_profiles, save_profiles, unique_profile_name,
 };
 use crate::vault::{SecretStore, VaultError};
 
@@ -85,8 +87,12 @@ pub struct TabbyCredentialRequirement {
 #[derive(Debug, Clone)]
 pub struct TabbyImportReport {
     pub profiles: Vec<Profile>,
+    pub quick_commands: Vec<QuickCommand>,
     pub imported_ssh_count: usize,
     pub imported_local_count: usize,
+    pub imported_serial_count: usize,
+    pub imported_telnet_count: usize,
+    pub imported_docker_count: usize,
     pub imported_tunnel_count: usize,
     pub skipped_unsupported_count: usize,
     pub vault_status: TabbyVaultStatus,
@@ -99,6 +105,7 @@ pub struct TabbyImportReport {
 pub struct TabbyImportOutcome {
     pub updated_profiles: ProfilesConfig,
     pub added_count: usize,
+    pub added_quick_commands_count: usize,
     pub skipped_duplicate_count: usize,
     pub imported_tunnel_count: usize,
     pub skipped_unsupported_count: usize,
@@ -112,6 +119,30 @@ struct TabbyRawConfig {
     profiles: Vec<TabbyRawProfile>,
     groups: Vec<TabbyRawGroup>,
     vault: Option<TabbyRawVault>,
+    #[serde(alias = "quickCmds", alias = "quick-cmds")]
+    quick_cmds: Option<noyalib::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct TabbyRawQuickCmd {
+    name: String,
+    text: String,
+    #[serde(alias = "command")]
+    command: Option<String>,
+    group: Option<String>,
+    #[serde(alias = "appendCR", alias = "append_cr")]
+    append_cr: Option<bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, rename_all = "camelCase")]
+struct TabbyRawLoginScript {
+    expect: String,
+    send: String,
+    is_regex: Option<bool>,
+    #[serde(alias = "isRegExp")]
+    is_regexp: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -146,13 +177,36 @@ struct TabbyRawProfile {
     options: Option<noyalib::Value>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum TabbyPortValue {
+    Num(u64),
+    Text(String),
+}
+
+impl TabbyPortValue {
+    fn as_u16(&self) -> Option<u16> {
+        match self {
+            Self::Num(n) => u16::try_from(*n).ok(),
+            Self::Text(s) => s.trim().parse::<u16>().ok(),
+        }
+    }
+
+    fn as_device_str(&self) -> Option<String> {
+        match self {
+            Self::Text(s) => non_empty_trimmed(s),
+            Self::Num(n) => Some(n.to_string()),
+        }
+    }
+}
+
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct TabbyRawOptions {
-    // SSH fields
+    // Shared / SSH / Telnet / Serial port field (numeric for SSH/Telnet, device path for Serial)
+    port: Option<TabbyPortValue>,
+    // SSH & Telnet fields
     host: Option<String>,
-    #[serde(deserialize_with = "deserialize_opt_u16")]
-    port: Option<u16>,
     #[serde(alias = "username")]
     user: Option<String>,
     auth: Option<String>,
@@ -168,6 +222,45 @@ struct TabbyRawOptions {
     jump_hosts: Vec<String>,
     #[serde(alias = "forwarded_ports")]
     forwarded_ports: Vec<TabbyRawForwardedPort>,
+    #[serde(alias = "agent_forward", alias = "agentForwarding")]
+    agent_forward: Option<bool>,
+    #[serde(alias = "forwardX11", alias = "forward_x11")]
+    x11: Option<bool>,
+    #[serde(alias = "proxy_command")]
+    proxy_command: Option<String>,
+    #[serde(alias = "socks_proxy_host")]
+    socks_proxy_host: Option<String>,
+    #[serde(alias = "socks_proxy_port")]
+    socks_proxy_port: Option<u16>,
+    #[serde(alias = "http_proxy_host")]
+    http_proxy_host: Option<String>,
+    #[serde(alias = "http_proxy_port")]
+    http_proxy_port: Option<u16>,
+    #[serde(alias = "login_scripts")]
+    login_scripts: Vec<TabbyRawLoginScript>,
+    // Serial fields
+    #[serde(alias = "baud_rate")]
+    baudrate: Option<u32>,
+    #[serde(alias = "data_bits")]
+    databits: Option<u8>,
+    parity: Option<String>,
+    #[serde(alias = "stop_bits")]
+    stopbits: Option<u8>,
+    rtscts: Option<bool>,
+    #[serde(alias = "flow_control")]
+    flow_control: Option<String>,
+    #[serde(alias = "input_mode")]
+    input_mode: Option<String>,
+    #[serde(alias = "output_mode")]
+    output_mode: Option<String>,
+    #[serde(alias = "newline_mode")]
+    newline_mode: Option<String>,
+    #[serde(alias = "auto_reconnect")]
+    auto_reconnect: Option<bool>,
+    // Docker fields
+    #[serde(alias = "container_id", alias = "containerId")]
+    container: Option<String>,
+    runtime: Option<String>,
     // Local shell fields
     command: Option<String>,
     args: Vec<String>,
@@ -244,8 +337,12 @@ pub fn parse_tabby_config_str(
     if yaml.trim().is_empty() {
         return Ok(TabbyImportReport {
             profiles: Vec::new(),
+            quick_commands: Vec::new(),
             imported_ssh_count: 0,
             imported_local_count: 0,
+            imported_serial_count: 0,
+            imported_telnet_count: 0,
+            imported_docker_count: 0,
             imported_tunnel_count: 0,
             skipped_unsupported_count: 0,
             vault_status: TabbyVaultStatus::None,
@@ -275,7 +372,10 @@ pub fn parse_tabby_config_str(
 
     for raw_prof in &raw.profiles {
         let kind = raw_prof.kind.trim().to_ascii_lowercase();
-        if kind != "ssh" && kind != "local" {
+        if !matches!(
+            kind.as_str(),
+            "ssh" | "local" | "serial" | "telnet" | "docker"
+        ) {
             skipped_unsupported_count += 1;
             continue;
         }
@@ -302,6 +402,9 @@ pub fn parse_tabby_config_str(
     let mut profiles = Vec::new();
     let mut imported_ssh_count = 0_usize;
     let mut imported_local_count = 0_usize;
+    let mut imported_serial_count = 0_usize;
+    let mut imported_telnet_count = 0_usize;
+    let mut imported_docker_count = 0_usize;
     let mut imported_tunnel_count = 0_usize;
     let mut missing_credentials = Vec::new();
     let mut plaintext_secrets = Vec::new();
@@ -320,7 +423,12 @@ pub fn parse_tabby_config_str(
                     skipped_unsupported_count += 1;
                     continue;
                 };
-                let port = opts.port.filter(|&p| p > 0).unwrap_or(22);
+                let port = opts
+                    .port
+                    .as_ref()
+                    .and_then(TabbyPortValue::as_u16)
+                    .filter(|&p| p > 0)
+                    .unwrap_or(22);
                 let username = opts
                     .user
                     .as_deref()
@@ -350,6 +458,33 @@ pub fn parse_tabby_config_str(
                 imported_tunnel_count += tunnels.len();
                 imported_ssh_count += 1;
 
+                let login_scripts = convert_login_scripts(&opts.login_scripts);
+
+                let proxy = if let Some(ph) = opts
+                    .socks_proxy_host
+                    .as_deref()
+                    .and_then(non_empty_trimmed)
+                {
+                    Some(crate::SshProxyConfig {
+                        kind: crate::SshProxyKind::Socks5,
+                        host: ph,
+                        port: opts.socks_proxy_port.filter(|&p| p > 0).unwrap_or(1080),
+                        username: None,
+                        vault_secret_ref: None,
+                    })
+                } else {
+                    opts.http_proxy_host
+                        .as_deref()
+                        .and_then(non_empty_trimmed)
+                        .map(|ph| crate::SshProxyConfig {
+                            kind: crate::SshProxyKind::HttpConnect,
+                            host: ph,
+                            port: opts.http_proxy_port.filter(|&p| p > 0).unwrap_or(8080),
+                            username: None,
+                            vault_secret_ref: None,
+                        })
+                };
+
                 profiles.push(Profile {
                     id: profile_id,
                     name,
@@ -361,6 +496,14 @@ pub fn parse_tabby_config_str(
                         username,
                         auth,
                         proxy_jump,
+                        proxy_command: opts
+                            .proxy_command
+                            .as_deref()
+                            .and_then(non_empty_trimmed),
+                        proxy,
+                        forward_agent: opts.agent_forward.unwrap_or(false),
+                        forward_x11: opts.x11.unwrap_or(false),
+                        login_scripts,
                         auto_connect_on_startup: false,
                         tmux_reattach: None,
                         keepalive_interval_secs: None,
@@ -396,11 +539,107 @@ pub fn parse_tabby_config_str(
                     tunnels: Vec::new(),
                 });
             }
+            "serial" => {
+                let Some(port) = opts.port.as_ref().and_then(TabbyPortValue::as_device_str) else {
+                    skipped_unsupported_count += 1;
+                    continue;
+                };
+                let name = non_empty_trimmed(&raw_prof.name).unwrap_or_else(|| port.clone());
+                imported_serial_count += 1;
+                profiles.push(Profile {
+                    id: Uuid::new_v4().to_string(),
+                    name,
+                    group,
+                    tags,
+                    target: ProfileTarget::Serial {
+                        port,
+                        baud_rate: opts.baudrate.filter(|&b| b > 0).unwrap_or(115_200),
+                        data_bits: opts.databits.filter(|&d| (5..=8).contains(&d)).unwrap_or(8),
+                        parity: parse_serial_parity(opts.parity.as_deref()),
+                        stop_bits: opts.stopbits.filter(|&s| s == 1 || s == 2).unwrap_or(1),
+                        flow_control: parse_serial_flow(
+                            opts.flow_control.as_deref(),
+                            opts.rtscts.unwrap_or(false),
+                        ),
+                        input_mode: parse_serial_input(opts.input_mode.as_deref()),
+                        output_mode: parse_serial_output(opts.output_mode.as_deref()),
+                        newline_mode: parse_newline_mode(opts.newline_mode.as_deref()),
+                        auto_reconnect: opts.auto_reconnect.unwrap_or(true),
+                    },
+                    tunnels: Vec::new(),
+                });
+            }
+            "telnet" => {
+                let Some(host) = opts.host.as_deref().and_then(non_empty_trimmed) else {
+                    skipped_unsupported_count += 1;
+                    continue;
+                };
+                let port = opts
+                    .port
+                    .as_ref()
+                    .and_then(TabbyPortValue::as_u16)
+                    .filter(|&p| p > 0)
+                    .unwrap_or(23);
+                let name = non_empty_trimmed(&raw_prof.name).unwrap_or_else(|| host.clone());
+                imported_telnet_count += 1;
+                profiles.push(Profile {
+                    id: Uuid::new_v4().to_string(),
+                    name,
+                    group,
+                    tags,
+                    target: ProfileTarget::Telnet {
+                        host,
+                        port,
+                        auto_reconnect: opts.auto_reconnect.unwrap_or(false),
+                        login_scripts: convert_login_scripts(&opts.login_scripts),
+                    },
+                    tunnels: Vec::new(),
+                });
+            }
+            "docker" => {
+                let Some(container) = opts.container.as_deref().and_then(non_empty_trimmed) else {
+                    skipped_unsupported_count += 1;
+                    continue;
+                };
+                let runtime = match opts
+                    .runtime
+                    .as_deref()
+                    .map(str::trim)
+                    .map(str::to_ascii_lowercase)
+                    .as_deref()
+                {
+                    Some("podman") => DockerRuntime::Podman,
+                    _ => DockerRuntime::Docker,
+                };
+                let name =
+                    non_empty_trimmed(&raw_prof.name).unwrap_or_else(|| container.clone());
+                imported_docker_count += 1;
+                profiles.push(Profile {
+                    id: Uuid::new_v4().to_string(),
+                    name,
+                    group,
+                    tags,
+                    target: ProfileTarget::Docker {
+                        runtime,
+                        container,
+                        shell: opts.command.as_deref().and_then(non_empty_trimmed),
+                        user: opts.user.as_deref().and_then(non_empty_trimmed),
+                        working_dir: opts
+                            .cwd
+                            .as_ref()
+                            .map(|p| p.to_string_lossy().into_owned())
+                            .filter(|s| !s.trim().is_empty()),
+                    },
+                    tunnels: Vec::new(),
+                });
+            }
             _ => {
                 skipped_unsupported_count += 1;
             }
         }
     }
+
+    let quick_commands = extract_quick_commands(raw.quick_cmds.as_ref());
 
     let vault_status = if let Some(reason) = vault_locked_reason {
         TabbyVaultStatus::Locked { reason }
@@ -412,8 +651,12 @@ pub fn parse_tabby_config_str(
 
     Ok(TabbyImportReport {
         profiles,
+        quick_commands,
         imported_ssh_count,
         imported_local_count,
+        imported_serial_count,
+        imported_telnet_count,
+        imported_docker_count,
         imported_tunnel_count,
         skipped_unsupported_count,
         vault_status,
@@ -469,6 +712,24 @@ pub fn import_tabby_into_profiles(
 
     save_profiles(paths, &cfg)?;
 
+    let mut added_quick_commands_count = 0_usize;
+    if !report.quick_commands.is_empty() {
+        let mut quick_cfg = load_quick_commands(paths)?;
+        for cmd in report.quick_commands {
+            let duplicate = quick_cfg
+                .commands
+                .iter()
+                .any(|existing| existing.name == cmd.name && existing.command == cmd.command);
+            if !duplicate {
+                quick_cfg.commands.push(cmd);
+                added_quick_commands_count += 1;
+            }
+        }
+        if added_quick_commands_count > 0 {
+            save_quick_commands(paths, &quick_cfg)?;
+        }
+    }
+
     let mut missing_credentials: Vec<TabbyCredentialRequirement> = report
         .missing_credentials
         .into_iter()
@@ -518,7 +779,10 @@ pub fn import_tabby_into_profiles(
                     };
                     (format!("{username}@{host}:{port}"), kind)
                 }
-                ProfileTarget::LocalShell { .. } => {
+                ProfileTarget::LocalShell { .. }
+                | ProfileTarget::Serial { .. }
+                | ProfileTarget::Telnet { .. }
+                | ProfileTarget::Docker { .. } => {
                     (profile.name.clone(), TabbyCredentialKind::Password)
                 }
             };
@@ -541,6 +805,7 @@ pub fn import_tabby_into_profiles(
     Ok(TabbyImportOutcome {
         updated_profiles: cfg,
         added_count,
+        added_quick_commands_count,
         skipped_duplicate_count,
         imported_tunnel_count,
         skipped_unsupported_count: report.skipped_unsupported_count,
@@ -856,7 +1121,12 @@ fn collect_jump_spec(
         }
 
         if let Some(host) = jump_opts.host.as_deref().and_then(non_empty_trimmed) {
-            let port = jump_opts.port.filter(|&p| p > 0).unwrap_or(22);
+            let port = jump_opts
+                .port
+                .as_ref()
+                .and_then(TabbyPortValue::as_u16)
+                .filter(|&p| p > 0)
+                .unwrap_or(22);
             let formatted = match jump_opts.user.as_deref().and_then(non_empty_trimmed) {
                 Some(user) if port != 22 => format!("{user}@{host}:{port}"),
                 Some(user) => format!("{user}@{host}"),
@@ -976,6 +1246,11 @@ fn targets_match_ignoring_secret_refs(a: &ProfileTarget, b: &ProfileTarget) -> b
                 username: u1,
                 auth: auth1,
                 proxy_jump: pj1,
+                proxy_command: pc1,
+                proxy: px1,
+                forward_agent: fa1,
+                forward_x11: fx1,
+                login_scripts: ls1,
                 auto_connect_on_startup: ac1,
                 tmux_reattach: tr1,
                 keepalive_interval_secs: ki1,
@@ -989,6 +1264,11 @@ fn targets_match_ignoring_secret_refs(a: &ProfileTarget, b: &ProfileTarget) -> b
                 username: u2,
                 auth: auth2,
                 proxy_jump: pj2,
+                proxy_command: pc2,
+                proxy: px2,
+                forward_agent: fa2,
+                forward_x11: fx2,
+                login_scripts: ls2,
                 auto_connect_on_startup: ac2,
                 tmux_reattach: tr2,
                 keepalive_interval_secs: ki2,
@@ -1001,6 +1281,11 @@ fn targets_match_ignoring_secret_refs(a: &ProfileTarget, b: &ProfileTarget) -> b
                 && p1 == p2
                 && u1 == u2
                 && pj1 == pj2
+                && pc1 == pc2
+                && px1 == px2
+                && fa1 == fa2
+                && fx1 == fx2
+                && ls1 == ls2
                 && ac1 == ac2
                 && tr1 == tr2
                 && ki1 == ki2
@@ -1009,7 +1294,160 @@ fn targets_match_ignoring_secret_refs(a: &ProfileTarget, b: &ProfileTarget) -> b
                 && mc1 == mc2
                 && auth_methods_equivalent(auth1, auth2)
         }
+        (
+            ProfileTarget::Serial {
+                port: p1,
+                baud_rate: b1,
+                data_bits: d1,
+                parity: pa1,
+                stop_bits: s1,
+                flow_control: fc1,
+                input_mode: im1,
+                output_mode: om1,
+                newline_mode: nm1,
+                auto_reconnect: ar1,
+            },
+            ProfileTarget::Serial {
+                port: p2,
+                baud_rate: b2,
+                data_bits: d2,
+                parity: pa2,
+                stop_bits: s2,
+                flow_control: fc2,
+                input_mode: im2,
+                output_mode: om2,
+                newline_mode: nm2,
+                auto_reconnect: ar2,
+            },
+        ) => {
+            p1 == p2
+                && b1 == b2
+                && d1 == d2
+                && pa1 == pa2
+                && s1 == s2
+                && fc1 == fc2
+                && im1 == im2
+                && om1 == om2
+                && nm1 == nm2
+                && ar1 == ar2
+        }
+        (
+            ProfileTarget::Telnet {
+                host: h1,
+                port: p1,
+                auto_reconnect: ar1,
+                login_scripts: ls1,
+            },
+            ProfileTarget::Telnet {
+                host: h2,
+                port: p2,
+                auto_reconnect: ar2,
+                login_scripts: ls2,
+            },
+        ) => h1 == h2 && p1 == p2 && ar1 == ar2 && ls1 == ls2,
+        (
+            ProfileTarget::Docker {
+                runtime: r1,
+                container: c1,
+                shell: s1,
+                user: u1,
+                working_dir: w1,
+            },
+            ProfileTarget::Docker {
+                runtime: r2,
+                container: c2,
+                shell: s2,
+                user: u2,
+                working_dir: w2,
+            },
+        ) => r1 == r2 && c1 == c2 && s1 == s2 && u1 == u2 && w1 == w2,
         _ => false,
+    }
+}
+
+fn convert_login_scripts(raw: &[TabbyRawLoginScript]) -> Vec<LoginScriptStep> {
+    raw.iter()
+        .filter(|s| !s.expect.is_empty() || !s.send.is_empty())
+        .map(|s| LoginScriptStep {
+            expect: s.expect.clone(),
+            send: s.send.clone(),
+            is_regex: s.is_regex.or(s.is_regexp).unwrap_or(false),
+            append_newline: true,
+            delay_ms: 0,
+            secret_ref: None,
+        })
+        .collect()
+}
+
+fn extract_quick_commands(value: Option<&noyalib::Value>) -> Vec<QuickCommand> {
+    let Some(val) = value else {
+        return Vec::new();
+    };
+    let raw_list: Vec<TabbyRawQuickCmd> = match val {
+        noyalib::Value::Sequence(_) => noyalib::from_value(val).unwrap_or_default(),
+        noyalib::Value::Mapping(map) => {
+            if let Some(cmds) = map.get("commands") {
+                noyalib::from_value(cmds).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        }
+        _ => Vec::new(),
+    };
+    raw_list
+        .into_iter()
+        .filter_map(|raw| {
+            let cmd_text = non_empty_trimmed(&raw.text)
+                .or_else(|| raw.command.as_deref().and_then(non_empty_trimmed))?;
+            let name = non_empty_trimmed(&raw.name).unwrap_or_else(|| cmd_text.clone());
+            let mut qc = QuickCommand::new(name, cmd_text);
+            qc.group = raw.group.as_deref().and_then(non_empty_trimmed);
+            qc.append_newline = raw.append_cr.unwrap_or(true);
+            Some(qc)
+        })
+        .collect()
+}
+
+fn parse_serial_parity(raw: Option<&str>) -> SerialParity {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("odd") => SerialParity::Odd,
+        Some("even") => SerialParity::Even,
+        _ => SerialParity::None,
+    }
+}
+
+fn parse_serial_flow(flow: Option<&str>, rtscts: bool) -> SerialFlowControl {
+    if rtscts {
+        return SerialFlowControl::Hardware;
+    }
+    match flow.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("rtscts" | "hardware" | "rts/cts") => SerialFlowControl::Hardware,
+        Some("xonxoff" | "software" | "xon/xoff") => SerialFlowControl::Software,
+        _ => SerialFlowControl::None,
+    }
+}
+
+fn parse_serial_input(raw: Option<&str>) -> SerialInputMode {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("readline") => SerialInputMode::Readline,
+        Some("hex" | "hex_bytes" | "hexbytes") => SerialInputMode::HexBytes,
+        _ => SerialInputMode::Text,
+    }
+}
+
+fn parse_serial_output(raw: Option<&str>) -> SerialOutputMode {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("hex" | "hexdump") => SerialOutputMode::Hexdump,
+        _ => SerialOutputMode::Text,
+    }
+}
+
+fn parse_newline_mode(raw: Option<&str>) -> NewlineMode {
+    match raw.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("lf") => NewlineMode::Lf,
+        Some("crlf") => NewlineMode::CrLf,
+        Some("keep" | "raw") => NewlineMode::Keep,
+        _ => NewlineMode::Cr,
     }
 }
 

@@ -8,9 +8,11 @@ rust-version.workspace = true
 alacritty_terminal.workspace = true
 portable-pty.workspace = true
 regex.workspace = true
+termewnal-core = { path = "../termewnal-core" }
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

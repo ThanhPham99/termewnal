@@ -16,3 +16,5 @@ mod ssh_auth_and_session;
 mod stub;
 #[path = "suite/tunnels.rs"]
 mod tunnels;
+#[path = "suite/v2_ssh_forwarding_and_scripts.rs"]
+mod v2_ssh_forwarding_and_scripts;

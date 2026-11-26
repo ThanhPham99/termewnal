@@ -18,8 +18,8 @@ use termewnal_core::{
 use termewnal_pty::PtyEvent;
 use termewnal_ssh::{
     AgentConnector, BoxFuture, HostKeyDecision, HostKeyPrompt, KeyboardInteractiveChallenge,
-    OsAgentConnector, SshConnectConfig, SshError, SshInteractionHandler, SshSession,
-    TransportStatus, fingerprint_sha256, record_known_host_path,
+    OsAgentConnector, ServerStatsCollector, SshConnectConfig, SshError, SshInteractionHandler,
+    SshSession, SshTransport, TransportStatus, fingerprint_sha256, record_known_host_path,
 };
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::oneshot;
@@ -47,6 +47,7 @@ struct TestServerState {
     auth_attempted: AtomicBool,
     pty_requests: Mutex<Vec<(String, u32, u32)>>,
     window_changes: Mutex<Vec<(u32, u32)>>,
+    exec_count: AtomicUsize,
 }
 
 struct TestSshHandler {
@@ -190,6 +191,43 @@ impl server::Handler for TestSshHandler {
         Ok(())
     }
 
+    async fn exec_request(
+        &mut self,
+        channel: ChannelId,
+        _data: &[u8],
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        let seq = self.state.exec_count.fetch_add(1, Ordering::SeqCst);
+        let payload = match seq {
+            0 => {
+                "CPU 1000 0 200 8800 0 0 0 0\n\
+                 UP 100.00\n\
+                 MEM 1000000 420000 100000 50000 250000 20000\n\
+                 NIF lo 100 100\n\
+                 NIF eth0 1048576 524288\n\
+                 DISK 100000000 74000000 26000000 74%\n"
+            }
+            1 => {
+                "CPU 1160 0 220 9620 0 0 0 0\n\
+                 UP 102.00\n\
+                 MEM 1000000 420000 100000 50000 250000 20000\n\
+                 NIF lo 500 500\n\
+                 NIF eth0 1896448 1134592\n\
+                 DISK 100000000 74000000 26000000 74%\n"
+            }
+            _ => {
+                session.channel_failure(channel)?;
+                return Ok(());
+            }
+        };
+        session.channel_success(channel)?;
+        session.data(channel, payload.as_bytes().to_vec())?;
+        session.exit_status_request(channel, 0)?;
+        session.eof(channel)?;
+        session.close(channel)?;
+        Ok(())
+    }
+
     async fn window_change_request(
         &mut self,
         channel: ChannelId,
@@ -271,6 +309,7 @@ async fn spawn_test_server(expected_auth: ExpectedAuth) -> SpawnedTestServer {
         auth_attempted: AtomicBool::new(false),
         pty_requests: Mutex::new(Vec::new()),
         window_changes: Mutex::new(Vec::new()),
+        exec_count: AtomicUsize::new(0),
     });
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -397,6 +436,7 @@ fn connect_cfg(addr: SocketAddr, user: &str, auth: SshAuthMethod, kh: &Path) -> 
         cols: 80,
         rows: 24,
         scrollback_lines: 10_000,
+        ..SshConnectConfig::default()
     }
 }
 
@@ -889,4 +929,59 @@ async fn password_auth_falls_back_to_interactive_prompt_when_absent_from_vault_a
             ..
         }
     ));
+}
+
+#[tokio::test]
+async fn exec_channel_collects_remote_server_stats_without_interfering_with_pty() {
+    let dir = TempDir::new().unwrap();
+    let kh = dir.path().join("known_hosts");
+    let srv = spawn_test_server(ExpectedAuth::Password {
+        username: "ops".to_string(),
+        password: "pw".to_string(),
+    })
+    .await;
+    record_known_host_path("127.0.0.1", srv.addr.port(), &srv.host_pubkey, &kh).unwrap();
+
+    let vault = InMemorySecretStore::default();
+    vault.set_secret("ssh/ops", "pw").unwrap();
+    let transport = SshTransport::connect(
+        &connect_cfg(
+            srv.addr,
+            "ops",
+            SshAuthMethod::Password {
+                vault_secret_ref: Some("ssh/ops".to_string()),
+            },
+            &kh,
+        ),
+        Some(&vault),
+        ScriptedInteraction::accept_tofu(),
+        Arc::new(OsAgentConnector::default()),
+    )
+    .await
+    .expect("transport must connect");
+
+    let mut collector = ServerStatsCollector::new();
+    let s1 = transport
+        .collect_server_stats(&mut collector, Duration::from_secs(2))
+        .await
+        .expect("first stats probe must succeed");
+    assert_eq!(s1.cpu_percent, None);
+    assert!((s1.ram_percent.unwrap() - 58.0).abs() < 0.01);
+    assert!((s1.disk_percent.unwrap() - 74.0).abs() < 0.01);
+
+    let s2 = transport
+        .collect_server_stats(&mut collector, Duration::from_secs(2))
+        .await
+        .expect("second stats probe must compute CPU and network deltas");
+    assert!((s2.cpu_percent.unwrap() - 18.0).abs() < 0.01);
+    assert_eq!(s2.net_rx_bytes_per_sec, Some(423_936));
+    assert_eq!(s2.net_tx_bytes_per_sec, Some(305_152));
+
+    let rejected = transport
+        .collect_server_stats(&mut collector, Duration::from_secs(2))
+        .await
+        .expect_err("rejected exec request must surface channel error cleanly");
+    assert!(rejected.to_string().contains("rejected"));
+
+    transport.disconnect().await.unwrap();
 }

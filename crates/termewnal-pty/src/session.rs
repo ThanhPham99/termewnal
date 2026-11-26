@@ -27,6 +27,7 @@ pub struct PtySpawnConfig {
     pub rows: u16,
     pub scrollback_lines: usize,
     pub cursor_shape: CursorShape,
+    pub cursor_blink: bool,
     pub working_dir: Option<PathBuf>,
 }
 
@@ -38,9 +39,21 @@ impl Default for PtySpawnConfig {
             rows: 24,
             scrollback_lines: 10_000,
             cursor_shape: CursorShape::Block,
+            cursor_blink: false,
             working_dir: None,
         }
     }
+}
+
+/// Progress indicator reported via `OSC 9;4;<state>;<progress>` (ConEmu / Windows Terminal / Tabby).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TerminalProgressState {
+    #[default]
+    Hidden,
+    Normal(u8),
+    Indeterminate,
+    Error(u8),
+    Paused(u8),
 }
 
 /// Lifecycle and grid notifications emitted by a running [`PtySession`].
@@ -49,6 +62,7 @@ pub enum PtyEvent {
     Output,
     Title(String),
     Bell,
+    Progress(TerminalProgressState),
     Exited(Option<i32>),
 }
 
@@ -144,6 +158,8 @@ pub struct TerminalSnapshot {
     pub selection: Option<GridRange>,
     pub bracketed_paste: bool,
     pub mouse_mode: bool,
+    pub mouse_sgr: bool,
+    pub mouse_motion: bool,
 }
 
 impl TerminalSnapshot {
@@ -289,11 +305,12 @@ impl PtySession {
 
         let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> =
             Arc::new(Mutex::new(Some(raw_writer)));
-        let buffer = Arc::new(TerminalBuffer::new_with_cursor_shape(
+        let buffer = Arc::new(TerminalBuffer::new_with_options(
             dims.cols,
             dims.rows,
             config.scrollback_lines,
             config.cursor_shape,
+            config.cursor_blink,
         ));
         buffer.set_write_sink(Some(Box::new(SharedPtyWriter(Arc::clone(&writer)))));
         let last_working_dir = Arc::new(Mutex::new(config.working_dir.clone()));

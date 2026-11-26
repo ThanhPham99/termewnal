@@ -3,15 +3,15 @@
 
 use std::path::{Path, PathBuf};
 
-use iced::widget::{Id, button, column, container, opaque, row, rule, space, text, text_input};
+use iced::widget::{Id, button, column, container, opaque, row, space, text, text_input};
 use iced::{Alignment, Color, Element, Length, Padding, Theme};
 use termewnal_core::{CursorStyle, RgbColor, ThemePalette};
 use termewnal_pty::{CursorShape, GridSearchMatch, PtySession, TerminalBuffer, shell_escape_path};
 
 use crate::app::{Message, SessionId};
 use crate::ui_theme::{
-    ChromePalette, PillTone, card_container_style, modal_card_style, modal_overlay,
-    pill_button_style, status_dot, styled_input_style,
+    ChromePalette, PillTone, hairline_h, inset_well_style, modal_card_style, modal_overlay,
+    modal_width, pill_button_style, status_dot, styled_input_style,
 };
 
 /// Returns the widget `Id` for the `Ctrl+F` scrollback search input.
@@ -35,13 +35,57 @@ pub const fn rgb_to_iced(c: RgbColor) -> Color {
 
 /// Converts a built-in theme name to the closest matching [`iced::Theme`].
 pub fn iced_theme_from_name(name: &str) -> Theme {
-    match termewnal_core::BuiltinTheme::resolve(name) {
+    iced_theme_with_overrides(name, &termewnal_core::ThemeOverrides::default())
+}
+
+/// Resolves an `iced::Theme` applying optional custom color overrides from `config.toml`.
+pub fn iced_theme_with_overrides(
+    name: &str,
+    overrides: &termewnal_core::ThemeOverrides,
+) -> Theme {
+    if !overrides.is_empty() {
+        let pal = termewnal_core::ThemePalette::for_name_with_overrides(name, overrides);
+        return Theme::custom(
+            pal.theme.name().to_string(),
+            iced::theme::Palette {
+                background: rgb_to_iced(pal.background),
+                text: rgb_to_iced(pal.foreground),
+                primary: rgb_to_iced(pal.ui_accent),
+                success: rgb_to_iced(pal.ansi[2]),
+                warning: rgb_to_iced(pal.ansi[3]),
+                danger: rgb_to_iced(pal.ansi[1]),
+            },
+        );
+    }
+    let builtin = termewnal_core::BuiltinTheme::resolve(name);
+    match builtin {
         termewnal_core::BuiltinTheme::Catppuccin => Theme::CatppuccinMocha,
+        termewnal_core::BuiltinTheme::CatppuccinLatte => Theme::CatppuccinLatte,
         termewnal_core::BuiltinTheme::TokyoNight => Theme::TokyoNight,
+        termewnal_core::BuiltinTheme::TokyoNightLight => Theme::TokyoNightLight,
         termewnal_core::BuiltinTheme::Dracula => Theme::Dracula,
         termewnal_core::BuiltinTheme::Nord => Theme::Nord,
         termewnal_core::BuiltinTheme::Dark => Theme::Dark,
         termewnal_core::BuiltinTheme::Light => Theme::Light,
+        termewnal_core::BuiltinTheme::SolarizedDark => Theme::SolarizedDark,
+        termewnal_core::BuiltinTheme::SolarizedLight => Theme::SolarizedLight,
+        termewnal_core::BuiltinTheme::GruvboxDark => Theme::GruvboxDark,
+        termewnal_core::BuiltinTheme::GruvboxLight => Theme::GruvboxLight,
+        termewnal_core::BuiltinTheme::Kanagawa => Theme::KanagawaWave,
+        other => {
+            let pal = other.palette();
+            Theme::custom(
+                other.name(),
+                iced::theme::Palette {
+                    background: rgb_to_iced(pal.background),
+                    text: rgb_to_iced(pal.foreground),
+                    primary: rgb_to_iced(pal.ui_accent),
+                    success: rgb_to_iced(pal.ansi[2]),
+                    warning: rgb_to_iced(pal.ansi[3]),
+                    danger: rgb_to_iced(pal.ansi[1]),
+                },
+            )
+        }
     }
 }
 
@@ -300,47 +344,77 @@ pub fn search_bar_view<'a>(
     state: &SearchBarState,
     palette: &ThemePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
-    let chrome = ChromePalette::from_palette(palette);
+    search_bar_view_responsive(state, palette, 1280.0)
+}
 
-    let input = text_input("Find in scrollback...", &state.query)
+/// Renders the floating top-right `Ctrl+F` search panel modeled after Tabby's `search-panel`.
+pub fn search_bar_view_responsive<'a>(
+    state: &SearchBarState,
+    palette: &ThemePalette,
+    available_width: f32,
+) -> Element<'a, Message, Theme, iced::Renderer> {
+    let chrome = ChromePalette::from_palette(palette);
+    let card_max_w = (available_width - 28.0).clamp(240.0, 420.0);
+
+    let input = text_input("Search", &state.query)
         .id(search_input_id())
         .on_input(Message::SearchQueryChanged)
         .on_submit(Message::SearchNext)
-        .size(12)
-        .padding([5, 9])
+        .size(13)
+        .padding([6, 10])
         .style(styled_input_style(chrome))
-        .width(Length::Fixed(220.0));
+        .width(Length::Fill);
 
     let counter = text(state.status_label())
         .size(11)
-        .color(chrome.text_secondary);
+        .color(chrome.text_muted);
 
     let bar_row = row![
         input,
         counter,
-        button(text("Prev").size(11))
-            .padding([4, 9])
-            .style(pill_button_style(chrome, PillTone::Subtle))
+        button(text("▲").size(11))
+            .padding([5, 7])
+            .style(pill_button_style(chrome, PillTone::Ghost))
             .on_press(Message::SearchPrev),
-        button(text("Next").size(11))
-            .padding([4, 9])
-            .style(pill_button_style(chrome, PillTone::Subtle))
+        button(text("▼").size(11))
+            .padding([5, 7])
+            .style(pill_button_style(chrome, PillTone::Ghost))
             .on_press(Message::SearchNext),
-        button(text("Close").size(11))
-            .padding([4, 9])
+        button(text("×").size(14))
+            .padding([3, 8])
             .style(pill_button_style(chrome, PillTone::Ghost))
             .on_press(Message::CloseSearch),
     ]
-    .spacing(6)
+    .spacing(4)
     .align_y(Alignment::Center);
 
     let card = container(bar_row)
-        .padding(Padding::from([7, 10]))
-        .style(move |_theme| modal_card_style(chrome, true));
+        .width(Length::Fixed(card_max_w))
+        .padding(Padding::from([4, 8]))
+        .style(move |_theme| iced::widget::container::Style {
+            background: Some(iced::Background::Color(chrome.bg_more)),
+            border: iced::Border {
+                color: chrome.border_subtle,
+                width: 1.0,
+                radius: iced::border::Radius {
+                    top_left: 0.0,
+                    top_right: 0.0,
+                    bottom_right: 5.0,
+                    bottom_left: 5.0,
+                },
+            },
+            text_color: Some(chrome.text_primary),
+            ..Default::default()
+        });
 
     container(opaque(card))
         .width(Length::Fill)
-        .padding(Padding::from([12, 16]))
+        .padding(Padding {
+            top: 0.0,
+            right: 16.0,
+            bottom: 0.0,
+            left: 12.0,
+        })
         .align_x(iced::alignment::Horizontal::Right)
         .align_y(iced::alignment::Vertical::Top)
         .into()
@@ -351,7 +425,17 @@ pub fn paste_confirm_modal_view<'a>(
     pending: &PendingPaste,
     palette: &ThemePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
+    paste_confirm_modal_view_responsive(pending, palette, 1280.0)
+}
+
+/// Renders the multi-line paste confirmation modal clamped to `window_width`.
+pub fn paste_confirm_modal_view_responsive<'a>(
+    pending: &PendingPaste,
+    palette: &ThemePalette,
+    window_width: f32,
+) -> Element<'a, Message, Theme, iced::Renderer> {
     let chrome = ChromePalette::from_palette(palette);
+    let card_w = modal_width(460.0, window_width);
 
     let heading = row![
         status_dot(chrome.warning),
@@ -372,7 +456,7 @@ pub fn paste_confirm_modal_view<'a>(
     let preview_box = container(text(pending.preview()).size(12).color(chrome.text_secondary))
         .width(Length::Fill)
         .padding([8, 10])
-        .style(move |_theme| card_container_style(chrome, false));
+        .style(move |_theme| inset_well_style(chrome));
 
     let actions = row![
         space::horizontal(),
@@ -389,9 +473,9 @@ pub fn paste_confirm_modal_view<'a>(
     .align_y(Alignment::Center);
 
     let card = container(
-        column![heading, hint, preview_box, rule::horizontal(1), actions].spacing(10),
+        column![heading, hint, preview_box, hairline_h(chrome), actions].spacing(10),
     )
-    .width(Length::Fixed(460.0))
+    .width(Length::Fixed(card_w))
     .padding(16)
     .style(move |_theme| modal_card_style(chrome, true));
 

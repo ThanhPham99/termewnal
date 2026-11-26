@@ -1,23 +1,32 @@
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use alacritty_terminal::event::{Event as TermEvent, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
-use alacritty_terminal::index::{Column, Point as GridPoint, Side};
+use alacritty_terminal::index::{Column, Line, Point as GridPoint, Side};
 use alacritty_terminal::selection::{Selection, SelectionType};
+use alacritty_terminal::term::cell::Flags as CellFlags;
 use alacritty_terminal::term::{Config as TermConfig, Term, TermMode, viewport_to_point};
 use alacritty_terminal::vte::ansi::{
     Color as TermColor, CursorShape, CursorStyle as VteCursorStyle, Processor, StdSyncHandler,
 };
+use alacritty_terminal::vte::{Parser as VteParser, Perform};
 use tokio::sync::{Notify, mpsc};
 
 use crate::ergonomics::{GridSearchMatch, search_term_matches};
+use crate::logging::SessionLogger;
 use crate::session::{
-    CursorSnapshot, GridRange, PtyEvent, TermDimensions, TerminalCell, TerminalSnapshot,
+    CursorSnapshot, GridRange, PtyEvent, TermDimensions, TerminalCell, TerminalProgressState,
+    TerminalSnapshot,
 };
 
 type SharedWriter = Arc<Mutex<Option<Box<dyn Write + Send>>>>;
+
+/// Intercepts raw wire output arriving in [`TerminalBuffer::feed_bytes`], returning
+/// `(terminal_bytes_to_render, wire_bytes_to_reply)`.
+pub type OutputInterceptor = Box<dyn FnMut(&[u8]) -> (Vec<u8>, Vec<u8>) + Send>;
 
 #[derive(Clone)]
 struct BufferEventProxy {
@@ -58,6 +67,10 @@ impl EventListener for BufferEventProxy {
 pub struct TerminalBuffer {
     term: Mutex<Term<BufferEventProxy>>,
     processor: Mutex<Processor<StdSyncHandler>>,
+    osc_parser: Mutex<VteParser>,
+    progress: Mutex<TerminalProgressState>,
+    logger: Mutex<Option<SessionLogger>>,
+    output_interceptor: Mutex<Option<OutputInterceptor>>,
     dimensions: Mutex<TermDimensions>,
     write_sink: SharedWriter,
     update_signal: Arc<(Mutex<(u64, bool, Option<i32>)>, Condvar)>,
@@ -80,6 +93,17 @@ impl TerminalBuffer {
         scrollback_lines: usize,
         cursor_shape: CursorShape,
     ) -> Self {
+        Self::new_with_options(cols, rows, scrollback_lines, cursor_shape, false)
+    }
+
+    /// Creates a new [`TerminalBuffer`] with explicit initial [`CursorShape`] and `cursor_blink`.
+    pub fn new_with_options(
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        cursor_shape: CursorShape,
+        cursor_blink: bool,
+    ) -> Self {
         let dims = TermDimensions::new(cols, rows);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let write_sink: SharedWriter = Arc::new(Mutex::new(None));
@@ -91,7 +115,7 @@ impl TerminalBuffer {
             scrolling_history: scrollback_lines,
             default_cursor_style: VteCursorStyle {
                 shape: cursor_shape,
-                blinking: false,
+                blinking: cursor_blink,
             },
             ..TermConfig::default()
         };
@@ -99,6 +123,10 @@ impl TerminalBuffer {
         Self {
             term: Mutex::new(Term::new(term_config, &dims, proxy)),
             processor: Mutex::new(Processor::new()),
+            osc_parser: Mutex::new(VteParser::new()),
+            progress: Mutex::new(TerminalProgressState::Hidden),
+            logger: Mutex::new(None),
+            output_interceptor: Mutex::new(None),
             dimensions: Mutex::new(dims),
             write_sink,
             update_signal: Arc::new((Mutex::new((0_u64, false, None)), Condvar::new())),
@@ -117,11 +145,73 @@ impl TerminalBuffer {
         *guard = sink;
     }
 
-    /// Feeds raw terminal output bytes into the `alacritty_terminal` VTE parser and emits
-    /// [`PtyEvent::Output`].
+    /// Attaches or clears a stateful wire-stream interceptor (used for live Zmodem `sz`/`rz`).
+    pub fn set_output_interceptor(&self, interceptor: Option<OutputInterceptor>) {
+        let mut guard = self
+            .output_interceptor
+            .lock()
+            .expect("output interceptor mutex poisoned");
+        *guard = interceptor;
+    }
+
+    /// Passes raw wire bytes through any attached [`OutputInterceptor`], forwards any resulting
+    /// wire reply to the backing `write_sink`, and returns `Some(terminal_bytes)` if intercepted.
+    pub fn run_output_interceptor(&self, bytes: &[u8]) -> Option<Vec<u8>> {
+        let mut hook_guard = self
+            .output_interceptor
+            .lock()
+            .expect("output interceptor mutex poisoned");
+        let hook = hook_guard.as_mut()?;
+        let (term_out, wire_reply) = hook(bytes);
+        if !wire_reply.is_empty()
+            && let Ok(mut wguard) = self.write_sink.lock()
+            && let Some(writer) = wguard.as_mut()
+        {
+            let _ = writer.write_all(&wire_reply);
+            let _ = writer.flush();
+        }
+        Some(term_out)
+    }
+
+    /// Feeds raw terminal output bytes through any attached interceptor, VTE parser,
+    /// `OSC 9;4` tracker, and active [`SessionLogger`], then emits [`PtyEvent::Output`].
     pub fn feed_bytes(&self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
+        }
+        if let Some(term_out) = self.run_output_interceptor(bytes) {
+            if term_out.is_empty() {
+                self.notify_output();
+                return;
+            }
+            self.feed_terminal_bytes(&term_out);
+        } else {
+            self.feed_terminal_bytes(bytes);
+        }
+    }
+
+    /// Feeds already-intercepted terminal bytes directly into `alacritty_terminal`, skipping the
+    /// [`OutputInterceptor`] hook (used by protocols that intercept wire bytes before display formatting).
+    pub fn feed_terminal_bytes(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        {
+            let mut osc_parser = self.osc_parser.lock().expect("osc parser mutex poisoned");
+            let mut tracker = OscProgressTracker { next: None };
+            osc_parser.advance(&mut tracker, bytes);
+            if let Some(state) = tracker.next {
+                let mut prog = self.progress.lock().expect("progress mutex poisoned");
+                if *prog != state {
+                    *prog = state;
+                    let _ = self.events_tx.send(PtyEvent::Progress(state));
+                }
+            }
+        }
+        if let Ok(mut guard) = self.logger.lock()
+            && let Some(logger) = guard.as_mut()
+        {
+            let _ = logger.write_bytes(bytes);
         }
         {
             let mut term = self.term.lock().expect("term mutex poisoned");
@@ -136,6 +226,79 @@ impl TerminalBuffer {
         }
         self.async_notify.notify_waiters();
         let _ = self.events_tx.send(PtyEvent::Output);
+    }
+
+    /// Returns the most recently reported `OSC 9;4` progress state.
+    pub fn progress(&self) -> TerminalProgressState {
+        *self.progress.lock().expect("progress mutex poisoned")
+    }
+
+    /// Starts streaming incoming session output into `path`.
+    pub fn start_logging(
+        &self,
+        path: impl Into<PathBuf>,
+        strip_ansi: bool,
+    ) -> std::io::Result<PathBuf> {
+        let logger = SessionLogger::start(path, strip_ansi)?;
+        let out_path = logger.path().to_path_buf();
+        *self.logger.lock().expect("logger mutex poisoned") = Some(logger);
+        Ok(out_path)
+    }
+
+    /// Stops active session output logging, flushing buffered bytes.
+    pub fn stop_logging(&self) -> Option<PathBuf> {
+        let mut guard = self.logger.lock().expect("logger mutex poisoned");
+        let mut logger = guard.take()?;
+        let _ = logger.flush();
+        Some(logger.path().to_path_buf())
+    }
+
+    /// Returns the active log file path when session logging is enabled.
+    pub fn log_path(&self) -> Option<PathBuf> {
+        self.logger
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().map(|l| l.path().to_path_buf()))
+    }
+
+    /// Clears both the visible terminal grid and retained scrollback history.
+    pub fn clear_screen_and_scrollback(&self) {
+        {
+            let mut term = self.term.lock().expect("term mutex poisoned");
+            let mut processor = self.processor.lock().expect("processor mutex poisoned");
+            // Clear viewport first (which pushes visible rows into history), then purge history.
+            processor.advance(&mut *term, b"\x1b[2J\x1b[3J\x1b[H");
+        }
+        self.notify_output();
+    }
+
+    /// Exports all lines currently in scrollback history and visible screen as plain text.
+    pub fn export_scrollback_text(&self) -> String {
+        let term = self.term.lock().expect("term mutex poisoned");
+        let grid = term.grid();
+        let top = term.topmost_line().0;
+        let bottom = term.bottommost_line().0;
+        let cols = term.columns();
+        let mut lines = Vec::new();
+        for raw_line in top..=bottom {
+            let row = &grid[Line(raw_line)];
+            let mut s = String::new();
+            for col in 0..cols {
+                let cell = &row[Column(col)];
+                if cell
+                    .flags
+                    .intersects(CellFlags::WIDE_CHAR_SPACER | CellFlags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    continue;
+                }
+                s.push(if cell.c == '\0' { ' ' } else { cell.c });
+            }
+            lines.push(s.trim_end().to_string());
+        }
+        while lines.last().is_some_and(String::is_empty) {
+            lines.pop();
+        }
+        lines.join("\n")
     }
 
     /// Emits a wake-up [`PtyEvent::Output`] signal without feeding new bytes.
@@ -220,12 +383,22 @@ impl TerminalBuffer {
 
     /// Applies updated scrollback capacity and default cursor shape to the running terminal.
     pub fn apply_options(&self, scrollback_lines: usize, cursor_shape: CursorShape) {
+        self.apply_options_with_blink(scrollback_lines, cursor_shape, false);
+    }
+
+    /// Applies updated scrollback capacity, cursor shape, and cursor blink to the running terminal.
+    pub fn apply_options_with_blink(
+        &self,
+        scrollback_lines: usize,
+        cursor_shape: CursorShape,
+        cursor_blink: bool,
+    ) {
         let mut term = self.term.lock().expect("term mutex poisoned");
         term.set_options(TermConfig {
             scrolling_history: scrollback_lines,
             default_cursor_style: VteCursorStyle {
                 shape: cursor_shape,
-                blinking: false,
+                blinking: cursor_blink,
             },
             ..TermConfig::default()
         });
@@ -430,6 +603,36 @@ pub fn snapshot_from_term<L: EventListener>(term: &Term<L>, dims: TermDimensions
         selection,
         bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
         mouse_mode: mode.intersects(TermMode::MOUSE_MODE),
+        mouse_sgr: mode.contains(TermMode::SGR_MOUSE),
+        mouse_motion: mode.intersects(TermMode::MOUSE_MOTION | TermMode::MOUSE_DRAG),
+    }
+}
+
+struct OscProgressTracker {
+    next: Option<TerminalProgressState>,
+}
+
+impl Perform for OscProgressTracker {
+    fn osc_dispatch(&mut self, params: &[&[u8]], _bell_terminated: bool) {
+        if params.len() >= 3 && params[0] == b"9" && params[1] == b"4" {
+            let state_code = std::str::from_utf8(params[2])
+                .ok()
+                .and_then(|s| s.trim().parse::<u8>().ok());
+            let pct = params
+                .get(3)
+                .and_then(|b| std::str::from_utf8(b).ok())
+                .and_then(|s| s.trim().parse::<u16>().ok())
+                .map(|v| v.min(100) as u8)
+                .unwrap_or(0);
+            self.next = match state_code {
+                Some(0) => Some(TerminalProgressState::Hidden),
+                Some(1) => Some(TerminalProgressState::Normal(pct)),
+                Some(2) => Some(TerminalProgressState::Error(pct)),
+                Some(3) => Some(TerminalProgressState::Indeterminate),
+                Some(4) => Some(TerminalProgressState::Paused(pct)),
+                _ => None,
+            };
+        }
     }
 }
 

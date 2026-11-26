@@ -222,6 +222,7 @@ username = "ops"
     let roundtrip: ProfilesConfig =
         toml::from_str(&toml::to_string_pretty(&ProfilesConfig {
             schema_version: CURRENT_SCHEMA_VERSION,
+            groups: Vec::new(),
             profiles: vec![profile],
         })
         .unwrap())
@@ -312,5 +313,43 @@ tmux_reattach = "main"
             .effective_mux_attach_command()
             .as_deref(),
         Some("tmux attach -t main || tmux new -s main")
+    );
+}
+
+#[test]
+fn profiles_groups_add_rename_delete_move_and_roundtrip_compat() {
+    let temp = TempDir::new().expect("create temp root");
+    let paths = ConfigPaths::from_root(temp.path());
+
+    let mut cfg = ProfilesConfig::default();
+    let p = Profile::local_shell("Local Dev", None);
+    let pid = p.id.clone();
+    cfg.profiles.push(p);
+
+    assert!(cfg.add_group("Production"));
+    assert!(!cfg.add_group("production")); // case-insensitive duplicate rejected
+    assert!(!cfg.add_group("Ungrouped")); // reserved label rejected
+    assert!(!cfg.add_group("   "));
+
+    save_profiles(&paths, &cfg).expect("save profiles with explicit groups");
+    let mut loaded = load_profiles(&paths).expect("reload profiles with explicit groups");
+    assert_eq!(loaded.groups, vec!["Production"]);
+
+    assert!(loaded.move_profile_to_group(&pid, Some("Production")));
+    assert_eq!(loaded.profiles[0].group.as_deref(), Some("Production"));
+
+    assert!(loaded.rename_group("Production", "Prod EU"));
+    assert_eq!(loaded.groups, vec!["Prod EU"]);
+    assert_eq!(loaded.profiles[0].group.as_deref(), Some("Prod EU"));
+
+    assert!(loaded.delete_group("Prod EU"));
+    assert!(loaded.groups.is_empty());
+    assert_eq!(loaded.profiles[0].group, None);
+
+    save_profiles(&paths, &loaded).expect("save profiles after group removal");
+    let raw = std::fs::read_to_string(paths.profiles_file()).expect("read profiles.toml");
+    assert!(
+        !raw.contains("groups ="),
+        "empty groups list should be omitted from serialized TOML: {raw}"
     );
 }

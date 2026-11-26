@@ -59,11 +59,73 @@ pub enum IpcError {
 pub enum IpcCommand {
     /// Open a new coordinated application window in the primary process.
     OpenWindow,
-    /// Open a new tab inside the primary process (optionally launching a specific `Profile`).
+    /// Open a new tab inside the primary process (optionally launching a specific `Profile` or `cwd`).
     OpenTab {
         #[serde(default)]
         profile_id: Option<String>,
+        #[serde(default)]
+        cwd: Option<PathBuf>,
     },
+    /// Toggle visibility of the Quake drop-down console window without closing active sessions.
+    ToggleQuake,
+}
+
+/// Parses CLI flags (`--toggle-quake`, `--profile <id-or-name>`, `--new-tab`, `--cwd <path>`)
+/// into a single-instance [`IpcCommand`].
+pub fn parse_cli_launch_command<I, S>(args: I) -> IpcCommand
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    let mut toggle_quake = false;
+    let mut open_tab = false;
+    let mut profile_id = None;
+    let mut cwd = None;
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        let s = arg.as_ref();
+        if s == "--toggle-quake" {
+            toggle_quake = true;
+        } else if s == "--new-tab" {
+            open_tab = true;
+        } else if s == "--profile" {
+            if let Some(id) = iter.next() {
+                let val = id.as_ref().trim();
+                if !val.is_empty() {
+                    profile_id = Some(val.to_string());
+                    open_tab = true;
+                }
+            }
+        } else if let Some(val) = s.strip_prefix("--profile=") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                profile_id = Some(trimmed.to_string());
+                open_tab = true;
+            }
+        } else if s == "--cwd" {
+            if let Some(dir) = iter.next() {
+                let trimmed = dir.as_ref().trim();
+                if !trimmed.is_empty() {
+                    cwd = Some(PathBuf::from(trimmed));
+                    open_tab = true;
+                }
+            }
+        } else if let Some(val) = s.strip_prefix("--cwd=") {
+            let trimmed = val.trim();
+            if !trimmed.is_empty() {
+                cwd = Some(PathBuf::from(trimmed));
+                open_tab = true;
+            }
+        }
+    }
+
+    if toggle_quake {
+        IpcCommand::ToggleQuake
+    } else if open_tab {
+        IpcCommand::OpenTab { profile_id, cwd }
+    } else {
+        IpcCommand::OpenWindow
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

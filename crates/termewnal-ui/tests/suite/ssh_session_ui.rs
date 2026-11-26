@@ -438,6 +438,7 @@ async fn end_to_end_app_state_drives_tofu_vault_auth_terminal_io_resize_and_mitm
             cols: 80,
             rows: 24,
             scrollback_lines: 10_000,
+            ..SshConnectConfig::default()
         },
     )
     .with_known_hosts_path(&known_hosts);
@@ -907,4 +908,113 @@ async fn supervised_ui_lifecycle_drives_latency_degraded_cancel_reconnect_scroll
         state.ssh_session(sid).unwrap().transport_status(),
         &TransportStatus::Disconnected
     );
+}
+
+
+#[tokio::test]
+async fn ssh_connection_ui_displays_auto_reconnecting_and_reconnected_successfully() {
+    use crate::common::boot_test_app;
+    use termewnal_ui::{RecoveryNoticeKind, SshUiEvent};
+
+    let temp = TempDir::new().unwrap();
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut state = boot_test_app(paths).unwrap();
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    let spec = SshTargetSpec::quick_connect(
+        "Reconnect Banner Host",
+        SshConnectConfig {
+            host: "127.0.0.1".to_string(),
+            port: 2222,
+            username: "ops".to_string(),
+            auth: SshAuthMethod::Password {
+                vault_secret_ref: None,
+            },
+            known_hosts_path: None,
+            nodelay: true,
+            term_name: "xterm-256color".to_string(),
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 1000,
+            proxy_jump: Vec::new(),
+            ..SshConnectConfig::default()
+        },
+    );
+
+    let _ = state.update(Message::QuickConnectSsh(spec));
+    let sid = state.active_session_id().unwrap();
+    let gen_id = state.ssh_session(sid).unwrap().ssh_generation();
+
+    // 1. Initial connection establishes session.
+    let _ = state.update(Message::SshEvent {
+        session_id: sid,
+        event: SshUiEvent::Connected {
+            generation: gen_id,
+            session: None,
+            supervisor: None,
+        },
+    });
+    assert!(state.status_bar_snapshot().connection_notice.is_none());
+
+    // 2. Connection drop -> Auto-reconnecting status must persist across Connecting retries.
+    let _ = state.update(Message::SshEvent {
+        session_id: sid,
+        event: SshUiEvent::TransportStatus {
+            generation: gen_id,
+            status: TransportStatus::Reconnecting {
+                attempt: 1,
+                next_retry_secs: 2,
+            },
+            last_error: Some("connection reset by peer".to_string()),
+        },
+    });
+    let _ = state.update(Message::SshEvent {
+        session_id: sid,
+        event: SshUiEvent::TransportStatus {
+            generation: gen_id,
+            status: TransportStatus::Connecting,
+            last_error: Some("connection reset by peer".to_string()),
+        },
+    });
+
+    let snap_reconn = state.status_bar_snapshot();
+    assert!(snap_reconn.shows_reconnect_controls());
+    let conn_notice = snap_reconn
+        .connection_notice
+        .as_ref()
+        .expect("connection_notice must show auto-reconnecting");
+    assert_eq!(conn_notice.kind, RecoveryNoticeKind::AutoReconnecting);
+    assert!(conn_notice.message.contains("Auto-reconnecting"));
+    let _ = state.update(Message::ToggleSidebar);
+    let _ = state.view(win);
+
+    // 3. Recovery -> Reconnected successfully badge & Status Bar notice.
+    let _ = state.update(Message::SshEvent {
+        session_id: sid,
+        event: SshUiEvent::Reconnected {
+            generation: gen_id,
+            epoch: 1,
+        },
+    });
+    let _ = state.update(Message::SshEvent {
+        session_id: sid,
+        event: SshUiEvent::TransportStatus {
+            generation: gen_id,
+            status: TransportStatus::Connected {
+                latency_ms: Some(12),
+            },
+            last_error: None,
+        },
+    });
+
+    let snap_done = state.status_bar_snapshot();
+    assert_eq!(snap_done.transport_text(), "Transport: Connected (12 ms)");
+    let done_notice = snap_done
+        .connection_notice
+        .as_ref()
+        .expect("connection_notice must report Reconnected successfully");
+    assert_eq!(done_notice.kind, RecoveryNoticeKind::ReconnectedSuccessfully);
+    assert_eq!(done_notice.message, "Reconnected successfully");
+    let _ = state.view(win);
 }

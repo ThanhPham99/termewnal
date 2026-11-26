@@ -1202,3 +1202,249 @@ async fn tunnel_create_modal_supports_six_plus_profiles_adhoc_ssh_sessions_and_p
     state.tunnel_manager().stop_all();
     let _ = state.update(Message::DisconnectSshSession(qc_sid));
 }
+
+#[test]
+fn editing_and_deleting_profile_and_adhoc_tunnels_updates_sidebar_modal_and_persistence() {
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+
+    let mut ssh_a = Profile::ssh(
+        "Host Alpha",
+        "10.0.0.10",
+        22,
+        "ops",
+        termewnal_core::SshAuthMethod::Agent,
+    );
+    ssh_a.id = "host-alpha".to_string();
+    let mut ssh_b = Profile::ssh(
+        "Host Beta",
+        "10.0.0.20",
+        22,
+        "ops",
+        termewnal_core::SshAuthMethod::Agent,
+    );
+    ssh_b.id = "host-beta".to_string();
+
+    let mut cfg = ProfilesConfig::default();
+    cfg.profiles.push(ssh_a);
+    cfg.profiles.push(ssh_b);
+    save_profiles(&paths, &cfg).expect("save profiles");
+
+    let mut state = super::common::boot_test_app(paths.clone()).expect("boot AppState");
+    let win = iced::window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    // Create a saved standalone tunnel under Host Alpha.
+    let _ = state.update(Message::OpenTunnelCreateModal);
+    let _ = state.update(Message::TunnelFormProfileSelected(Some(
+        "host-alpha".to_string(),
+    )));
+    let _ = state.update(Message::TunnelFormStandaloneToggled(true));
+    let _ = state.update(Message::TunnelFormNameChanged("PG Alpha".to_string()));
+    let _ = state.update(Message::TunnelFormBindPortChanged("15432".to_string()));
+    let _ = state.update(Message::TunnelFormTargetPortChanged("5432".to_string()));
+    let _ = state.update(Message::SubmitTunnelCreate);
+
+    let alpha = state
+        .profiles()
+        .profiles
+        .iter()
+        .find(|p| p.id == "host-alpha")
+        .unwrap();
+    assert_eq!(alpha.tunnels.len(), 1);
+    let tunnel_id = alpha.tunnels[0].id.clone();
+    assert_eq!(state.sidebar().active_tunnels().len(), 1);
+
+    // Open Edit modal for the existing tunnel, change name/ports/direction and move it to Host Beta.
+    let _ = state.update(Message::OpenEditTunnelModal(tunnel_id.clone()));
+    assert!(state.tunnel_ui().create_form().open);
+    assert_eq!(
+        state.tunnel_ui().create_form().editing_tunnel_id.as_deref(),
+        Some(tunnel_id.as_str())
+    );
+    drop(state.view(win));
+
+    let _ = state.update(Message::TunnelFormNameChanged("SOCKS Beta".to_string()));
+    let _ = state.update(Message::TunnelFormDirectionChanged(
+        TunnelDirection::Dynamic,
+    ));
+    let _ = state.update(Message::TunnelFormBindPortChanged("11080".to_string()));
+    let _ = state.update(Message::TunnelFormProfileSelected(Some(
+        "host-beta".to_string(),
+    )));
+    let _ = state.update(Message::SubmitTunnelCreate);
+
+    assert!(!state.tunnel_ui().create_form().open);
+    let reloaded = load_profiles(&paths).expect("reload profiles after edit");
+    let alpha_after = reloaded
+        .profiles
+        .iter()
+        .find(|p| p.id == "host-alpha")
+        .unwrap();
+    let beta_after = reloaded
+        .profiles
+        .iter()
+        .find(|p| p.id == "host-beta")
+        .unwrap();
+    assert!(alpha_after.tunnels.is_empty());
+    assert_eq!(beta_after.tunnels.len(), 1);
+    assert_eq!(beta_after.tunnels[0].id, tunnel_id);
+    assert_eq!(beta_after.tunnels[0].name, "SOCKS Beta");
+    assert_eq!(beta_after.tunnels[0].direction, TunnelDirection::Dynamic);
+    assert_eq!(beta_after.tunnels[0].bind_port, 11080);
+
+    // Right-click context menu renders cleanly for the tunnel row.
+    let _ = state.update(Message::OpenTunnelContextMenu {
+        tunnel_id: tunnel_id.clone(),
+        position: iced::Point::new(140.0, 400.0),
+    });
+    assert!(state.context_menu().is_open());
+    drop(state.view(win));
+
+    // Deleting removes it from Host Beta, profiles.toml, runtime snapshot, and sidebar list.
+    let _ = state.update(Message::DeleteTunnel(tunnel_id.clone()));
+    assert!(!state.context_menu().is_open());
+    assert!(state.sidebar().active_tunnels().is_empty());
+    assert!(state.tunnel_manager().snapshot().tunnels.is_empty());
+    let reloaded_after_delete = load_profiles(&paths).expect("reload after delete");
+    assert!(reloaded_after_delete
+        .profiles
+        .iter()
+        .all(|p| p.tunnels.is_empty()));
+
+    // Verify ad-hoc standalone tunnel edit & delete without saved profile as well.
+    let _ = state.update(Message::OpenTunnelCreateModal);
+    let _ = state.update(Message::TunnelFormProfileSelected(None));
+    let _ = state.update(Message::TunnelFormStandaloneToggled(true));
+    let _ = state.update(Message::TunnelFormNameChanged("Temp Tun".to_string()));
+    let _ = state.update(Message::TunnelFormBindPortChanged("16379".to_string()));
+    let _ = state.update(Message::TunnelFormTargetPortChanged("6379".to_string()));
+    let _ = state.update(Message::SubmitTunnelCreate);
+    assert_eq!(state.sidebar().active_tunnels().len(), 1);
+    let adhoc_id = state.sidebar().active_tunnels()[0].id.clone();
+
+    let _ = state.update(Message::OpenEditTunnelModal(adhoc_id.clone()));
+    let _ = state.update(Message::TunnelFormNameChanged("Temp Tun Renamed".to_string()));
+    let _ = state.update(Message::SubmitTunnelCreate);
+    assert_eq!(state.sidebar().active_tunnels().len(), 1);
+    assert_eq!(state.sidebar().active_tunnels()[0].name, "Temp Tun Renamed");
+
+    let _ = state.update(Message::DeleteTunnel(adhoc_id));
+    assert!(state.sidebar().active_tunnels().is_empty());
+    assert!(state.tunnel_ui().ad_hoc_tunnels().is_empty());
+}
+
+
+#[test]
+fn tunnel_ui_displays_auto_reconnecting_and_reconnected_successfully_and_preserves_tunnels_text() {
+    use crate::common::boot_test_app;
+    use termewnal_ssh::{TunnelManagerSnapshot, TunnelSnapshot};
+    use termewnal_ui::RecoveryNoticeKind;
+
+    let temp = TempDir::new().unwrap();
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut state = boot_test_app(paths).unwrap();
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+    if !state.sidebar().is_open() {
+        let _ = state.update(Message::ToggleSidebar);
+    }
+
+    let retrying_snap = TunnelManagerSnapshot {
+        tunnels: vec![TunnelSnapshot {
+            id: "tun-auto-1".to_string(),
+            name: "Redis Tunnel".to_string(),
+            profile_id: None,
+            session_id: Some(1),
+            direction: TunnelDirection::Local,
+            bind_host: "127.0.0.1".to_string(),
+            bind_port: 6379,
+            bound_addr: None,
+            remote_bound_port: None,
+            target_host: Some("127.0.0.1".to_string()),
+            target_port: Some(6379),
+            standalone: false,
+            allow_public_bind: false,
+            hold_grace_secs: 30,
+            state: TunnelState::Reconnecting,
+            held_clients: 0,
+            active_connections: 0,
+            last_error: Some("connection reset".to_string()),
+            reconnect_attempt: Some(2),
+            next_retry_secs: Some(4),
+            reconnected: false,
+        }],
+        active_count: 0,
+        holding_count: 0,
+        reconnecting_count: 1,
+        retrying_count: 0,
+        error_count: 0,
+        active_standalone_count: 0,
+    };
+
+    let _ = state.update(Message::TunnelManagerUpdated(retrying_snap));
+    let bar_retrying = state.status_bar_snapshot();
+    assert_eq!(bar_retrying.tunnels_text(), "Tunnels: 0 active, 1 reconnecting");
+    let notice_retrying = bar_retrying
+        .tunnel_notice
+        .as_ref()
+        .expect("tunnel auto-reconnecting notice must be set");
+    assert_eq!(notice_retrying.kind, RecoveryNoticeKind::AutoReconnecting);
+    assert!(notice_retrying.message.contains("auto-reconnecting"));
+    let entry = &state.sidebar().active_tunnels()[0];
+    assert_eq!(entry.reconnect_attempt, Some(2));
+    assert_eq!(entry.last_error.as_deref(), Some("connection reset"));
+    let _ = state.view(win);
+
+    let recovered_snap = TunnelManagerSnapshot {
+        tunnels: vec![TunnelSnapshot {
+            id: "tun-auto-1".to_string(),
+            name: "Redis Tunnel".to_string(),
+            profile_id: None,
+            session_id: Some(1),
+            direction: TunnelDirection::Local,
+            bind_host: "127.0.0.1".to_string(),
+            bind_port: 6379,
+            bound_addr: None,
+            remote_bound_port: None,
+            target_host: Some("127.0.0.1".to_string()),
+            target_port: Some(6379),
+            standalone: false,
+            allow_public_bind: false,
+            hold_grace_secs: 30,
+            state: TunnelState::Active,
+            held_clients: 0,
+            active_connections: 0,
+            last_error: None,
+            reconnect_attempt: None,
+            next_retry_secs: None,
+            reconnected: true,
+        }],
+        active_count: 1,
+        holding_count: 0,
+        reconnecting_count: 0,
+        retrying_count: 0,
+        error_count: 0,
+        active_standalone_count: 0,
+    };
+
+    let _ = state.update(Message::TunnelManagerUpdated(recovered_snap));
+    let bar_done = state.status_bar_snapshot();
+    assert_eq!(bar_done.tunnels_text(), "Tunnels: 1 active");
+    let notice_done = bar_done
+        .tunnel_notice
+        .as_ref()
+        .expect("tunnel reconnected notice must be set");
+    assert_eq!(
+        notice_done.kind,
+        RecoveryNoticeKind::ReconnectedSuccessfully
+    );
+    assert!(notice_done.message.contains("reconnected successfully"));
+    assert_eq!(
+        state.sidebar().active_tunnels()[0]
+            .reconnected_notice
+            .as_deref(),
+        Some("Reconnected successfully")
+    );
+    let _ = state.view(win);
+}

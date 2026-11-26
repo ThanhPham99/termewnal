@@ -4,19 +4,20 @@ use iced::keyboard::{Key, Modifiers, key::Named};
 use tempfile::TempDir;
 use termewnal_core::{
     ConfigPaths, Profile, ProfileTarget, ProfilesConfig, SshAuthMethod, TunnelDirection,
-    save_profiles,
+    load_profiles, save_profiles,
 };
 use termewnal_ssh::TransportStatus;
 use termewnal_ui::command_palette::{CommandPaletteMode, PaletteAction, QuickConnectTarget};
 use termewnal_ui::sidebar::{
-    ActiveTunnelEntry, SidebarSection, SystemSshProfile, TunnelRuntimeState, UNGROUPED_LABEL,
+    ActiveTunnelEntry, SidebarFilterScope, SidebarSection, SystemSshProfile, TunnelRuntimeState,
+    UNGROUPED_LABEL,
 };
 use termewnal_ui::status_bar::{
     SessionKindLabel, StatusBarAction, TransferSummaryHook, TunnelSummaryHook,
 };
 use termewnal_ui::{
-    LaunchDisposition, Message, SessionId, SplitAxis, TabId, shortcut_for_key_event,
-    shortcut_for_key_event_with_palette,
+    ContextMenuKind, DragPayload, DropTarget, LaunchDisposition, Message, SessionId, SplitAxis,
+    TabId, shortcut_for_key_event, shortcut_for_key_event_with_palette,
 };
 
 fn seed_profiles(paths: &ConfigPaths) -> Vec<Profile> {
@@ -53,27 +54,21 @@ fn seed_profiles(paths: &ConfigPaths) -> Vec<Profile> {
 #[test]
 fn ctrl_b_toggles_left_sidebar_and_groups_saved_profiles_by_group_and_tag() {
     let tab = Some(TabId(1));
-    assert!(matches!(
-        shortcut_for_key_event(&Key::Character("b".into()), Modifiers::CTRL, tab),
-        Some(Message::ToggleSidebar)
-    ));
-    assert!(matches!(
-        shortcut_for_key_event(&Key::Character("B".into()), Modifiers::CTRL, tab),
-        Some(Message::ToggleSidebar)
-    ));
+    assert!(shortcut_for_key_event(&Key::Character("b".into()), Modifiers::CTRL, tab).is_none());
+    assert!(shortcut_for_key_event(&Key::Character("B".into()), Modifiers::CTRL, tab).is_none());
 
     let temp = TempDir::new().expect("create temp XDG root");
     let paths = ConfigPaths::from_root(temp.path());
     seed_profiles(&paths);
 
     let mut state = super::common::boot_test_app(paths).expect("boot AppState");
-    assert!(!state.sidebar().is_open());
+    assert!(state.sidebar().is_open());
 
     let _ = state.update(Message::ToggleSidebar);
     assert!(state.sidebar().is_open());
 
-    let _ = state.update(Message::ToggleSidebar);
-    assert!(!state.sidebar().is_open());
+    let _ = state.update(Message::SetSidebarOpen(false));
+    assert!(state.sidebar().is_open());
 
     let _ = state.update(Message::SetSidebarOpen(true));
     assert!(state.sidebar().is_open());
@@ -134,6 +129,9 @@ fn ctrl_b_toggles_left_sidebar_and_groups_saved_profiles_by_group_and_tag() {
         user: Some("postgres".to_string()),
         identity_file: None,
         proxy_jump: vec!["bastion".to_string()],
+        forward_agent: None,
+        forward_x11: None,
+        proxy_command: None,
     }]));
     assert_eq!(state.sidebar().system_ssh_profiles().len(), 1);
     assert_eq!(state.sidebar().system_ssh_profiles()[0].alias, "db-prod");
@@ -147,9 +145,28 @@ fn ctrl_b_toggles_left_sidebar_and_groups_saved_profiles_by_group_and_tag() {
         state: TunnelRuntimeState::Active,
         standalone: true,
         session_id: Some(SessionId(1)),
+        reconnect_attempt: None,
+        next_retry_secs: None,
+        last_error: None,
+        reconnected_notice: None,
     }]));
     assert_eq!(state.sidebar().active_tunnels().len(), 1);
     assert_eq!(state.sidebar().active_tunnels()[0].name, "Postgres Local");
+
+    // Sidebar `[Active]`/`[All]` filter scope and Active Sessions collapse.
+    let win = iced::window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+    assert_eq!(state.sidebar().filter_scope(), SidebarFilterScope::All);
+    drop(state.view(win));
+
+    let _ = state.update(Message::SetSidebarFilterScope(SidebarFilterScope::Active));
+    assert_eq!(state.sidebar().filter_scope(), SidebarFilterScope::Active);
+    drop(state.view(win));
+
+    let _ = state.update(Message::SetSidebarFilterScope(SidebarFilterScope::All));
+    let _ = state.update(Message::SidebarToggleSection(SidebarSection::ActiveSessions));
+    assert!(state.sidebar().is_section_collapsed(SidebarSection::ActiveSessions));
+    drop(state.view(win));
 }
 
 #[test]
@@ -184,6 +201,11 @@ fn selecting_saved_profile_opens_local_pty_or_ssh_session_slot_in_tab_or_split_p
         username: "deploy".to_string(),
         auth: SshAuthMethod::Agent,
         proxy_jump: vec!["bastion.internal".to_string()],
+        proxy_command: None,
+        proxy: None,
+        forward_agent: false,
+        forward_x11: false,
+        login_scripts: Vec::new(),
         auto_connect_on_startup: true,
         tmux_reattach: Some("main".to_string()),
         keepalive_interval_secs: None,
@@ -353,7 +375,7 @@ fn ctrl_k_and_ctrl_shift_p_open_command_palette_with_fuzzy_search_and_execution(
     assert_eq!(state.active_session_id(), Some(initial_session));
     assert_eq!(state.active_tab_id(), Some(initial_tab));
 
-    // Workspace actions (Toggle Broadcast Input, Toggle Sidebar, Split Vertically) execute via palette.
+    // Workspace actions (Toggle Broadcast Input, Split Vertically) execute via palette.
     let _ = state.update(Message::ToggleCommandPalette);
     let _ = state.update(Message::CommandPaletteQueryChanged("broadcast".to_string()));
     assert!(!state.is_broadcast_banner_visible());
@@ -362,8 +384,8 @@ fn ctrl_k_and_ctrl_shift_p_open_command_palette_with_fuzzy_search_and_execution(
 
     let _ = state.update(Message::ToggleCommandPalette);
     let _ = state.update(Message::CommandPaletteQueryChanged("sidebar".to_string()));
-    assert!(!state.sidebar().is_open());
-    let _ = state.update(Message::CommandPaletteConfirm);
+    assert!(state.command_palette_items().iter().all(|i| i.action != PaletteAction::ToggleSidebar));
+    let _ = state.update(Message::CloseCommandPalette);
     assert!(state.sidebar().is_open());
 
     // Arrow navigation moves selection index across filtered workspace commands.
@@ -576,7 +598,8 @@ fn status_bar_reflects_active_session_and_extensible_transport_tunnel_transfer_h
     ));
     assert!(state.status_bar_snapshot().transfer_drawer_open);
 
-    assert!(!state.sidebar().is_open());
+    let _ = state.update(Message::SetSidebarOpen(false));
+    assert!(state.sidebar().is_open());
     let _ = state.update(Message::StatusBarAction(StatusBarAction::ToggleTunnelsView));
     assert!(state.sidebar().is_open());
     assert!(!state.sidebar().is_section_collapsed(SidebarSection::ActiveTunnels));
@@ -715,4 +738,243 @@ fn probe_reconnect_all_palette_and_status_bar_handle_degraded_reconnecting_and_m
         state.ssh_session(untouched_sid).unwrap().transport_status(),
         &TransportStatus::Disconnected
     );
+}
+
+#[test]
+fn sidebar_right_click_group_management_and_drag_drop_workflows() {
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+    let seeded = seed_profiles(&paths);
+    let dev_id = seeded[2].id.clone();
+
+    let mut state = super::common::boot_test_app(paths.clone()).expect("boot AppState");
+    let win = iced::window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    // Profile sidebar is always open and cannot be collapsed.
+    assert!(state.sidebar().is_open());
+    let _ = state.update(Message::SetSidebarOpen(false));
+    assert!(state.sidebar().is_open());
+
+    // 1. Right-clicking sidebar empty area opens Sidebar context menu and creates a persistent empty group.
+    let _ = state.update(Message::OpenSidebarContextMenu {
+        group_name: None,
+        profile_id: None,
+        position: iced::Point::new(80.0, 220.0),
+    });
+    assert!(matches!(
+        state.context_menu().active,
+        Some((ContextMenuKind::Sidebar { group_name: None, profile_id: None, .. }, _))
+    ));
+    drop(state.view(win));
+
+    let _ = state.update(Message::BeginCreateGroup {
+        assign_profile_id: None,
+    });
+    assert!(state.context_menu().is_open());
+    let _ = state.update(Message::CreateGroupDraftChanged("Cloud Ops".to_string()));
+    drop(state.view(win));
+    let _ = state.update(Message::SubmitCreateGroup);
+    assert!(!state.context_menu().is_open());
+
+    let persisted = load_profiles(&paths).expect("reload profiles after group create");
+    assert_eq!(persisted.groups, vec!["Cloud Ops"]);
+    let groups_view = state
+        .sidebar()
+        .grouped_saved_profiles_with_groups(&state.profiles().profiles, &state.profiles().groups);
+    let group_names: Vec<&str> = groups_view.iter().map(|g| g.name.as_str()).collect();
+    assert_eq!(
+        group_names,
+        vec!["Cloud Ops", "Production", "Staging", UNGROUPED_LABEL]
+    );
+    drop(state.view(win));
+
+    // 2. Group right-click -> New Profile in Group prefills target group.
+    let _ = state.update(Message::OpenNewProfileInGroup(Some("Cloud Ops".to_string())));
+    assert!(state.profile_editor().is_open());
+    assert_eq!(state.profile_editor().group, "Cloud Ops");
+    let _ = state.update(Message::CloseProfileEditor);
+
+    // 3. Drag saved profile "Dev Shell" into empty "Cloud Ops" group.
+    let _ = state.update(Message::DragStart {
+        payload: DragPayload::SavedProfile {
+            profile_id: dev_id.clone(),
+            label: "Dev Shell".to_string(),
+        },
+        position: iced::Point::new(60.0, 320.0),
+    });
+    assert!(state.drag_drop().is_dragging());
+    let _ = state.update(Message::DragCursorMoved(iced::Point::new(60.0, 180.0)));
+    let _ = state.update(Message::DragHoverChanged(DropTarget::ProfileGroup(Some(
+        "Cloud Ops".to_string(),
+    ))));
+    drop(state.view(win));
+    let _ = state.update(Message::DragFinish);
+    assert!(!state.drag_drop().is_dragging());
+
+    let after_drop = load_profiles(&paths).expect("reload profiles after drag move");
+    let moved_dev = after_drop
+        .profiles
+        .iter()
+        .find(|p| p.id == dev_id)
+        .expect("dev profile present");
+    assert_eq!(moved_dev.group.as_deref(), Some("Cloud Ops"));
+
+    // 4. Rename and delete group cleanly without losing member profiles.
+    let _ = state.update(Message::BeginRenameGroup("Cloud Ops".to_string()));
+    let _ = state.update(Message::RenameGroupDraftChanged("Platform".to_string()));
+    drop(state.view(win));
+    let _ = state.update(Message::SubmitRenameGroup);
+    assert_eq!(
+        state
+            .profiles()
+            .profiles
+            .iter()
+            .find(|p| p.id == dev_id)
+            .and_then(|p| p.group.as_deref()),
+        Some("Platform")
+    );
+
+    let _ = state.update(Message::DeleteProfileGroup("Platform".to_string()));
+    let after_delete = load_profiles(&paths).expect("reload profiles after delete group");
+    assert!(after_delete.groups.is_empty());
+    assert_eq!(
+        after_delete
+            .profiles
+            .iter()
+            .find(|p| p.id == dev_id)
+            .and_then(|p| p.group.as_deref()),
+        None
+    );
+
+    // 5. Drag System SSH host into a group clones & assigns it.
+    let _ = state.update(Message::SetSystemSshProfiles(vec![SystemSshProfile {
+        alias: "edge-ssh".to_string(),
+        host_name: Some("10.20.0.5".to_string()),
+        port: 22,
+        user: Some("deploy".to_string()),
+        identity_file: None,
+        proxy_jump: Vec::new(),
+        forward_agent: None,
+        forward_x11: None,
+        proxy_command: None,
+    }]));
+    let _ = state.update(Message::DragStart {
+        payload: DragPayload::SystemSsh {
+            alias: "edge-ssh".to_string(),
+            label: "edge-ssh".to_string(),
+        },
+        position: iced::Point::new(60.0, 500.0),
+    });
+    let _ = state.update(Message::DragHoverChanged(DropTarget::ProfileGroup(Some(
+        "Production".to_string(),
+    ))));
+    let _ = state.update(Message::DragFinish);
+    assert!(state.profiles().profiles.iter().any(|p| {
+        p.name == "edge-ssh" && p.group.as_deref() == Some("Production")
+    }));
+
+    // 6. Drag & drop workspace tabs reorders cleanly and supports cancel with Escape.
+    let _ = state.update(Message::NewTab);
+    let _ = state.update(Message::NewTab);
+    let initial_ids: Vec<TabId> = state.workspace().tabs().iter().map(|t| t.id).collect();
+    assert_eq!(initial_ids.len(), 3);
+    let (t1, t2, t3) = (initial_ids[0], initial_ids[1], initial_ids[2]);
+
+    // Drag T1 after T2 -> [T2, T1, T3]
+    let _ = state.update(Message::DragStart {
+        payload: DragPayload::Tab {
+            tab_id: t1,
+            label: "Tab 1".to_string(),
+        },
+        position: iced::Point::new(260.0, 20.0),
+    });
+    let _ = state.update(Message::DragHoverChanged(DropTarget::TabSlot {
+        tab_id: t2,
+        after: true,
+    }));
+    drop(state.view(win));
+    let _ = state.update(Message::DragFinish);
+    let order_1: Vec<TabId> = state.workspace().tabs().iter().map(|t| t.id).collect();
+    assert_eq!(order_1, vec![t2, t1, t3]);
+
+    // Drag T3 before T2 -> [T3, T2, T1]
+    let _ = state.update(Message::DragStart {
+        payload: DragPayload::Tab {
+            tab_id: t3,
+            label: "Tab 3".to_string(),
+        },
+        position: iced::Point::new(420.0, 20.0),
+    });
+    let _ = state.update(Message::DragHoverChanged(DropTarget::TabSlot {
+        tab_id: t2,
+        after: false,
+    }));
+    let _ = state.update(Message::DragFinish);
+    let order_2: Vec<TabId> = state.workspace().tabs().iter().map(|t| t.id).collect();
+    assert_eq!(order_2, vec![t3, t2, t1]);
+
+    // Drag T3 to TabStripEnd -> [T2, T1, T3]
+    let _ = state.update(Message::DragStart {
+        payload: DragPayload::Tab {
+            tab_id: t3,
+            label: "Tab 3".to_string(),
+        },
+        position: iced::Point::new(260.0, 20.0),
+    });
+    let _ = state.update(Message::DragHoverChanged(DropTarget::TabStripEnd));
+    let _ = state.update(Message::DragFinish);
+    let order_3: Vec<TabId> = state.workspace().tabs().iter().map(|t| t.id).collect();
+    assert_eq!(order_3, vec![t2, t1, t3]);
+
+    // Dragging a saved profile onto TabStripEnd opens a new tab; onto WorkspacePane splits right.
+    let tabs_before_drop = state.workspace().tab_count();
+    let _ = state.update(Message::DragStart {
+        payload: DragPayload::SavedProfile {
+            profile_id: dev_id.clone(),
+            label: "Dev Shell".to_string(),
+        },
+        position: iced::Point::new(80.0, 300.0),
+    });
+    let _ = state.update(Message::DragHoverChanged(DropTarget::TabStripEnd));
+    let _ = state.update(Message::DragFinish);
+    assert_eq!(state.workspace().tab_count(), tabs_before_drop + 1);
+
+    let focused_pane = state.workspace().active_tab().unwrap().focused_pane;
+    let panes_before = state.workspace().active_tab().unwrap().root.pane_count();
+    let _ = state.update(Message::DragStart {
+        payload: DragPayload::SavedProfile {
+            profile_id: dev_id,
+            label: "Dev Shell".to_string(),
+        },
+        position: iced::Point::new(80.0, 300.0),
+    });
+    let _ = state.update(Message::DragHoverChanged(DropTarget::WorkspacePane {
+        pane_id: Some(focused_pane),
+        split_axis: Some(SplitAxis::Vertical),
+    }));
+    drop(state.view(win));
+    let _ = state.update(Message::DragFinish);
+    assert_eq!(
+        state.workspace().active_tab().unwrap().root.pane_count(),
+        panes_before + 1
+    );
+
+    // Escape cancels active drag; external OS file hover renders and clears cleanly.
+    let _ = state.update(Message::DragStart {
+        payload: DragPayload::Tab {
+            tab_id: t1,
+            label: "Tab 1".to_string(),
+        },
+        position: iced::Point::new(260.0, 20.0),
+    });
+    assert!(state.drag_drop().is_dragging());
+    let _ = state.update(Message::EscapePressed);
+    assert!(!state.drag_drop().is_dragging());
+
+    let _ = state.update(Message::ExternalFileHovered("/tmp/deploy.tar.gz".into()));
+    assert!(state.drag_drop().external_file_hover.is_some());
+    drop(state.view(win));
+    let _ = state.update(Message::ExternalFilesLeft);
+    assert!(state.drag_drop().external_file_hover.is_none());
 }

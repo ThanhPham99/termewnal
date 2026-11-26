@@ -710,6 +710,7 @@ fn connect_cfg(addr: SocketAddr, user: &str, auth: SshAuthMethod, kh: &Path) -> 
         cols: 80,
         rows: 24,
         scrollback_lines: 10_000,
+        ..SshConnectConfig::default()
     }
 }
 
@@ -1277,4 +1278,88 @@ async fn concurrent_multi_mb_transfers_do_not_starve_terminal_ssh_session() {
     assert!(queue.wait_until_idle(Duration::from_secs(20)).await);
     assert_eq!(queue.snapshot().completed_count, 3);
     assert_eq!(srv.state.connection_count.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn sftp_manager_text_edit_create_copy_and_recursive_rmdir() {
+    let temp = TempDir::new().unwrap();
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(remote_root.join("nested/sub")).unwrap();
+    fs::write(remote_root.join("nested/a.txt"), b"alpha").unwrap();
+    fs::write(remote_root.join("nested/sub/b.txt"), b"beta").unwrap();
+    fs::write(remote_root.join("binary.bin"), b"\x00\x01\x02\x03").unwrap();
+
+    let known_hosts = temp.path().join("known_hosts");
+    let vault = make_vault(&temp);
+    vault.set_secret("ssh/plus_pw", "secret-pass").unwrap();
+
+    let srv = spawn_sftp_server(
+        remote_root.clone(),
+        ServerAuthMode::Password {
+            username: "ops".to_string(),
+            password: "secret-pass".to_string(),
+        },
+    )
+    .await;
+    record_known_host_path("127.0.0.1", srv.addr.port(), &srv.host_pubkey, &known_hosts).unwrap();
+
+    let cfg = connect_cfg(
+        srv.addr,
+        "ops",
+        SshAuthMethod::Password {
+            vault_secret_ref: Some("ssh/plus_pw".to_string()),
+        },
+        &known_hosts,
+    );
+    let agent: Arc<dyn AgentConnector> = Arc::new(OsAgentConnector::default());
+    let primary = SshSession::connect(
+        cfg.clone(),
+        Some(vault.as_ref()),
+        TestInteraction::tofu_only(),
+        Arc::clone(&agent),
+    )
+    .await
+    .unwrap();
+
+    let key = ProfileTransportKey::from_connect_config(Some("prof-plus".to_string()), &cfg);
+    let endpoint = SftpEndpoint::new(key, cfg)
+        .with_vault(vault)
+        .with_agent_connector(agent)
+        .with_primary_transport(Arc::clone(primary.primary_transport()));
+
+    let sftp = SftpManager::new();
+
+    sftp.create_empty_file(&endpoint, "/empty.conf")
+        .await
+        .unwrap();
+    assert_eq!(sftp.read_text_file(&endpoint, "/empty.conf", 65536).await.unwrap(), "");
+
+    sftp.write_text_file(&endpoint, "/empty.conf", "port=8080\nmode=prod\n")
+        .await
+        .unwrap();
+    assert_eq!(
+        sftp.read_text_file(&endpoint, "/empty.conf", 65536).await.unwrap(),
+        "port=8080\nmode=prod\n"
+    );
+
+    sftp.copy_file(&endpoint, "/empty.conf", "/empty.copy.conf")
+        .await
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(remote_root.join("empty.copy.conf")).unwrap(),
+        "port=8080\nmode=prod\n"
+    );
+
+    // Binary and oversized safeguards must reject cleanly.
+    let bin_err = sftp.read_text_file(&endpoint, "/binary.bin", 65536).await;
+    assert!(bin_err.is_err());
+    let limit_err = sftp.read_text_file(&endpoint, "/empty.conf", 4).await;
+    assert!(limit_err.is_err());
+
+    // Recursive directory deletion removes nested subdirectories and files.
+    assert!(remote_root.join("nested/sub/b.txt").exists());
+    sftp.remove_dir_recursive(&endpoint, "/nested")
+        .await
+        .unwrap();
+    assert!(!remote_root.join("nested").exists());
 }

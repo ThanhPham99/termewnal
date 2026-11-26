@@ -6,17 +6,21 @@ rust-version.workspace = true
 
 [dependencies]
 arboard.workspace = true
+chrono.workspace = true
 iced.workspace = true
 interprocess.workspace = true
 open.workspace = true
 serde.workspace = true
 termewnal-core = { path = "../termewnal-core" }
+termewnal-protocols = { path = "../termewnal-protocols" }
 termewnal-pty = { path = "../termewnal-pty" }
 termewnal-ssh = { path = "../termewnal-ssh" }
 thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+x11rb.workspace = true
+zbus.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]

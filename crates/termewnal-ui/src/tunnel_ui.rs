@@ -1,10 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use iced::widget::{
-    Id, button, column, container, opaque, row, rule, scrollable, space, text, text_input,
+    Id, button, column, container, opaque, row, scrollable, space, text, text_input,
 };
-use iced::{Alignment, Background, Border, Color, Element, Length, Shadow, Theme, Vector};
+use iced::{Alignment, Background, Border, Color, Element, Length, Padding, Shadow, Theme, Vector};
 use termewnal_core::{
     DEFAULT_TUNNEL_HOLD_GRACE_SECS, Profile, ProfileTarget, ThemePalette, TunnelDirection,
     TunnelRule,
@@ -14,11 +15,14 @@ use termewnal_ssh::{TunnelManagerSnapshot, TunnelState};
 use crate::app::{Message, SessionId};
 use crate::sidebar::{ActiveTunnelEntry, TunnelRuntimeState};
 use crate::ui_theme::{
-    ChromePalette, PillTone, modal_card_style, modal_overlay, pill_button_style, status_dot,
-    styled_input_style,
+    ChromePalette, FONT_BODY, FONT_META, FONT_SUBHEAD, PillTone, hairline_h, inset_well_style,
+    modal_card_style, modal_overlay, modal_width, mono_font, pill_button_style,
+    segmented_button_style, segmented_track_style, sheet_header, status_dot, styled_input_style,
+    ui_font, ui_font_medium, ui_font_semibold,
 };
 
 const MODAL_WIDTH: f32 = 540.0;
+pub(crate) const RECONNECT_NOTICE_TTL: Duration = Duration::from_secs(8);
 
 /// Returns the static widget [`Id`] for the Tunnel creation form name input.
 pub const fn tunnel_name_input_id() -> Id {
@@ -53,10 +57,12 @@ pub struct AdHocTunnelRule {
     pub session_id: Option<SessionId>,
 }
 
-/// State backing the modal form for defining a Local (`-L`), Remote (`-R`), or Dynamic SOCKS5 (`-D`) `Tunnel`.
+/// State backing the modal form for defining or editing a Local (`-L`), Remote (`-R`), or Dynamic SOCKS5 (`-D`) `Tunnel`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelCreateForm {
     pub open: bool,
+    pub editing_tunnel_id: Option<String>,
+    pub orig_public_bind_host: Option<String>,
     pub name: String,
     pub profile_id: Option<String>,
     pub session_id: Option<SessionId>,
@@ -74,6 +80,8 @@ impl Default for TunnelCreateForm {
     fn default() -> Self {
         Self {
             open: false,
+            editing_tunnel_id: None,
+            orig_public_bind_host: None,
             name: String::new(),
             profile_id: None,
             session_id: None,
@@ -90,7 +98,7 @@ impl Default for TunnelCreateForm {
 }
 
 impl TunnelCreateForm {
-    /// Opens the modal seeded with default loopback (`127.0.0.1`) settings.
+    /// Opens the modal seeded with default loopback (`127.0.0.1`) settings for a new tunnel.
     pub fn open_for(&mut self, profile_id: Option<String>, session_id: Option<SessionId>) {
         *self = Self {
             open: true,
@@ -100,9 +108,47 @@ impl TunnelCreateForm {
         };
     }
 
+    /// Opens the modal pre-populated for editing an existing [`TunnelRule`].
+    pub fn open_for_edit(
+        &mut self,
+        rule: &TunnelRule,
+        profile_id: Option<String>,
+        session_id: Option<SessionId>,
+    ) {
+        let bind_host = rule.effective_bind_host().to_string();
+        let orig_public_bind_host = rule.allow_public_bind.then(|| bind_host.clone());
+        *self = Self {
+            open: true,
+            editing_tunnel_id: Some(rule.id.clone()),
+            orig_public_bind_host,
+            name: rule.name.clone(),
+            profile_id,
+            session_id,
+            direction: rule.direction,
+            bind_host,
+            bind_port: rule.bind_port.to_string(),
+            target_host: rule
+                .target_host
+                .clone()
+                .unwrap_or_else(|| "127.0.0.1".to_string()),
+            target_port: rule
+                .target_port
+                .unwrap_or(5432)
+                .to_string(),
+            standalone: rule.standalone,
+            hold_grace_secs: rule
+                .hold_grace_secs
+                .unwrap_or(DEFAULT_TUNNEL_HOLD_GRACE_SECS)
+                .to_string(),
+            validation_error: None,
+        };
+    }
+
     /// Closes the modal and clears transient validation errors.
     pub fn close(&mut self) {
         self.open = false;
+        self.editing_tunnel_id = None;
+        self.orig_public_bind_host = None;
         self.validation_error = None;
     }
 
@@ -192,6 +238,12 @@ impl TunnelCreateForm {
         rule.bind_host = bind_host;
         rule.standalone = self.standalone;
         rule.hold_grace_secs = hold_grace_secs;
+        if let Some(existing_id) = &self.editing_tunnel_id {
+            rule.id = existing_id.clone();
+            if self.orig_public_bind_host.as_deref() == Some(rule.bind_host.as_str()) {
+                rule.allow_public_bind = true;
+            }
+        }
         Ok(rule)
     }
 }
@@ -225,6 +277,9 @@ pub struct TunnelUiState {
     ad_hoc_tunnels: Vec<AdHocTunnelRule>,
     manually_stopped: BTreeSet<String>,
     start_errors: BTreeMap<String, String>,
+    was_recovering: BTreeSet<String>,
+    reconnected_ack: BTreeSet<String>,
+    reconnected_at: BTreeMap<String, Instant>,
 }
 
 impl TunnelUiState {
@@ -301,6 +356,84 @@ impl TunnelUiState {
         self.ad_hoc_tunnels.iter().find(|t| t.rule.id == tunnel_id)
     }
 
+    /// Removes an ad-hoc `TunnelRule` and clears any transient runtime error/stop state for it.
+    pub fn remove_ad_hoc(&mut self, tunnel_id: &str) -> bool {
+        let before = self.ad_hoc_tunnels.len();
+        self.ad_hoc_tunnels.retain(|t| t.rule.id != tunnel_id);
+        let removed = self.ad_hoc_tunnels.len() != before;
+        self.manually_stopped.remove(tunnel_id);
+        self.start_errors.remove(tunnel_id);
+        self.was_recovering.remove(tunnel_id);
+        self.reconnected_ack.remove(tunnel_id);
+        self.reconnected_at.remove(tunnel_id);
+        removed
+    }
+
+    /// Synchronizes recovery completion timestamps from a live [`TunnelManagerSnapshot`].
+    pub fn sync_from_manager_snapshot(&mut self, snap: &TunnelManagerSnapshot, now: Instant) {
+        let mut live_ids = BTreeSet::new();
+        for t in &snap.tunnels {
+            live_ids.insert(t.id.clone());
+            match t.state {
+                TunnelState::Holding | TunnelState::Reconnecting | TunnelState::Retrying { .. } => {
+                    self.was_recovering.insert(t.id.clone());
+                    self.reconnected_ack.remove(&t.id);
+                    self.reconnected_at.remove(&t.id);
+                }
+                TunnelState::Active => {
+                    if (t.reconnected || self.was_recovering.remove(&t.id))
+                        && !self.reconnected_ack.contains(&t.id)
+                    {
+                        self.reconnected_ack.insert(t.id.clone());
+                        self.reconnected_at.insert(t.id.clone(), now);
+                    }
+                }
+                TunnelState::Stopped | TunnelState::Error(_) | TunnelState::Starting => {
+                    self.was_recovering.remove(&t.id);
+                    self.reconnected_ack.remove(&t.id);
+                    self.reconnected_at.remove(&t.id);
+                }
+            }
+        }
+        self.was_recovering.retain(|id| live_ids.contains(id));
+        self.reconnected_ack.retain(|id| live_ids.contains(id));
+        self.reconnected_at.retain(|id, _| live_ids.contains(id));
+    }
+
+    /// Expires `"Reconnected successfully"` tunnel notices older than `RECONNECT_NOTICE_TTL`.
+    pub fn expire_reconnected_notices(&mut self, now: Instant) -> bool {
+        let before = self.reconnected_at.len();
+        self.reconnected_at
+            .retain(|_, ts| now.saturating_duration_since(*ts) < RECONNECT_NOTICE_TTL);
+        self.reconnected_at.len() != before
+    }
+
+    /// Returns `true` while any tunnel holds an active `"Reconnected successfully"` notice.
+    pub fn has_active_reconnected_notices(&self) -> bool {
+        !self.reconnected_at.is_empty()
+    }
+
+    /// Returns `true` when `tunnel_id` has an active `"Reconnected successfully"` notice.
+    pub fn is_reconnected(&self, tunnel_id: &str) -> bool {
+        self.reconnected_at.contains_key(tunnel_id)
+    }
+
+    /// Returns `true` when recovery for `tunnel_id` has already been acknowledged.
+    pub fn was_acknowledged(&self, tunnel_id: &str) -> bool {
+        self.reconnected_ack.contains(tunnel_id)
+    }
+
+    /// Clears `pending_public_bind` when it targets `tunnel_id`.
+    pub fn clear_pending_public_bind_if(&mut self, tunnel_id: &str) {
+        if self
+            .pending_public_bind
+            .as_ref()
+            .is_some_and(|p| p.rule.id == tunnel_id)
+        {
+            self.pending_public_bind = None;
+        }
+    }
+
     /// Removes session-bound ad-hoc `Tunnel`s tied to a closed `SessionId`.
     pub fn prune_session(&mut self, session_id: SessionId) {
         self.ad_hoc_tunnels
@@ -346,55 +479,90 @@ impl TunnelUiState {
         adhoc_ssh_sessions: &[(SessionId, String)],
         palette: &ThemePalette,
     ) -> Option<Element<'a, Message, Theme, iced::Renderer>> {
+        self.view_create_modal_responsive(profiles, adhoc_ssh_sessions, palette, 1280.0, 800.0)
+    }
+
+    /// Renders the `Tunnel` creation modal clamped responsively to `window_width` x `window_height`.
+    pub fn view_create_modal_responsive<'a>(
+        &'a self,
+        profiles: &'a [Profile],
+        adhoc_ssh_sessions: &[(SessionId, String)],
+        palette: &ThemePalette,
+        window_width: f32,
+        window_height: f32,
+    ) -> Option<Element<'a, Message, Theme, iced::Renderer>> {
         if !self.create_form.open {
             return None;
         }
         let chrome = ChromePalette::from_palette(palette);
+        let card_w = modal_width(MODAL_WIDTH, window_width);
+        let compact_form = card_w < 480.0;
+        let label_w = if compact_form { 88.0 } else { 104.0 };
+        let field_row = |label: &'static str, control: Element<'a, Message, Theme, iced::Renderer>| -> Element<'a, Message, Theme, iced::Renderer> {
+            if compact_form {
+                column![
+                    text(label).size(FONT_META).color(chrome.text_secondary),
+                    control,
+                ]
+                .spacing(4)
+                .width(Length::Fill)
+                .into()
+            } else {
+                row![
+                    text(label)
+                        .size(FONT_BODY)
+                        .width(Length::Fixed(label_w))
+                        .color(chrome.text_secondary),
+                    control,
+                ]
+                .spacing(8)
+                .width(Length::Fill)
+                .align_y(Alignment::Center)
+                .into()
+            }
+        };
         let form = &self.create_form;
         let is_local = form.direction == TunnelDirection::Local;
         let is_remote = form.direction == TunnelDirection::Remote;
         let is_dynamic = form.direction == TunnelDirection::Dynamic;
 
-        let dir_row = row![
-            text("Direction:").size(12).color(chrome.text_secondary),
-            button(text("Local (-L)").size(12))
-                .padding([5, 10])
-                .style(pill_button_style(
-                    chrome,
-                    if is_local {
-                        PillTone::ActiveAccent
-                    } else {
-                        PillTone::Subtle
-                    },
-                ))
+        let dir_track = container(
+            row![
+                button(
+                    text("Local (-L)")
+                        .size(12.0)
+                        .font(if is_local { ui_font_medium() } else { ui_font() }),
+                )
+                .padding([5, 11])
+                .style(segmented_button_style(chrome, is_local, true))
                 .on_press(Message::TunnelFormDirectionChanged(TunnelDirection::Local)),
-            button(text("Remote (-R)").size(12))
-                .padding([5, 10])
-                .style(pill_button_style(
-                    chrome,
-                    if is_remote {
-                        PillTone::ActiveAccent
-                    } else {
-                        PillTone::Subtle
-                    },
-                ))
+                button(
+                    text("Remote (-R)")
+                        .size(12.0)
+                        .font(if is_remote { ui_font_medium() } else { ui_font() }),
+                )
+                .padding([5, 11])
+                .style(segmented_button_style(chrome, is_remote, true))
                 .on_press(Message::TunnelFormDirectionChanged(TunnelDirection::Remote)),
-            button(text("Dynamic SOCKS5 (-D)").size(12))
-                .padding([5, 10])
-                .style(pill_button_style(
-                    chrome,
-                    if is_dynamic {
-                        PillTone::ActiveAccent
-                    } else {
-                        PillTone::Subtle
-                    },
-                ))
+                button(
+                    text("SOCKS5 (-D)")
+                        .size(12.0)
+                        .font(if is_dynamic { ui_font_medium() } else { ui_font() }),
+                )
+                .padding([5, 11])
+                .style(segmented_button_style(chrome, is_dynamic, true))
                 .on_press(Message::TunnelFormDirectionChanged(
                     TunnelDirection::Dynamic
                 )),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
+            ]
+            .spacing(3)
+            .wrap()
+            .vertical_spacing(4),
+        )
+        .padding(3)
+        .style(move |_| segmented_track_style(chrome));
+
+        let dir_row = field_row("Direction", dir_track.into());
 
         let ssh_profiles: Vec<&Profile> = profiles
             .iter()
@@ -405,246 +573,308 @@ impl TunnelUiState {
         for prof in ssh_profiles {
             let selected = form.profile_id.as_deref() == Some(prof.id.as_str());
             target_buttons.push(
-                button(text(&prof.name).size(11))
-                    .padding([4, 9])
-                    .style(pill_button_style(
-                        chrome,
-                        if selected {
-                            PillTone::ActiveAccent
-                        } else {
-                            PillTone::Subtle
-                        },
-                    ))
-                    .on_press(Message::TunnelFormProfileSelected(Some(prof.id.clone())))
-                    .into(),
+                button(
+                    text(&prof.name)
+                        .size(FONT_META)
+                        .font(if selected { ui_font_medium() } else { ui_font() }),
+                )
+                .padding([5, 10])
+                .style(pill_button_style(
+                    chrome,
+                    if selected {
+                        PillTone::ActiveAccent
+                    } else {
+                        PillTone::Subtle
+                    },
+                ))
+                .on_press(Message::TunnelFormProfileSelected(Some(prof.id.clone())))
+                .into(),
             );
         }
         for (sid, label) in adhoc_ssh_sessions {
             let selected = form.profile_id.is_none() && form.session_id == Some(*sid);
             target_buttons.push(
-                button(text(format!("Session: {label}")).size(11))
-                    .padding([4, 9])
-                    .style(pill_button_style(
-                        chrome,
-                        if selected {
-                            PillTone::ActiveAccent
-                        } else {
-                            PillTone::Subtle
-                        },
-                    ))
-                    .on_press(Message::TunnelFormSessionSelected(*sid))
-                    .into(),
+                button(
+                    text(format!("Session: {label}"))
+                        .size(FONT_META)
+                        .font(if selected { ui_font_medium() } else { ui_font() }),
+                )
+                .padding([5, 10])
+                .style(pill_button_style(
+                    chrome,
+                    if selected {
+                        PillTone::ActiveAccent
+                    } else {
+                        PillTone::Subtle
+                    },
+                ))
+                .on_press(Message::TunnelFormSessionSelected(*sid))
+                .into(),
             );
         }
 
+        let target_count = target_buttons.len();
         let target_picker: Element<'a, Message, Theme, iced::Renderer> =
             if target_buttons.is_empty() {
                 text("No SSH Profile or active SSH Session")
-                    .size(12)
+                    .size(FONT_BODY)
                     .color(chrome.text_muted)
                     .into()
             } else {
-                let mut rows_col = column![].spacing(4);
-                let mut current_row = row![].spacing(6).align_y(Alignment::Center);
-                let mut count_in_row = 0usize;
-                for btn in target_buttons {
-                    current_row = current_row.push(btn);
-                    count_in_row += 1;
-                    if count_in_row == 3 {
-                        rows_col = rows_col.push(current_row);
-                        current_row = row![].spacing(6).align_y(Alignment::Center);
-                        count_in_row = 0;
-                    }
-                }
-                if count_in_row > 0 {
-                    rows_col = rows_col.push(current_row);
-                }
-                if profiles.len() + adhoc_ssh_sessions.len() > 6 {
-                    scrollable(rows_col).height(Length::Fixed(76.0)).into()
+                let wrapped = row(target_buttons)
+                    .spacing(6)
+                    .align_y(Alignment::Center)
+                    .wrap()
+                    .vertical_spacing(6);
+                if target_count > 6 {
+                    scrollable(wrapped).height(Length::Fixed(82.0)).into()
                 } else {
-                    rows_col.into()
+                    wrapped.into()
                 }
             };
 
-        let profile_row = row![
-            text("SSH Target:")
-                .size(12)
-                .width(Length::Fixed(95.0))
-                .color(chrome.text_secondary),
-            target_picker,
-        ]
-        .spacing(8)
-        .align_y(Alignment::Start);
+        let profile_row = field_row("SSH Target", target_picker);
 
-        let scope_row = row![
-            text("Lifecycle:")
-                .size(12)
-                .width(Length::Fixed(95.0))
-                .color(chrome.text_secondary),
-            button(text("Session-bound").size(12))
-                .padding([5, 10])
-                .style(pill_button_style(
-                    chrome,
-                    if !form.standalone {
-                        PillTone::ActiveAccent
-                    } else {
-                        PillTone::Subtle
-                    },
-                ))
+        let scope_track = container(
+            row![
+                button(
+                    text("Session-bound")
+                        .size(12.0)
+                        .font(if !form.standalone { ui_font_medium() } else { ui_font() }),
+                )
+                .padding([5, 11])
+                .style(segmented_button_style(chrome, !form.standalone, true))
                 .on_press(Message::TunnelFormStandaloneToggled(false)),
-            button(text("Standalone (Background)").size(12))
-                .padding([5, 10])
-                .style(pill_button_style(
-                    chrome,
-                    if form.standalone {
-                        PillTone::ActiveAccent
-                    } else {
-                        PillTone::Subtle
-                    },
-                ))
+                button(
+                    text("Standalone (Background)")
+                        .size(12.0)
+                        .font(if form.standalone { ui_font_medium() } else { ui_font() }),
+                )
+                .padding([5, 11])
+                .style(segmented_button_style(chrome, form.standalone, true))
                 .on_press(Message::TunnelFormStandaloneToggled(true)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
+            ]
+            .spacing(3)
+            .wrap()
+            .vertical_spacing(4),
+        )
+        .padding(3)
+        .style(move |_| segmented_track_style(chrome));
+
+        let scope_row = field_row("Lifecycle", scope_track.into());
 
         let bind_label = if is_remote {
-            "Remote Bind:"
+            "Remote Bind"
         } else {
-            "Bind Host:"
+            "Bind Host"
         };
-        let mut fields = column![
-            row![
-                status_dot(chrome.accent),
-                text("New SSH Tunnel")
-                    .size(16)
-                    .color(chrome.text_primary),
-                space::horizontal(),
-                button(text("Close").size(11))
-                    .padding([4, 9])
-                    .style(pill_button_style(chrome, PillTone::Ghost))
-                    .on_press(Message::CloseTunnelCreateModal),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-            rule::horizontal(1),
+
+        let routing_col = column![
             dir_row,
+            hairline_h(chrome),
             profile_row,
+            hairline_h(chrome),
             scope_row,
-            row![
-                text("Name:")
-                    .size(12)
-                    .width(Length::Fixed(95.0))
-                    .color(chrome.text_secondary),
-                text_input("Optional display name", &form.name)
-                    .id(tunnel_name_input_id())
-                    .on_input(Message::TunnelFormNameChanged)
-                    .size(12)
-                    .padding([6, 8])
-                    .style(styled_input_style(chrome)),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-            row![
-                text(bind_label)
-                    .size(12)
-                    .width(Length::Fixed(95.0))
-                    .color(chrome.text_secondary),
-                text_input("127.0.0.1", &form.bind_host)
-                    .id(tunnel_bind_host_input_id())
-                    .on_input(Message::TunnelFormBindHostChanged)
-                    .size(12)
-                    .padding([6, 8])
-                    .style(styled_input_style(chrome)),
-                text("Port:").size(12).color(chrome.text_secondary),
-                text_input("5432", &form.bind_port)
-                    .id(tunnel_bind_port_input_id())
-                    .on_input(Message::TunnelFormBindPortChanged)
-                    .width(Length::Fixed(90.0))
-                    .size(12)
-                    .padding([6, 8])
-                    .style(styled_input_style(chrome)),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
         ]
-        .spacing(10);
+        .spacing(9)
+        .width(Length::Fill);
+
+        let name_ctrl = text_input("Optional display name", &form.name)
+            .id(tunnel_name_input_id())
+            .on_input(Message::TunnelFormNameChanged)
+            .size(FONT_BODY)
+            .padding([7, 10])
+            .style(styled_input_style(chrome))
+            .width(Length::Fill)
+            .into();
+
+        let bind_ctrl = row![
+            text_input("127.0.0.1", &form.bind_host)
+                .id(tunnel_bind_host_input_id())
+                .on_input(Message::TunnelFormBindHostChanged)
+                .font(mono_font())
+                .size(FONT_BODY)
+                .padding([7, 10])
+                .style(styled_input_style(chrome))
+                .width(Length::Fill),
+            text("Port").size(FONT_BODY).color(chrome.text_secondary),
+            text_input("5432", &form.bind_port)
+                .id(tunnel_bind_port_input_id())
+                .on_input(Message::TunnelFormBindPortChanged)
+                .font(mono_font())
+                .width(Length::Fixed(80.0))
+                .size(FONT_BODY)
+                .padding([7, 10])
+                .style(styled_input_style(chrome)),
+        ]
+        .spacing(8)
+        .width(Length::Fill)
+        .align_y(Alignment::Center)
+        .into();
+
+        let mut endpoint_col = column![
+            field_row("Name", name_ctrl),
+            hairline_h(chrome),
+            field_row(bind_label, bind_ctrl),
+        ]
+        .spacing(9)
+        .width(Length::Fill);
 
         if is_local || is_remote {
             let target_label = if is_remote {
-                "Local Target:"
+                "Local Target"
             } else {
-                "Target Host:"
+                "Target Host"
             };
-            fields = fields.push(
-                row![
-                    text(target_label)
-                        .size(12)
-                        .width(Length::Fixed(95.0))
-                        .color(chrome.text_secondary),
-                    text_input("127.0.0.1", &form.target_host)
-                        .id(tunnel_target_host_input_id())
-                        .on_input(Message::TunnelFormTargetHostChanged)
-                        .size(12)
-                        .padding([6, 8])
-                        .style(styled_input_style(chrome)),
-                    text("Port:").size(12).color(chrome.text_secondary),
-                    text_input("5432", &form.target_port)
-                        .id(tunnel_target_port_input_id())
-                        .on_input(Message::TunnelFormTargetPortChanged)
-                        .width(Length::Fixed(90.0))
-                        .size(12)
-                        .padding([6, 8])
-                        .style(styled_input_style(chrome)),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            );
-        }
-
-        fields = fields.push(
-            row![
-                text("Hold Grace (s):")
-                    .size(12)
-                    .width(Length::Fixed(95.0))
-                    .color(chrome.text_secondary),
-                text_input("10", &form.hold_grace_secs)
-                    .on_input(Message::TunnelFormHoldGraceChanged)
-                    .width(Length::Fixed(90.0))
-                    .size(12)
-                    .padding([6, 8])
+            let target_ctrl = row![
+                text_input("127.0.0.1", &form.target_host)
+                    .id(tunnel_target_host_input_id())
+                    .on_input(Message::TunnelFormTargetHostChanged)
+                    .font(mono_font())
+                    .size(FONT_BODY)
+                    .padding([7, 10])
+                    .style(styled_input_style(chrome))
+                    .width(Length::Fill),
+                text("Port").size(FONT_BODY).color(chrome.text_secondary),
+                text_input("5432", &form.target_port)
+                    .id(tunnel_target_port_input_id())
+                    .on_input(Message::TunnelFormTargetPortChanged)
+                    .font(mono_font())
+                    .width(Length::Fixed(80.0))
+                    .size(FONT_BODY)
+                    .padding([7, 10])
                     .style(styled_input_style(chrome)),
-                text("Held sockets wait for reconnect before resetting")
-                    .size(11)
-                    .color(chrome.text_muted),
             ]
             .spacing(8)
-            .align_y(Alignment::Center),
+            .width(Length::Fill)
+            .align_y(Alignment::Center)
+            .into();
+            endpoint_col = endpoint_col.push(hairline_h(chrome)).push(field_row(target_label, target_ctrl));
+        }
+
+        let grace_ctrl = row![
+            text_input("10", &form.hold_grace_secs)
+                .on_input(Message::TunnelFormHoldGraceChanged)
+                .font(mono_font())
+                .width(Length::Fixed(80.0))
+                .size(FONT_BODY)
+                .padding([7, 10])
+                .style(styled_input_style(chrome)),
+            text("Held sockets wait before resetting")
+                .size(FONT_META)
+                .color(chrome.text_muted),
+        ]
+        .spacing(8)
+        .width(Length::Fill)
+        .align_y(Alignment::Center)
+        .wrap()
+        .vertical_spacing(4)
+        .into();
+
+        endpoint_col = endpoint_col
+            .push(hairline_h(chrome))
+            .push(field_row("Hold Grace (s)", grace_ctrl));
+
+        let editing_id = form.editing_tunnel_id.clone();
+        let is_editing = editing_id.is_some();
+        let header = sheet_header(
+            if is_editing {
+                "Edit SSH Tunnel"
+            } else {
+                "New SSH Tunnel"
+            },
+            if is_editing {
+                "Update tunnel direction, SSH target, endpoints, or lifecycle"
+            } else {
+                "Create a local, remote, or dynamic SOCKS5 port forward"
+            },
+            Some("Esc"),
+            Message::CloseTunnelCreateModal,
+            chrome,
         );
+
+        let mut form_sections = column![
+            text("Routing & Target")
+                .size(FONT_SUBHEAD)
+                .font(ui_font_semibold())
+                .color(chrome.text_primary),
+            container(routing_col)
+                .padding(12)
+                .width(Length::Fill)
+                .style(move |_| inset_well_style(chrome)),
+            text("Endpoints & Resilience")
+                .size(FONT_SUBHEAD)
+                .font(ui_font_semibold())
+                .color(chrome.text_primary),
+            container(endpoint_col)
+                .padding(12)
+                .width(Length::Fill)
+                .style(move |_| inset_well_style(chrome)),
+        ]
+        .spacing(10)
+        .width(Length::Fill);
 
         if let Some(err) = &form.validation_error {
-            fields = fields.push(text(err.as_str()).size(12).color(chrome.danger));
+            form_sections = form_sections.push(text(err.as_str()).size(FONT_BODY).color(chrome.danger));
         }
 
-        fields = fields.push(rule::horizontal(1));
-        fields = fields.push(
-            row![
-                space::horizontal(),
-                button(text("Cancel").size(12))
-                    .padding([6, 12])
+        let mut footer = row![].spacing(8).align_y(Alignment::Center);
+        if let Some(tid) = editing_id {
+            footer = footer.push(
+                button(text("Delete").size(FONT_BODY).font(ui_font_medium()))
+                    .padding([6, 14])
+                    .style(pill_button_style(chrome, PillTone::Danger))
+                    .on_press(Message::DeleteTunnel(tid)),
+            );
+        }
+        let footer = footer
+            .push(space::horizontal())
+            .push(
+                button(text("Cancel").size(FONT_BODY))
+                    .padding([6, 14])
                     .style(pill_button_style(chrome, PillTone::Subtle))
                     .on_press(Message::CloseTunnelCreateModal),
-                button(text("Create & Start").size(12))
-                    .padding([6, 14])
-                    .style(pill_button_style(chrome, PillTone::Primary))
-                    .on_press(Message::SubmitTunnelCreate),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        );
+            )
+            .push(
+                button(
+                    text(if is_editing { "Save" } else { "Create & Start" })
+                        .size(FONT_BODY)
+                        .font(ui_font_medium()),
+                )
+                .padding([6, 16])
+                .style(pill_button_style(chrome, PillTone::Primary))
+                .on_press(Message::SubmitTunnelCreate),
+            );
 
-        let card = container(scrollable(fields.padding(16)))
-            .width(Length::Fixed(MODAL_WIDTH))
-            .style(move |_| modal_card_style(chrome, true));
+        let max_body_h = (window_height - 200.0).max(160.0).min(460.0);
+        let scrolled = container(
+            scrollable(
+                container(form_sections)
+                    .padding(Padding {
+                        top: 0.0,
+                        right: 8.0,
+                        bottom: 2.0,
+                        left: 0.0,
+                    })
+                    .width(Length::Fill),
+            )
+            .width(Length::Fill),
+        )
+        .max_height(max_body_h)
+        .width(Length::Fill);
+        let card = container(
+            column![
+                header,
+                hairline_h(chrome),
+                scrolled,
+                hairline_h(chrome),
+                footer,
+            ]
+            .spacing(12)
+            .padding(18),
+        )
+        .width(Length::Fixed(card_w))
+        .style(move |_| modal_card_style(chrome, true));
 
         Some(modal_overlay(card.into(), Some(Message::CloseTunnelCreateModal), 24.0))
     }
@@ -654,8 +884,18 @@ impl TunnelUiState {
         &'a self,
         palette: &ThemePalette,
     ) -> Option<Element<'a, Message, Theme, iced::Renderer>> {
+        self.view_public_bind_warning_responsive(palette, 1280.0)
+    }
+
+    /// Renders the `0.0.0.0` public-bind security warning modal clamped to `window_width`.
+    pub fn view_public_bind_warning_responsive<'a>(
+        &'a self,
+        palette: &ThemePalette,
+        window_width: f32,
+    ) -> Option<Element<'a, Message, Theme, iced::Renderer>> {
         let pending = self.pending_public_bind.as_ref()?;
         let chrome = ChromePalette::from_palette(palette);
+        let card_w = modal_width(MODAL_WIDTH, window_width);
 
         let card = opaque(
             container(
@@ -671,36 +911,36 @@ impl TunnelUiState {
                     text(pending.warning_text())
                         .size(13)
                         .color(chrome.text_primary),
-                    rule::horizontal(1),
+                    hairline_h(chrome),
                     row![
                         button(text("Cancel (Keep Safe)").size(12))
                             .padding([6, 12])
                             .style(pill_button_style(chrome, PillTone::Subtle))
                             .on_press(Message::TunnelPublicBindCancel),
-                        space::horizontal(),
                         button(text("Allow Public Bind & Start").size(12))
                             .padding([6, 14])
                             .style(pill_button_style(chrome, PillTone::Danger))
                             .on_press(Message::TunnelPublicBindConfirm),
                     ]
                     .spacing(8)
-                    .align_y(Alignment::Center),
+                    .wrap()
+                    .vertical_spacing(6),
                 ]
                 .spacing(12)
                 .padding(18),
             )
-            .width(Length::Fixed(MODAL_WIDTH))
+            .width(Length::Fixed(card_w))
             .style(move |_| container::Style {
                 background: Some(Background::Color(chrome.panel_bg)),
                 border: Border {
                     color: chrome.warning,
                     width: 1.5,
-                    radius: 10.0.into(),
+                    radius: 14.0.into(),
                 },
                 shadow: Shadow {
-                    color: Color::from_rgba(0.0, 0.0, 0.0, 0.55),
-                    offset: Vector::new(0.0, 8.0),
-                    blur_radius: 22.0,
+                    color: Color::from_rgba(0.0, 0.0, 0.0, if chrome.is_light { 0.18 } else { 0.48 }),
+                    offset: Vector::new(0.0, 12.0),
+                    blur_radius: 30.0,
                 },
                 text_color: Some(chrome.text_primary),
                 ..Default::default()
@@ -766,6 +1006,24 @@ pub fn build_active_tunnel_entries(
         } else {
             map_tunnel_state(&snap.state)
         };
+        let reconnect_attempt = snap.reconnect_attempt.or_else(|| match &state {
+            TunnelRuntimeState::Retrying { attempt, .. } => Some(*attempt),
+            _ => None,
+        });
+        let next_retry_secs = snap.next_retry_secs.or_else(|| match &state {
+            TunnelRuntimeState::Retrying {
+                next_retry_secs, ..
+            } => Some(*next_retry_secs),
+            _ => None,
+        });
+        let reconnected_notice = if state == TunnelRuntimeState::Active
+            && (tunnel_ui.is_reconnected(&snap.id)
+                || (snap.reconnected && !tunnel_ui.was_acknowledged(&snap.id)))
+        {
+            Some("Reconnected successfully".to_string())
+        } else {
+            None
+        };
         entries.push(ActiveTunnelEntry {
             id: snap.id.clone(),
             name: snap.name.clone(),
@@ -775,6 +1033,10 @@ pub fn build_active_tunnel_entries(
             state,
             standalone: snap.standalone,
             session_id: snap.session_id.map(SessionId),
+            reconnect_attempt,
+            next_retry_secs,
+            last_error: snap.last_error.clone(),
+            reconnected_notice,
         });
     }
 
@@ -813,6 +1075,10 @@ pub fn build_active_tunnel_entries(
                 } else {
                     matching_session
                 },
+                reconnect_attempt: None,
+                next_retry_secs: None,
+                last_error: None,
+                reconnected_notice: None,
             });
         }
     }
@@ -849,6 +1115,10 @@ pub fn build_active_tunnel_entries(
             } else {
                 ad_hoc.session_id
             },
+            reconnect_attempt: None,
+            next_retry_secs: None,
+            last_error: None,
+            reconnected_notice: None,
         });
     }
 

@@ -274,6 +274,7 @@ fn build_connect_config(addr: SocketAddr, known_hosts_path: &Path) -> SshConnect
         cols: 80,
         rows: 24,
         scrollback_lines: 1000,
+        ..SshConnectConfig::default()
     }
 }
 
@@ -1035,4 +1036,96 @@ async fn standalone_tunnel_runs_without_pty_shell_recovers_after_drop_and_tracks
     assert_eq!(final_snap.active_standalone_count, 0);
     assert_eq!(final_snap.tunnels[0].state, TunnelState::Stopped);
     assert!(TcpStream::connect(bound_addr).await.is_err());
+
+    assert!(manager.remove_tunnel(&rule.id));
+    assert!(!manager.remove_tunnel(&rule.id));
+    assert!(manager.snapshot().tunnels.is_empty());
+}
+
+
+#[tokio::test]
+async fn tunnel_snapshot_tracks_reconnect_attempt_and_sets_reconnected_flag_on_recovery() {
+    let temp = TempDir::new().unwrap();
+    let known_hosts = temp.path().join("known_hosts");
+    let echo = spawn_echo_server("127.0.0.1:0").await;
+    let ssh_srv = spawn_ssh_server().await;
+
+    // Controllable proxy so we can force an active session tunnel drop and clean recovery.
+    let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_addr = proxy_listener.local_addr().unwrap();
+    let allow_connect = Arc::new(AtomicBool::new(true));
+    let (drop_tx, _) = tokio::sync::broadcast::channel::<()>(8);
+    let allow_clone = Arc::clone(&allow_connect);
+    let drop_tx_clone = drop_tx.clone();
+    let target_addr = ssh_srv.addr;
+    tokio::spawn(async move {
+        while let Ok((mut inbound, _)) = proxy_listener.accept().await {
+            if !allow_clone.load(Ordering::SeqCst) {
+                drop(inbound);
+                continue;
+            }
+            let mut drop_rx = drop_tx_clone.subscribe();
+            tokio::spawn(async move {
+                let Ok(mut outbound) = TcpStream::connect(target_addr).await else {
+                    return;
+                };
+                tokio::select! {
+                    _ = drop_rx.recv() => {},
+                    _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound) => {},
+                }
+            });
+        }
+    });
+
+    let sup = start_supervised_session(proxy_addr, &ssh_srv.host_pubkey, &known_hosts).await;
+    let manager = TunnelManager::new();
+    let mut sub = manager.subscribe();
+    let rule = TunnelRule::local("Recover Local", 0, "127.0.0.1", echo.addr.port());
+    let _bound = manager
+        .start_session_tunnel(1, None, rule.clone(), sup.subscribe_ready())
+        .await
+        .expect("start tunnel");
+
+    let initial = manager.snapshot();
+    assert_eq!(initial.tunnels[0].state, TunnelState::Active);
+    assert!(!initial.tunnels[0].reconnected);
+
+    // Drop proxy while holding new dials closed -> tunnel enters Reconnecting with attempt/error.
+    allow_connect.store(false, Ordering::SeqCst);
+    let _ = drop_tx.send(());
+
+    tokio::time::timeout(Duration::from_secs(3), async {
+        sub.wait_for(|snap| {
+            snap.tunnels.iter().any(|t| {
+                t.id == rule.id
+                    && matches!(
+                        t.state,
+                        TunnelState::Reconnecting | TunnelState::Retrying { .. }
+                    )
+            })
+        })
+        .await
+        .unwrap();
+    })
+    .await
+    .expect("tunnel enters Reconnecting state after connection drop");
+
+    // Re-open proxy and let supervisor recover -> tunnel returns Active with reconnected = true.
+    allow_connect.store(true, Ordering::SeqCst);
+    sup.reconnect_now();
+
+    tokio::time::timeout(Duration::from_secs(5), async {
+        sub.wait_for(|snap| {
+            snap.tunnels
+                .iter()
+                .any(|t| t.id == rule.id && t.state == TunnelState::Active && t.reconnected)
+        })
+        .await
+        .unwrap();
+    })
+    .await
+    .expect("tunnel surfaces reconnected = true once recovered");
+
+    assert!(manager.stop_tunnel(&rule.id));
+    sup.disconnect();
 }

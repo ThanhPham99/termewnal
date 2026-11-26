@@ -39,4 +39,7 @@ pub enum CoreError {
         found: u32,
         expected: u32,
     },
+    /// Configuration sync, bundle encryption, or remote provider failure.
+    #[error("config sync error: {0}")]
+    Sync(String),
 }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use iced::widget::{Id, button, column, container, row, rule, scrollable, space, text, text_input};
+use iced::widget::{Id, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Element, Length, Theme};
 use termewnal_core::{
     TabbyCredentialKind, TabbyImportOutcome, TabbyVaultStatus, ThemePalette,
@@ -10,8 +10,8 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::Message;
 use crate::ui_theme::{
-    ChromePalette, PillTone, card_container_style, modal_card_style, modal_overlay,
-    pill_button_style, styled_input_style,
+    ChromePalette, PillTone, hairline_h, inset_well_style, modal_body_height, modal_card_style,
+    modal_overlay, modal_width, pill_button_style, sheet_header, styled_input_style,
 };
 
 const MODAL_WIDTH: f32 = 580.0;
@@ -219,19 +219,28 @@ impl TabbyImportUiState {
         palette: &ThemePalette,
         vault_requires_unlock: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
-        let chrome = ChromePalette::from_palette(palette);
+        self.view_responsive(palette, vault_requires_unlock, 1280.0, 800.0)
+    }
 
-        let header = row![
-            text("Import Tabby config.yaml")
-                .size(16)
-                .color(chrome.text_primary),
-            space::horizontal(),
-            button(text("Close").size(12))
-                .padding([4, 10])
-                .style(pill_button_style(chrome, PillTone::Ghost))
-                .on_press(Message::CloseTabbyImportModal),
-        ]
-        .align_y(Alignment::Center);
+    /// Renders the Tabby importer modal clamped responsively to `window_width` x `window_height`.
+    pub fn view_responsive(
+        &self,
+        palette: &ThemePalette,
+        vault_requires_unlock: bool,
+        window_width: f32,
+        window_height: f32,
+    ) -> Element<'_, Message, Theme, iced::Renderer> {
+        let chrome = ChromePalette::from_palette(palette);
+        let card_w = modal_width(MODAL_WIDTH, window_width);
+        let list_h = modal_body_height(190.0, window_height, 260.0);
+
+        let header = sheet_header(
+            "Import Tabby config.yaml",
+            "Migrates SSH & Local Profiles, groups/tags, and Tunnel rules into profiles.toml",
+            Some("Esc"),
+            Message::CloseTabbyImportModal,
+            chrome,
+        );
 
         let path_row = row![
             text_input("/path/to/tabby/config.yaml", &self.path_input)
@@ -250,26 +259,19 @@ impl TabbyImportUiState {
         .spacing(8)
         .align_y(Alignment::Center);
 
-        let mut body = column![
-            header,
-            text("Migrates SSH & Local Profiles, groups/tags, and Tunnel rules into profiles.toml (ignores plugin settings).")
-                .size(12)
-                .color(chrome.text_muted),
-            path_row,
-        ]
-        .spacing(10);
+        let mut body = column![header, hairline_h(chrome), path_row].spacing(10);
 
         if let Some(err) = &self.import_error {
             body = body.push(text(err.as_str()).size(12).color(chrome.danger));
         }
 
         if let Some(summary) = &self.summary {
-            body = body.push(self.view_summary(summary, chrome, vault_requires_unlock));
+            body = body.push(self.view_summary(summary, chrome, vault_requires_unlock, list_h));
         }
 
         let card = container(body)
-            .width(Length::Fixed(MODAL_WIDTH))
-            .padding(16)
+            .width(Length::Fixed(card_w))
+            .padding(18)
             .style(move |_theme: &Theme| modal_card_style(chrome, true));
 
         modal_overlay(card.into(), Some(Message::CloseTabbyImportModal), 24.0)
@@ -280,9 +282,10 @@ impl TabbyImportUiState {
         summary: &'a TabbyImportSummary,
         chrome: ChromePalette,
         vault_requires_unlock: bool,
+        list_height: f32,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
         let mut section = column![
-            rule::horizontal(1),
+            hairline_h(chrome),
             text(format!(
                 "Imported {} profile(s), {} tunnel(s) (skipped {} duplicate(s), {} unsupported).",
                 summary.added_count,
@@ -305,7 +308,7 @@ impl TabbyImportUiState {
                         border: Border {
                             color: chrome.warning,
                             width: 1.0,
-                            radius: 6.0.into(),
+                            radius: 8.0.into(),
                         },
                         ..Default::default()
                     }),
@@ -321,14 +324,22 @@ impl TabbyImportUiState {
         }
 
         if !self.credential_rows.is_empty() {
-            let mut rows_col = column![].spacing(8);
-            for row_item in &self.credential_rows {
+            let mut rows_col = column![].spacing(4);
+            let total = self.credential_rows.len();
+            for (idx, row_item) in self.credential_rows.iter().enumerate() {
                 rows_col = rows_col.push(view_credential_row(row_item, chrome));
+                if idx + 1 < total {
+                    rows_col = rows_col.push(hairline_h(chrome));
+                }
             }
             section = section.push(
-                scrollable(rows_col)
-                    .width(Length::Fill)
-                    .height(Length::Fixed(190.0)),
+                container(
+                    scrollable(rows_col)
+                        .width(Length::Fill)
+                        .height(Length::Fixed(list_height)),
+                )
+                .padding(6)
+                .style(move |_| inset_well_style(chrome)),
             );
         }
 
@@ -372,7 +383,9 @@ fn view_credential_row<'a>(
         action_elem,
     ]
     .spacing(6)
-    .align_y(Alignment::Center);
+    .align_y(Alignment::Center)
+    .wrap()
+    .vertical_spacing(6);
 
     let mut entry_col = column![
         text(format!(
@@ -392,6 +405,6 @@ fn view_credential_row<'a>(
     container(entry_col)
         .padding([8, 10])
         .width(Length::Fill)
-        .style(move |_| card_container_style(chrome, false))
+        .style(move |_| inset_well_style(chrome))
         .into()
 }

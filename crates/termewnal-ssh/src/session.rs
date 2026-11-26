@@ -4,14 +4,16 @@ use std::time::Duration;
 
 use russh::ChannelMsg;
 use russh::client::Msg as ClientMsg;
-use termewnal_core::vault::SecretStore;
-use termewnal_pty::{PtyEvent, TerminalBuffer, TerminalSnapshot};
+use termewnal_core::{LoginScriptStep, vault::SecretStore};
+use termewnal_pty::{LoginScriptRunner, PtyEvent, TerminalBuffer, TerminalSnapshot};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::TransportStatus;
 use crate::auth::{AgentConnector, SshInteractionHandler};
-use crate::client::{SshConnectConfig, SshTransport, await_channel_reply};
+use crate::client::{
+    SshConnectConfig, SshTransport, await_channel_reply, request_channel_forwarding,
+};
 use crate::error::SshError;
 use crate::supervisor::ConnectionSupervisor;
 
@@ -57,7 +59,7 @@ impl SshSession {
     ) -> Result<Self, SshError> {
         let transport =
             SshTransport::connect(&config, vault, interaction, agent_connector).await?;
-        Self::open_on_transport(transport, config).await
+        Self::open_on_transport_with_vault(transport, config, vault).await
     }
 
     /// Opens an interactive PTY shell channel on an already authenticated [`SshTransport`].
@@ -65,17 +67,30 @@ impl SshSession {
         transport: SshTransport,
         config: SshConnectConfig,
     ) -> Result<Self, SshError> {
+        Self::open_on_transport_with_vault(transport, config, None).await
+    }
+
+    /// Opens an interactive PTY shell channel on an already authenticated [`SshTransport`] with
+    /// optional `Vault` access for `LoginScriptStep::secret_ref` resolution.
+    pub async fn open_on_transport_with_vault(
+        transport: SshTransport,
+        config: SshConnectConfig,
+        vault: Option<&dyn SecretStore>,
+    ) -> Result<Self, SshError> {
         let buffer = Arc::new(TerminalBuffer::new(
             config.cols,
             config.rows,
             config.scrollback_lines,
         ));
-        Self::open_on_buffer(
+        Self::open_on_buffer_with_options(
             transport,
             buffer,
             config.cols,
             config.rows,
             &config.term_name,
+            config.forward_agent,
+            &config.login_scripts,
+            vault,
         )
         .await
     }
@@ -89,6 +104,22 @@ impl SshSession {
         rows: u16,
         term_name: &str,
     ) -> Result<Self, SshError> {
+        Self::open_on_buffer_with_options(transport, buffer, cols, rows, term_name, false, &[], None)
+            .await
+    }
+
+    /// Attaches a fresh PTY shell channel with explicit forwarding and login script automation.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn open_on_buffer_with_options(
+        transport: SshTransport,
+        buffer: Arc<TerminalBuffer>,
+        cols: u16,
+        rows: u16,
+        term_name: &str,
+        forward_agent: bool,
+        login_scripts: &[LoginScriptStep],
+        vault: Option<&dyn SecretStore>,
+    ) -> Result<Self, SshError> {
         let cols = cols.max(1);
         let rows = rows.max(1);
         buffer.resize(cols, rows);
@@ -97,18 +128,44 @@ impl SshSession {
         let channel = transport.open_session_channel().await?;
         let (mut rx, tx) = channel.split();
 
+        let mut initial_bytes = Vec::new();
         tx.request_pty(true, term_name, u32::from(cols), u32::from(rows), 0, 0, &[])
             .await
             .map_err(|err| SshError::Channel(err.to_string()))?;
-        await_channel_reply(&mut rx, "PTY request", |data| buffer.feed_bytes(data)).await?;
+        await_channel_reply(&mut rx, "PTY request", |data| {
+            initial_bytes.extend_from_slice(data);
+            buffer.feed_bytes(data);
+        })
+        .await?;
+
+        let x11_auth = transport.x11_auth().cloned();
+        request_channel_forwarding(
+            &tx,
+            &mut rx,
+            forward_agent,
+            x11_auth.as_ref(),
+            &mut |data| {
+                initial_bytes.extend_from_slice(data);
+                buffer.feed_bytes(data);
+            },
+        )
+        .await;
 
         tx.request_shell(true)
             .await
             .map_err(|err| SshError::Channel(err.to_string()))?;
-        await_channel_reply(&mut rx, "shell request", |data| buffer.feed_bytes(data)).await?;
+        await_channel_reply(&mut rx, "shell request", |data| {
+            initial_bytes.extend_from_slice(data);
+            buffer.feed_bytes(data);
+        })
+        .await?;
 
         let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
         buffer.set_write_sink(Some(Box::new(ChannelWriteSink { tx: cmd_tx.clone() })));
+
+        let mut login_runner = LoginScriptRunner::compile(login_scripts, vault);
+        let initial_dispatches = login_runner.advance(&initial_bytes);
+        schedule_login_dispatches(&cmd_tx, initial_dispatches);
 
         let status = Arc::new(Mutex::new(TransportStatus::Connected { latency_ms: None }));
         let used_interactive_auth = transport.used_interactive_auth();
@@ -117,9 +174,11 @@ impl SshSession {
             Arc::clone(&transport),
             rx,
             tx,
+            cmd_tx.clone(),
             cmd_rx,
             Arc::clone(&buffer),
             Arc::clone(&status),
+            login_runner,
         );
 
         Ok(Self {
@@ -251,13 +310,35 @@ impl Drop for SshSession {
     }
 }
 
+fn schedule_login_dispatches(
+    cmd_tx: &mpsc::UnboundedSender<SessionCmd>,
+    dispatches: Vec<termewnal_pty::LoginScriptDispatch>,
+) {
+    for step in dispatches {
+        if step.delay.is_zero() {
+            let _ = cmd_tx.send(SessionCmd::WriteBytes(step.bytes.to_vec()));
+        } else {
+            let tx = cmd_tx.clone();
+            let bytes = step.bytes.to_vec();
+            let delay = step.delay;
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                let _ = tx.send(SessionCmd::WriteBytes(bytes));
+            });
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_channel_pump(
     transport: Arc<SshTransport>,
     mut rx: russh::ChannelReadHalf,
     tx: russh::ChannelWriteHalf<ClientMsg>,
+    cmd_tx: mpsc::UnboundedSender<SessionCmd>,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCmd>,
     buffer: Arc<TerminalBuffer>,
     status: Arc<Mutex<TransportStatus>>,
+    mut login_runner: LoginScriptRunner,
 ) {
     tokio::spawn(async move {
         let mut exit_code: Option<i32> = None;
@@ -269,9 +350,15 @@ fn spawn_channel_pump(
                     match msg {
                         Some(ChannelMsg::Data { data }) => {
                             buffer.feed_bytes(&data);
+                            if !login_runner.is_finished() {
+                                schedule_login_dispatches(&cmd_tx, login_runner.advance(&data));
+                            }
                         }
                         Some(ChannelMsg::ExtendedData { data, .. }) => {
                             buffer.feed_bytes(&data);
+                            if !login_runner.is_finished() {
+                                schedule_login_dispatches(&cmd_tx, login_runner.advance(&data));
+                            }
                         }
                         Some(ChannelMsg::ExitStatus { exit_status }) => {
                             exit_code = Some(exit_status as i32);

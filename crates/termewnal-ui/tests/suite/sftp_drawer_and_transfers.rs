@@ -705,6 +705,7 @@ async fn live_app_state_browses_remote_sftp_uploads_downloads_and_surfaces_mux_f
             cols: 80,
             rows: 24,
             scrollback_lines: 10_000,
+            ..SshConnectConfig::default()
         },
     )
     .with_agent_connector(Arc::new(OsAgentConnector::default()));
@@ -852,5 +853,608 @@ async fn live_app_state_browses_remote_sftp_uploads_downloads_and_surfaces_mux_f
     assert_eq!(state.sftp_drawer().current_path(), "/");
     let _ = state.update(Message::ClearFinishedTransfers);
     assert!(state.sftp_drawer().transfers().is_empty());
+}
+
+#[test]
+fn sftp_drawer_state_and_transfers_are_isolated_per_ssh_session() {
+    let (temp, mut state) = boot_test_state();
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+    let local_sid = state.active_session_id().expect("initial local session");
+
+    let file_a = temp.path().join("alpha.txt");
+    let file_b = temp.path().join("beta.txt");
+    fs::write(&file_a, b"payload-alpha").unwrap();
+    fs::write(&file_b, b"payload-beta").unwrap();
+
+    // Open two SSH sessions (even sharing the same host tuple) alongside the local session.
+    let profile_a = Profile::ssh("Prod A", "10.0.0.10", 22, "ops", SshAuthMethod::Agent);
+    let profile_b = Profile::ssh("Prod B", "10.0.0.10", 22, "ops", SshAuthMethod::Agent);
+    let _ = state.update(Message::OpenSshProfile(profile_a));
+    let ssh_a = state.active_session_id().expect("ssh_a session");
+    let _ = state.update(Message::OpenSshProfile(profile_b));
+    let ssh_b = state.active_session_id().expect("ssh_b session");
+    assert_ne!(ssh_a, ssh_b);
+
+    // Focus ssh_a: open SFTP drawer, set path/drafts, apply listing, enqueue upload.
+    let _ = state.update(Message::FocusSession(ssh_a));
+    assert!(!state.sftp_drawer().is_open());
+    let _ = state.update(Message::ToggleSftpDrawer);
+    assert!(state.sftp_drawer().is_open());
+    assert!(state.status_bar_snapshot().transfer_drawer_open);
+    assert_eq!(
+        state.sftp_drawer().session_label(),
+        Some("Prod A (ops@10.0.0.10:22)")
+    );
+    let _ = state.update(Message::SftpNavigateTo("/var/www".to_string()));
+    let _ = state.update(Message::SftpNewFolderInputChanged("assets".to_string()));
+    let _ = state.update(Message::SftpBrowseResult {
+        session_id: ssh_a,
+        generation: 0,
+        result: Ok(termewnal_ssh::RemoteListing {
+            resolved_path: "/var/www".to_string(),
+            entries: vec![termewnal_ssh::RemoteDirEntry {
+                name: "index.html".to_string(),
+                path: "/var/www/index.html".to_string(),
+                kind: RemoteEntryKind::File,
+                size: 512,
+                permissions: Some(0o644),
+                modified_epoch_secs: None,
+                uid: None,
+                gid: None,
+            }],
+            transport_mode: SftpTransportMode::IsolatedTransferTransport,
+            notice: None,
+        }),
+    });
+    let _ = state.update(Message::SftpDrawerFileDropped {
+        path: file_a.clone(),
+    });
+    assert_eq!(state.sftp_drawer().current_path(), "/var/www");
+    assert_eq!(state.sftp_drawer().new_folder_name(), "assets");
+    assert_eq!(state.sftp_drawer().entries().len(), 1);
+    assert_eq!(state.sftp_drawer().transfers().len(), 1);
+    assert_eq!(
+        state.sftp_drawer().transfers()[0].remote_path,
+        "/var/www/alpha.txt"
+    );
+    drop(state.view(win));
+
+    // Switch to ssh_b: drawer starts closed, at ".", empty entries, zero transfers from ssh_a.
+    let _ = state.update(Message::FocusSession(ssh_b));
+    assert!(!state.sftp_drawer().is_open());
+    assert!(!state.status_bar_snapshot().transfer_drawer_open);
+    assert_eq!(state.sftp_drawer().current_path(), ".");
+    assert_eq!(state.sftp_drawer().new_folder_name(), "");
+    assert!(state.sftp_drawer().entries().is_empty());
+    assert!(state.sftp_drawer().transfers().is_empty());
+    assert_eq!(
+        state.sftp_drawer().session_label(),
+        Some("Prod B (ops@10.0.0.10:22)")
+    );
+    drop(state.view(win));
+
+    // Open ssh_b's SFTP drawer and navigate/upload independently.
+    let _ = state.update(Message::ToggleSftpDrawerForSession(ssh_b));
+    assert!(state.sftp_drawer().is_open());
+    let _ = state.update(Message::SftpNavigateTo("/etc/nginx".to_string()));
+    let _ = state.update(Message::SftpBrowseResult {
+        session_id: ssh_b,
+        generation: 0,
+        result: Ok(termewnal_ssh::RemoteListing {
+            resolved_path: "/etc/nginx".to_string(),
+            entries: vec![termewnal_ssh::RemoteDirEntry {
+                name: "nginx.conf".to_string(),
+                path: "/etc/nginx/nginx.conf".to_string(),
+                kind: RemoteEntryKind::File,
+                size: 1024,
+                permissions: Some(0o644),
+                modified_epoch_secs: None,
+                uid: None,
+                gid: None,
+            }],
+            transport_mode: SftpTransportMode::IsolatedTransferTransport,
+            notice: None,
+        }),
+    });
+    let _ = state.update(Message::SftpDrawerFileDropped {
+        path: file_b.clone(),
+    });
+    assert_eq!(state.sftp_drawer().entries()[0].name, "nginx.conf");
+    assert_eq!(state.sftp_drawer().transfers().len(), 1);
+    assert_eq!(
+        state.sftp_drawer().transfers()[0].remote_path,
+        "/etc/nginx/beta.txt"
+    );
+
+    // Background browse result arriving for ssh_a updates ssh_a only without touching ssh_b.
+    let _ = state.update(Message::SftpBrowseResult {
+        session_id: ssh_a,
+        generation: 0,
+        result: Ok(termewnal_ssh::RemoteListing {
+            resolved_path: "/srv/releases".to_string(),
+            entries: vec![termewnal_ssh::RemoteDirEntry {
+                name: "release.tar.gz".to_string(),
+                path: "/srv/releases/release.tar.gz".to_string(),
+                kind: RemoteEntryKind::File,
+                size: 2048,
+                permissions: Some(0o644),
+                modified_epoch_secs: None,
+                uid: None,
+                gid: None,
+            }],
+            transport_mode: SftpTransportMode::IsolatedTransferTransport,
+            notice: None,
+        }),
+    });
+    assert_eq!(state.sftp_drawer().current_path(), "/etc/nginx");
+    assert_eq!(state.sftp_drawer().entries()[0].name, "nginx.conf");
+    assert_eq!(
+        state.sftp_drawer_for_session(ssh_a).unwrap().current_path(),
+        "/srv/releases"
+    );
+    assert_eq!(
+        state.sftp_drawer_for_session(ssh_a).unwrap().entries()[0].name,
+        "release.tar.gz"
+    );
+
+    // Switch to Local tab: no SSH SFTP drawer leaks into the Local workspace.
+    let _ = state.update(Message::FocusSession(local_sid));
+    assert!(!state.sftp_drawer().is_open());
+    assert!(!state.status_bar_snapshot().transfer_drawer_open);
+    drop(state.view(win));
+
+    // ToggleSftpDrawerForSession(ssh_a) from Local tab focuses ssh_a and toggles ssh_a's open drawer.
+    let _ = state.update(Message::ToggleSftpDrawerForSession(ssh_a));
+    assert_eq!(state.active_session_id(), Some(ssh_a));
+    assert!(!state.sftp_drawer().is_open());
+    let _ = state.update(Message::ToggleSftpDrawerForSession(ssh_a));
+    assert!(state.sftp_drawer().is_open());
+    assert_eq!(state.sftp_drawer().current_path(), "/srv/releases");
+    assert_eq!(state.sftp_drawer().entries()[0].name, "release.tar.gz");
+    assert_eq!(state.sftp_drawer().transfers().len(), 1);
+    let transfer_a_id = state.sftp_drawer().transfers()[0].id;
+
+    // Cancel and clear finished transfers on ssh_a leaves ssh_b's queue untouched.
+    let _ = state.update(Message::CancelTransfer(transfer_a_id));
+    let _ = state.update(Message::ClearFinishedTransfers);
+    assert!(state.sftp_drawer().transfers().is_empty());
+    let _ = state.update(Message::FocusSession(ssh_b));
+    assert_eq!(state.sftp_drawer().transfers().len(), 1);
+    assert_eq!(
+        state.sftp_drawer().transfers()[0].remote_path,
+        "/etc/nginx/beta.txt"
+    );
+
+    // Closing ssh_a removes only ssh_a's SFTP drawer state while preserving ssh_b.
+    let _ = state.update(Message::FocusSession(ssh_a));
+    let _ = state.update(Message::CloseFocusedPane);
+    assert!(state.sftp_drawer_for_session(ssh_a).is_none());
+    assert!(state.sftp_drawer_for_session(ssh_b).is_some());
+    assert!(state.sftp_drawer_for_session(ssh_b).unwrap().is_open());
+}
+
+#[test]
+fn remember_last_sftp_working_folder_per_profile_across_sessions_and_restarts() {
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut cfg = AppConfig::default();
+    #[cfg(unix)]
+    if Path::new("/bin/sh").exists() {
+        cfg.terminal.shell = Some("/bin/sh".to_string());
+    }
+    save_config(&paths, &cfg).expect("write deterministic test shell config");
+
+    // Save two SSH profiles targeting the same server so identity isolation depends on profile_id.
+    let prof_web = Profile::ssh("Prod Web", "10.0.0.10", 22, "ops", SshAuthMethod::Agent);
+    let prof_api = Profile::ssh("Prod API", "10.0.0.10", 22, "ops", SshAuthMethod::Agent);
+    let web_id = prof_web.id.clone();
+    let api_id = prof_api.id.clone();
+    let mut profiles = termewnal_core::ProfilesConfig::default();
+    profiles.profiles.push(prof_web.clone());
+    profiles.profiles.push(prof_api.clone());
+    termewnal_core::save_profiles(&paths, &profiles).expect("save profiles");
+
+    {
+        let mut state = AppState::boot_with_paths(paths.clone()).expect("boot AppState v1");
+        let win = window::Id::unique();
+        let _ = state.update(Message::WindowOpened(win));
+
+        // Open Prod Web -> defaults to ".", then live browse to "/var/www/html".
+        let _ = state.update(Message::LaunchProfile {
+            profile_id: web_id.clone(),
+            disposition: termewnal_ui::LaunchDisposition::NewTab,
+        });
+        let web_sid = state.active_session_id().expect("web session");
+        assert_eq!(state.sftp_drawer().current_path(), ".");
+        let _ = state.update(Message::SftpBrowseResult {
+            session_id: web_sid,
+            generation: 0,
+            result: Ok(termewnal_ssh::RemoteListing {
+                resolved_path: "/var/www/html".to_string(),
+                entries: Vec::new(),
+                transport_mode: SftpTransportMode::IsolatedTransferTransport,
+                notice: None,
+            }),
+        });
+        assert_eq!(
+            state.remembered_profile_sftp_dir(&web_id),
+            Some("/var/www/html")
+        );
+
+        // Failed browse error must NOT overwrite the valid remembered directory.
+        let _ = state.update(Message::SftpBrowseResult {
+            session_id: web_sid,
+            generation: 0,
+            result: Err("permission denied".to_string()),
+        });
+        assert_eq!(
+            state.remembered_profile_sftp_dir(&web_id),
+            Some("/var/www/html")
+        );
+
+        // Navigating to another directory updates remembered folder for Prod Web.
+        let _ = state.update(Message::SftpNavigateTo("/var/www/releases".to_string()));
+        assert_eq!(
+            state.remembered_profile_sftp_dir(&web_id),
+            Some("/var/www/releases")
+        );
+
+        // Open Prod API on same host -> starts cleanly at "." and remembers its own folder.
+        let _ = state.update(Message::LaunchProfile {
+            profile_id: api_id.clone(),
+            disposition: termewnal_ui::LaunchDisposition::NewTab,
+        });
+        let _api_sid = state.active_session_id().expect("api session");
+        assert_eq!(state.sftp_drawer().current_path(), ".");
+        let _ = state.update(Message::SftpNavigateTo("/opt/api".to_string()));
+        assert_eq!(state.remembered_profile_sftp_dir(&api_id), Some("/opt/api"));
+        assert_eq!(
+            state.remembered_profile_sftp_dir(&web_id),
+            Some("/var/www/releases")
+        );
+
+        // Persist workspace layout before simulating full app shutdown.
+        state.save_workspace_layout().expect("save workspace layout");
+        assert!(paths.sftp_state_file().is_file());
+    }
+
+    // Reboot AppState from disk: restored tabs AND freshly launched tabs both remember SFTP dirs!
+    let mut rebooted = AppState::boot_with_paths(paths.clone()).expect("reboot AppState");
+    let win2 = window::Id::unique();
+    let _ = rebooted.update(Message::WindowOpened(win2));
+
+    assert_eq!(
+        rebooted.remembered_profile_sftp_dir(&web_id),
+        Some("/var/www/releases")
+    );
+    assert_eq!(
+        rebooted.remembered_profile_sftp_dir(&api_id),
+        Some("/opt/api")
+    );
+    // Active restored tab was Prod API -> SFTP drawer restores "/opt/api".
+    assert_eq!(rebooted.sftp_drawer().current_path(), "/opt/api");
+    assert_eq!(rebooted.sftp_drawer().path_input(), "/opt/api");
+
+    // Launching Prod Web again initializes its new SSH session's SFTP drawer at "/var/www/releases".
+    let _ = rebooted.update(Message::LaunchProfile {
+        profile_id: web_id.clone(),
+        disposition: termewnal_ui::LaunchDisposition::NewTab,
+    });
+    assert_eq!(rebooted.sftp_drawer().current_path(), "/var/www/releases");
+    assert_eq!(rebooted.sftp_drawer().path_input(), "/var/www/releases");
+
+    // Deleting Prod Web removes its remembered SFTP entry on disk without affecting Prod API.
+    let _ = rebooted.update(Message::DeleteSavedProfileById(web_id.clone()));
+    assert_eq!(rebooted.remembered_profile_sftp_dir(&web_id), None);
+    assert_eq!(
+        rebooted.remembered_profile_sftp_dir(&api_id),
+        Some("/opt/api")
+    );
+    let persisted = termewnal_core::load_sftp_state(&paths).expect("load persisted sftp_state");
+    assert_eq!(persisted.last_dir(&web_id), None);
+    assert_eq!(persisted.last_dir(&api_id), Some("/opt/api"));
+}
+
+#[test]
+fn sftp_plus_dual_pane_navigation_sorting_filtering_hidden_bookmarks_and_local_ops() {
+    use iced::widget::text_editor;
+    use iced::{Point, window};
+    use termewnal_ui::sftp_plus::{format_octal_mode, pane_prefs, visible_pane_entries};
+    use termewnal_ui::{SftpContextActionKind, SftpLayoutMode, SftpModalState, SftpPaneSide, SftpSortColumn};
+
+    let (temp, mut state) = boot_test_state();
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    let root = temp.path().to_path_buf();
+    let sub = root.join("sub_folder");
+    fs::create_dir_all(&sub).expect("create sub_folder");
+    fs::write(root.join("alpha.txt"), b"hello alpha").expect("write alpha");
+    fs::write(root.join("zeta.log"), vec![b'z'; 2048]).expect("write zeta");
+    fs::write(root.join(".hidden_rc"), b"secret=1").expect("write hidden file");
+    fs::write(sub.join("inside.txt"), b"inside").expect("write inside");
+
+    // Local FS scanning stays lazy until SFTP is actually opened.
+    assert!(!state.sftp_drawer().plus.local.initialized);
+
+    let _ = state.update(Message::ToggleSftpDrawer);
+    assert!(state.sftp_drawer().is_open());
+    assert_eq!(
+        state.sftp_drawer().plus.layout_mode,
+        SftpLayoutMode::DualHorizontal
+    );
+    assert!(state.sftp_drawer().plus.local.initialized);
+    assert_eq!(
+        state.sftp_drawer().plus.local.current_path,
+        fs::canonicalize(&root).unwrap().to_string_lossy().as_ref()
+    );
+
+    // Hidden files toggle hides and reveals dot-prefixed entries.
+    let visible_with_hidden = visible_pane_entries(state.sftp_drawer(), SftpPaneSide::Local);
+    assert!(visible_with_hidden.iter().any(|e| e.name == ".hidden_rc"));
+    let _ = state.update(Message::SftpPaneToggleHidden(SftpPaneSide::Local));
+    let visible_no_hidden = visible_pane_entries(state.sftp_drawer(), SftpPaneSide::Local);
+    assert!(!visible_no_hidden.iter().any(|e| e.name == ".hidden_rc"));
+    let _ = state.update(Message::SftpPaneToggleHidden(SftpPaneSide::Local));
+
+    // Inline filter filters by case-insensitive substring and clears when closed.
+    let _ = state.update(Message::SftpPaneToggleFilter(SftpPaneSide::Local));
+    let _ = state.update(Message::SftpPaneFilterChanged(
+        SftpPaneSide::Local,
+        "ALPHA".to_string(),
+    ));
+    let filtered = visible_pane_entries(state.sftp_drawer(), SftpPaneSide::Local);
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(filtered[0].name, "alpha.txt");
+    let _ = state.update(Message::SftpPaneToggleFilter(SftpPaneSide::Local));
+
+    // Sorting keeps directories first, and sorts files by Size asc/desc cleanly.
+    let _ = state.update(Message::SftpPaneSortBy(
+        SftpPaneSide::Local,
+        SftpSortColumn::Size,
+    ));
+    let sorted_asc = visible_pane_entries(state.sftp_drawer(), SftpPaneSide::Local);
+    let first_file_asc = sorted_asc.iter().position(|e| !e.is_dir).unwrap();
+    assert!(sorted_asc[..first_file_asc].iter().all(|e| e.is_dir));
+    assert!(sorted_asc[first_file_asc..].iter().all(|e| !e.is_dir));
+    let file_names_asc: Vec<&str> = sorted_asc
+        .iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(
+        file_names_asc.iter().position(|&n| n == "alpha.txt")
+            < file_names_asc.iter().position(|&n| n == "zeta.log")
+    );
+    let _ = state.update(Message::SftpPaneSortBy(
+        SftpPaneSide::Local,
+        SftpSortColumn::Size,
+    ));
+    let sorted_desc = visible_pane_entries(state.sftp_drawer(), SftpPaneSide::Local);
+    let first_file_desc = sorted_desc.iter().position(|e| !e.is_dir).unwrap();
+    assert!(sorted_desc[..first_file_desc].iter().all(|e| e.is_dir));
+    assert!(sorted_desc[first_file_desc..].iter().all(|e| !e.is_dir));
+    let file_names_desc: Vec<&str> = sorted_desc
+        .iter()
+        .filter(|e| !e.is_dir)
+        .map(|e| e.name.as_str())
+        .collect();
+    assert!(
+        file_names_desc.iter().position(|&n| n == "zeta.log")
+            < file_names_desc.iter().position(|&n| n == "alpha.txt")
+    );
+
+    // Navigation history (enter subfolder, Back, Forward, Up, Home).
+    let canon_root = fs::canonicalize(&root).unwrap();
+    let canon_sub = fs::canonicalize(&sub).unwrap();
+    let _ = state.update(Message::SftpPaneNavigateTo {
+        side: SftpPaneSide::Local,
+        path: canon_sub.to_string_lossy().into_owned(),
+    });
+    assert_eq!(
+        state.sftp_drawer().plus.local.current_path,
+        canon_sub.to_string_lossy().as_ref()
+    );
+    let _ = state.update(Message::SftpPaneBack(SftpPaneSide::Local));
+    assert_eq!(
+        state.sftp_drawer().plus.local.current_path,
+        canon_root.to_string_lossy().as_ref()
+    );
+    let _ = state.update(Message::SftpPaneForward(SftpPaneSide::Local));
+    assert_eq!(
+        state.sftp_drawer().plus.local.current_path,
+        canon_sub.to_string_lossy().as_ref()
+    );
+    let _ = state.update(Message::SftpPaneUp(SftpPaneSide::Local));
+    assert_eq!(
+        state.sftp_drawer().plus.local.current_path,
+        canon_root.to_string_lossy().as_ref()
+    );
+
+    // Bookmark persistence in sftp_state.toml.
+    let _ = state.update(Message::SftpPaneToggleBookmarkCurrent(SftpPaneSide::Local));
+    let paths = ConfigPaths::from_root(temp.path());
+    let persisted = termewnal_core::load_sftp_state(&paths).expect("load sftp bookmarks");
+    assert_eq!(
+        persisted.local_bookmarks(),
+        &[canon_root.to_string_lossy().into_owned()]
+    );
+
+    // Multi-select + SelectAll + InvertSelection.
+    let alpha_path = canon_root.join("alpha.txt").to_string_lossy().into_owned();
+    let zeta_path = canon_root.join("zeta.log").to_string_lossy().into_owned();
+    let _ = state.update(Message::SftpPaneRowClicked {
+        side: SftpPaneSide::Local,
+        path: alpha_path.clone(),
+        ctrl_held: false,
+    });
+    let _ = state.update(Message::SftpPaneRowClicked {
+        side: SftpPaneSide::Local,
+        path: zeta_path.clone(),
+        ctrl_held: true,
+    });
+    assert_eq!(
+        pane_prefs(state.sftp_drawer(), SftpPaneSide::Local)
+            .selected_paths
+            .len(),
+        2
+    );
+    let _ = state.update(Message::SftpOpenContextMenu {
+        side: SftpPaneSide::Local,
+        target_path: Some(alpha_path.clone()),
+        position: Point::new(120.0, 200.0),
+    });
+    assert!(state.sftp_drawer().plus.context_menu.open);
+    drop(state.view(win));
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::InvertSelection));
+    assert!(
+        !pane_prefs(state.sftp_drawer(), SftpPaneSide::Local)
+            .selected_paths
+            .contains(&alpha_path)
+    );
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::SelectAll));
+    assert_eq!(
+        pane_prefs(state.sftp_drawer(), SftpPaneSide::Local)
+            .selected_paths
+            .len(),
+        visible_pane_entries(state.sftp_drawer(), SftpPaneSide::Local).len()
+    );
+
+    // View mode blocks text edits; Edit mode writes changes to disk.
+    let _ = state.update(Message::SftpPaneRowClicked {
+        side: SftpPaneSide::Local,
+        path: alpha_path.clone(),
+        ctrl_held: false,
+    });
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::View));
+    assert!(matches!(
+        state.sftp_drawer().plus.modal,
+        SftpModalState::FileViewer {
+            editable: false,
+            ..
+        }
+    ));
+    drop(state.view(win));
+    let _ = state.update(Message::SftpModalEditorAction(text_editor::Action::Edit(
+        text_editor::Edit::Insert('X'),
+    )));
+    if let SftpModalState::FileViewer { content, dirty, .. } = &state.sftp_drawer().plus.modal {
+        assert_eq!(content.text(), "hello alpha");
+        assert!(!dirty);
+    }
+    let _ = state.update(Message::SftpDismissModal);
+
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Edit));
+    assert!(matches!(
+        state.sftp_drawer().plus.modal,
+        SftpModalState::FileViewer { editable: true, .. }
+    ));
+    let _ = state.update(Message::SftpModalEditorAction(text_editor::Action::Edit(
+        text_editor::Edit::Insert('!'),
+    )));
+    let _ = state.update(Message::SftpModalSaveFile);
+    assert!(fs::read_to_string(canon_root.join("alpha.txt"))
+        .unwrap()
+        .contains('!'));
+    let _ = state.update(Message::SftpDismissModal);
+
+    // Edit Permissions modal syncs checkboxes & octal input.
+    let _ = state.update(Message::SftpContextAction(
+        SftpContextActionKind::EditPermissions,
+    ));
+    let _ = state.update(Message::SftpModalOctalChanged("740".to_string()));
+    if let SftpModalState::EditPermissions { mode_bits, .. } = &state.sftp_drawer().plus.modal {
+        assert_eq!(*mode_bits, 0o740);
+        assert_eq!(format_octal_mode(*mode_bits), "740");
+    }
+    drop(state.view(win));
+    let _ = state.update(Message::SftpModalConfirmPermissions);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = fs::metadata(canon_root.join("alpha.txt"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o740);
+    }
+
+    // Properties modal renders cleanly.
+    let _ = state.update(Message::SftpPaneRowClicked {
+        side: SftpPaneSide::Local,
+        path: alpha_path.clone(),
+        ctrl_held: false,
+    });
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Properties));
+    assert!(matches!(
+        state.sftp_drawer().plus.modal,
+        SftpModalState::Properties { .. }
+    ));
+    drop(state.view(win));
+    let _ = state.update(Message::SftpDismissModal);
+
+    // New File, Copy + Paste, Rename, Cut + Paste, and Delete on Local pane.
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::NewFile));
+    let _ = state.update(Message::SftpModalNameChanged("created.txt".to_string()));
+    let _ = state.update(Message::SftpModalConfirmCreateOrRename);
+    assert!(canon_root.join("created.txt").is_file());
+
+    let created_path = canon_root.join("created.txt").to_string_lossy().into_owned();
+    let _ = state.update(Message::SftpPaneRowClicked {
+        side: SftpPaneSide::Local,
+        path: created_path,
+        ctrl_held: false,
+    });
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Copy));
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Paste));
+    assert!(canon_root.join("created copy.txt").is_file());
+
+    let copy_path = canon_root
+        .join("created copy.txt")
+        .to_string_lossy()
+        .into_owned();
+    let _ = state.update(Message::SftpPaneRowClicked {
+        side: SftpPaneSide::Local,
+        path: copy_path,
+        ctrl_held: false,
+    });
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Rename));
+    let _ = state.update(Message::SftpModalNameChanged("moved.txt".to_string()));
+    let _ = state.update(Message::SftpModalConfirmCreateOrRename);
+    assert!(canon_root.join("moved.txt").is_file());
+
+    let moved_path = canon_root.join("moved.txt").to_string_lossy().into_owned();
+    let _ = state.update(Message::SftpPaneRowClicked {
+        side: SftpPaneSide::Local,
+        path: moved_path,
+        ctrl_held: false,
+    });
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Cut));
+    let _ = state.update(Message::SftpPaneNavigateTo {
+        side: SftpPaneSide::Local,
+        path: canon_sub.to_string_lossy().into_owned(),
+    });
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Paste));
+    assert!(canon_sub.join("moved.txt").is_file());
+    assert!(!canon_root.join("moved.txt").exists());
+
+    let moved_in_sub = canon_sub.join("moved.txt").to_string_lossy().into_owned();
+    let _ = state.update(Message::SftpPaneRowClicked {
+        side: SftpPaneSide::Local,
+        path: moved_in_sub,
+        ctrl_held: false,
+    });
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Delete));
+    assert!(!canon_sub.join("moved.txt").exists());
+
+    // Layout modes DualVertical and SideDock render cleanly without panics.
+    let _ = state.update(Message::SftpSetLayoutMode(SftpLayoutMode::DualVertical));
+    drop(state.view(win));
+    let _ = state.update(Message::SftpSetLayoutMode(SftpLayoutMode::SideDock));
+    drop(state.view(win));
+    let _ = state.update(Message::SftpSetLayoutMode(SftpLayoutMode::DualHorizontal));
+    drop(state.view(win));
 }
 

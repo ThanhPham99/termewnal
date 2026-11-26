@@ -120,19 +120,58 @@ pub enum SshError {
     Io(#[from] std::io::Error),
 }
 
+impl SshError {
+    /// Returns `true` when this error reflects a transient transport, channel, or network drop
+    /// rather than an authentication, host-key, configuration, or remote permission refusal.
+    pub fn is_connection_error(&self) -> bool {
+        match self {
+            Self::TransferTransportDropped(_)
+            | Self::Disconnected
+            | Self::Connection { .. }
+            | Self::Channel(_)
+            | Self::Russh(_) => true,
+            Self::SftpStatus {
+                status_code: russh_sftp::protocol::StatusCode::ConnectionLost,
+                ..
+            } => true,
+            Self::Io(err) => matches!(
+                err.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::NotConnected
+                    | std::io::ErrorKind::NetworkUnreachable
+                    | std::io::ErrorKind::HostUnreachable
+            ),
+            Self::Sftp(msg) => is_drop_message(msg),
+            _ => false,
+        }
+    }
+}
+
+fn is_drop_message(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("sender dropped")
+        || lower.contains("senderror")
+        || lower.contains("recverror")
+        || lower.contains("eof")
+        || lower.contains("closed")
+        || lower.contains("reset")
+        || lower.contains("broken pipe")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+        || lower.contains("subsystem")
+        || lower.contains("disconnected")
+        || lower.contains("connection")
+}
+
 fn is_sftp_client_transport_drop(err: &russh_sftp::client::error::Error) -> bool {
     match err {
         russh_sftp::client::error::Error::IO(_) | russh_sftp::client::error::Error::Timeout => true,
-        russh_sftp::client::error::Error::UnexpectedBehavior(msg) => {
-            let lower = msg.to_ascii_lowercase();
-            lower.contains("sender dropped")
-                || lower.contains("senderror")
-                || lower.contains("recverror")
-                || lower.contains("eof")
-                || lower.contains("closed")
-                || lower.contains("reset")
-                || lower.contains("broken pipe")
-        }
+        russh_sftp::client::error::Error::UnexpectedBehavior(msg) => is_drop_message(msg),
         _ => false,
     }
 }

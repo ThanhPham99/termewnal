@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use iced::futures::SinkExt;
-use iced::widget::{button, column, container, row, space, text, text_input};
+use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Alignment, Background, Border, Element, Length, Task, Theme};
 use termewnal_core::{
     AppConfig, OpenSshHost, Profile, ThemePalette, VaultSession, vault::SecretStore,
@@ -199,6 +199,10 @@ pub enum SshUiEvent {
         status: TransportStatus,
         last_error: Option<String>,
     },
+    Reconnected {
+        generation: u64,
+        epoch: u64,
+    },
     HostKeyPrompt {
         generation: u64,
         prompt: HostKeyPrompt,
@@ -235,6 +239,11 @@ impl fmt::Debug for SshUiEvent {
                 .field("generation", generation)
                 .field("status", status)
                 .field("last_error", last_error)
+                .finish(),
+            Self::Reconnected { generation, epoch } => f
+                .debug_struct("Reconnected")
+                .field("generation", generation)
+                .field("epoch", epoch)
                 .finish(),
             Self::HostKeyPrompt {
                 generation, prompt, ..
@@ -479,14 +488,14 @@ impl SshUiState {
                 row![
                     status_dot(chrome.danger),
                     text(summary).size(12).color(chrome.text_primary),
-                    space::horizontal(),
                     button(text("Dismiss").size(11))
                         .padding([4, 10])
                         .style(pill_button_style(chrome, PillTone::Subtle))
                         .on_press(Message::DismissMitmAlert(alert.session_id)),
                 ]
                 .spacing(10)
-                .align_y(Alignment::Center),
+                .wrap()
+                .vertical_spacing(6),
             )
             .width(Length::Fill)
             .padding([8, 12])
@@ -549,7 +558,8 @@ impl SshUiState {
                         }),
                 ]
                 .spacing(8)
-                .align_y(Alignment::Center),
+                .wrap()
+                .vertical_spacing(6),
             ]
             .spacing(8),
         )
@@ -617,7 +627,7 @@ impl SshUiState {
                 .unwrap_or_default();
             let input = text_input(item.prompt.trim(), val)
                 .secure(!item.echo)
-                .width(Length::Fixed(280.0))
+                .width(Length::Fixed(240.0))
                 .size(12)
                 .padding([5, 8])
                 .style(styled_input_style(chrome))
@@ -635,7 +645,8 @@ impl SshUiState {
                     input
                 ]
                 .spacing(8)
-                .align_y(Alignment::Center),
+                .wrap()
+                .vertical_spacing(6),
             );
         }
 
@@ -697,27 +708,29 @@ impl SshUiState {
                 chrome.warning
             }),
             text(copy).size(12).color(chrome.text_primary),
-            space::horizontal(),
         ]
-        .spacing(8)
-        .align_y(Alignment::Center);
+        .spacing(8);
 
         if !blocked_by_mitm {
             bar = bar.push(
-                button(text("Connect").size(11))
-                    .padding([4, 12])
-                    .style(pill_button_style(chrome, PillTone::Primary))
+                button(
+                    text("Connect")
+                        .size(12)
+                        .font(crate::ui_theme::ui_font_medium()),
+                )
+                    .padding([3, 10])
+                    .style(crate::ui_theme::tab_bar_button_style(chrome, true, false))
                     .on_press(Message::ConnectSshSession(session_id)),
             );
         }
 
-        container(bar)
+        container(bar.wrap().vertical_spacing(4))
             .width(Length::Fill)
-            .padding([6, 12])
+            .padding([5, 10])
             .style(move |_| container::Style {
-                background: Some(Background::Color(chrome.panel_bg)),
+                background: Some(Background::Color(chrome.bg_more)),
                 border: Border {
-                    color: chrome.border_subtle,
+                    color: chrome.secondary,
                     width: 1.0,
                     radius: 0.0.into(),
                 },
@@ -880,14 +893,33 @@ pub async fn drive_ssh_connect(
     );
 
     let mut sent_initial_connected = false;
+    let mut saw_reconnecting = false;
     let mut last_disconnect_error: Option<String> = None;
 
     while let Some(ev) = sup_rx.recv().await {
         match ev {
             SupervisorEvent::StatusChanged(status_ev) => {
+                if matches!(
+                    status_ev.status,
+                    TransportStatus::Reconnecting { .. } | TransportStatus::Degraded { .. }
+                ) {
+                    saw_reconnecting = true;
+                }
                 if !sent_initial_connected {
                     match status_ev.status {
-                        TransportStatus::Connecting => {}
+                        TransportStatus::Connecting => {
+                            if saw_reconnecting
+                                && events_tx
+                                    .send(SshUiEvent::TransportStatus {
+                                        generation,
+                                        status: status_ev.status,
+                                        last_error: status_ev.last_error,
+                                    })
+                                    .is_err()
+                            {
+                                break;
+                            }
+                        }
                         TransportStatus::Connected { .. } => {
                             sent_initial_connected = true;
                             let session = supervisor.current_transport().map(|transport| {
@@ -902,6 +934,18 @@ pub async fn drive_ssh_connect(
                                 .is_err()
                             {
                                 break;
+                            }
+                            if saw_reconnecting {
+                                saw_reconnecting = false;
+                                if events_tx
+                                    .send(SshUiEvent::Reconnected {
+                                        generation,
+                                        epoch: 0,
+                                    })
+                                    .is_err()
+                                {
+                                    break;
+                                }
                             }
                             if let TransportStatus::Connected {
                                 latency_ms: Some(_),
@@ -936,7 +980,15 @@ pub async fn drive_ssh_connect(
                     break;
                 }
             }
-            SupervisorEvent::Reconnected { .. } => {}
+            SupervisorEvent::Reconnected { epoch, .. } => {
+                saw_reconnecting = false;
+                if events_tx
+                    .send(SshUiEvent::Reconnected { generation, epoch })
+                    .is_err()
+                {
+                    break;
+                }
+            }
             SupervisorEvent::MitmBlocked {
                 host,
                 port,

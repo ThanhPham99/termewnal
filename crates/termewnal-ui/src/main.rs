@@ -2,43 +2,16 @@ use std::sync::Mutex;
 
 use termewnal_core::ConfigPaths;
 use termewnal_ui::AppState;
-use termewnal_ui::ipc::{IpcCommand, LaunchOutcome, acquire_or_forward};
+use termewnal_ui::ipc::{LaunchOutcome, acquire_or_forward, parse_cli_launch_command};
+use termewnal_ui::ui_theme::{FONT_BODY, ui_font};
 use tracing::warn;
-
-fn parse_launch_command<I, S>(args: I) -> IpcCommand
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<str>,
-{
-    let mut open_tab = false;
-    let mut profile_id = None;
-    let mut iter = args.into_iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_ref() {
-            "--new-tab" => open_tab = true,
-            "--profile" => {
-                if let Some(id) = iter.next() {
-                    profile_id = Some(id.as_ref().to_string());
-                    open_tab = true;
-                }
-            }
-            _ => {}
-        }
-    }
-
-    if open_tab {
-        IpcCommand::OpenTab { profile_id }
-    } else {
-        IpcCommand::OpenWindow
-    }
-}
 
 fn main() -> iced::Result {
     let paths = ConfigPaths::detect_xdg()
         .unwrap_or_else(|_| ConfigPaths::from_root(std::env::temp_dir().join("termewnal")));
-    let launch_cmd = parse_launch_command(std::env::args().skip(1));
+    let launch_cmd = parse_cli_launch_command(std::env::args().skip(1));
 
-    let ipc_handle = match acquire_or_forward(&paths, launch_cmd) {
+    let ipc_handle = match acquire_or_forward(&paths, launch_cmd.clone()) {
         Ok(LaunchOutcome::SecondaryForwarded) => {
             return Ok(());
         }
@@ -49,19 +22,26 @@ fn main() -> iced::Result {
         }
     };
 
-    let boot_slot = Mutex::new(Some((paths, ipc_handle)));
+    let boot_slot = Mutex::new(Some((paths, ipc_handle, launch_cmd)));
     iced::daemon(
         move || {
-            let (paths, ipc_handle) = boot_slot
+            let (paths, ipc_handle, initial_cmd) = boot_slot
                 .lock()
                 .expect("boot slot poisoned")
                 .take()
                 .expect("iced daemon boot invoked more than once");
-            AppState::boot_daemon_with_ipc(paths, ipc_handle)
+            AppState::boot_daemon_with_ipc_and_initial_command(paths, ipc_handle, initial_cmd)
         },
         AppState::update,
         AppState::view,
     )
+    .settings(iced::Settings {
+        id: Some("termewnal".to_string()),
+        default_font: ui_font(),
+        default_text_size: iced::Pixels(FONT_BODY),
+        antialiasing: true,
+        ..Default::default()
+    })
     .title(AppState::title)
     .theme(AppState::theme)
     .subscription(AppState::subscription)

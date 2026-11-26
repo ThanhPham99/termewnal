@@ -184,6 +184,18 @@ impl TransferStatus {
     }
 }
 
+/// Auto-reconnect lifecycle state for a single [`TransferSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum TransferReconnectState {
+    #[default]
+    None,
+    AutoReconnecting {
+        attempt: u32,
+        reason: String,
+    },
+    Reconnected,
+}
+
 /// Immutable telemetry snapshot of a single `Transfer` item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferSnapshot {
@@ -199,6 +211,7 @@ pub struct TransferSnapshot {
     pub status: TransferStatus,
     pub transport_mode: Option<SftpTransportMode>,
     pub status_notice: Option<String>,
+    pub reconnect_state: TransferReconnectState,
     pub notice: Option<TransferNotice>,
     pub pending_conflict: Option<TransferConflict>,
     pub resume_offset: u64,
@@ -257,6 +270,17 @@ impl TransferQueueSnapshot {
                 }
             })
             .collect()
+    }
+
+    /// Returns a derived [`TransferQueueSnapshot`] retaining only transfers matching `predicate`.
+    pub fn filtered(&self, predicate: impl Fn(&TransferSnapshot) -> bool) -> Self {
+        let transfers: Vec<TransferSnapshot> = self
+            .transfers
+            .iter()
+            .filter(|t| predicate(t))
+            .cloned()
+            .collect();
+        build_snapshot_from_transfers(transfers)
     }
 }
 
@@ -875,6 +899,7 @@ struct TransferEntry {
     generation: u64,
     resume_hint: u64,
     failed_on_transport_drop: bool,
+    was_reconnecting: bool,
     force_direct_fallback: bool,
     resolved_conflict: Option<ResolvedConflict>,
     overwrite_authorized: bool,
@@ -1296,6 +1321,7 @@ impl TransferQueue {
                     status: TransferStatus::Queued,
                     transport_mode: None,
                     status_notice: notice.as_ref().map(TransferNotice::summary),
+                    reconnect_state: TransferReconnectState::None,
                     notice: notice.clone(),
                     pending_conflict: None,
                     resume_offset: 0,
@@ -1305,6 +1331,7 @@ impl TransferQueue {
                 generation: 1,
                 resume_hint: 0,
                 failed_on_transport_drop: false,
+                was_reconnecting: false,
                 force_direct_fallback: false,
                 resolved_conflict: None,
                 overwrite_authorized: false,
@@ -1421,6 +1448,7 @@ impl TransferQueue {
                     status: TransferStatus::Queued,
                     transport_mode: None,
                     status_notice: notice.as_ref().map(TransferNotice::summary),
+                    reconnect_state: TransferReconnectState::None,
                     notice: notice.clone(),
                     pending_conflict: None,
                     resume_offset: 0,
@@ -1430,6 +1458,7 @@ impl TransferQueue {
                 generation: 1,
                 resume_hint: 0,
                 failed_on_transport_drop: false,
+                was_reconnecting: false,
                 force_direct_fallback: false,
                 resolved_conflict: None,
                 overwrite_authorized: false,
@@ -1494,6 +1523,7 @@ impl TransferQueue {
                 status: TransferStatus::Failed { error },
                 transport_mode: None,
                 status_notice: None,
+                reconnect_state: TransferReconnectState::None,
                 notice: None,
                 pending_conflict: None,
                 resume_offset: 0,
@@ -1503,6 +1533,7 @@ impl TransferQueue {
             generation: 1,
             resume_hint: 0,
             failed_on_transport_drop: false,
+            was_reconnecting: false,
             force_direct_fallback: false,
             resolved_conflict: None,
             overwrite_authorized: false,
@@ -1545,6 +1576,7 @@ impl TransferQueue {
                 status,
                 transport_mode: None,
                 status_notice: None,
+                reconnect_state: TransferReconnectState::None,
                 notice: None,
                 pending_conflict: None,
                 resume_offset: 0,
@@ -1554,6 +1586,7 @@ impl TransferQueue {
             generation: 1,
             resume_hint: 0,
             failed_on_transport_drop: false,
+            was_reconnecting: false,
             force_direct_fallback: false,
             resolved_conflict: None,
             overwrite_authorized: false,
@@ -1643,8 +1676,14 @@ impl TransferQueue {
                     entry.generation += 1;
                     entry.resume_hint = entry.snapshot.bytes_transferred.max(1);
                     entry.failed_on_transport_drop = false;
+                    entry.was_reconnecting = true;
                     entry.snapshot.throughput_bytes_per_sec = 0;
                     entry.snapshot.status = TransferStatus::Queued;
+                    entry.snapshot.reconnect_state = TransferReconnectState::AutoReconnecting {
+                        attempt: 1,
+                        reason: "Session reconnected; resuming transfer...".to_string(),
+                    };
+                    entry.snapshot.status_notice = Some("Auto-reconnecting transfer...".to_string());
                     let _ = entry.control_tx.send(ControlSignal::Run);
                     out.push((entry.snapshot.id, entry.generation));
                 }
@@ -1711,6 +1750,9 @@ impl TransferQueue {
                             entry.snapshot.resume_offset = 0;
                         }
                         entry.failed_on_transport_drop = false;
+                        entry.was_reconnecting = false;
+                        entry.snapshot.reconnect_state = TransferReconnectState::None;
+                        entry.snapshot.status_notice = None;
                         entry.snapshot.throughput_bytes_per_sec = 0;
                         entry.snapshot.status = TransferStatus::Queued;
                         let _ = entry.control_tx.send(ControlSignal::Run);
@@ -1725,6 +1767,9 @@ impl TransferQueue {
                         entry.snapshot.bytes_transferred = 0;
                         entry.snapshot.resume_offset = 0;
                         entry.failed_on_transport_drop = false;
+                        entry.was_reconnecting = false;
+                        entry.snapshot.reconnect_state = TransferReconnectState::None;
+                        entry.snapshot.status_notice = None;
                         entry.resolved_conflict = None;
                         entry.overwrite_authorized = false;
                         entry.snapshot.pending_conflict = None;
@@ -1765,13 +1810,19 @@ impl TransferQueue {
 
     /// Removes `Completed`, `Skipped`, and `Cancelled` entries from the queue snapshot.
     pub fn clear_finished(&self) {
+        self.clear_finished_matching(|_| true);
+    }
+
+    /// Removes `Completed`, `Skipped`, and `Cancelled` entries matching `predicate`.
+    pub fn clear_finished_matching(&self, predicate: impl Fn(&TransferSnapshot) -> bool) {
         let snap = {
             let mut entries = self.inner.entries.lock().expect("entries mutex poisoned");
             entries.retain(|e| {
-                !matches!(
+                let is_finished = matches!(
                     e.snapshot.status,
                     TransferStatus::Completed | TransferStatus::Skipped | TransferStatus::Cancelled
-                )
+                );
+                !(is_finished && predicate(&e.snapshot))
             });
             build_queue_snapshot(&entries)
         };
@@ -1883,7 +1934,6 @@ impl TransferQueue {
 
         let reconnect_notifier = self.inner.sftp.pool().reconnect_notifier();
         let mut transport_retries = 0u32;
-        let mut active_session_started = false;
         let mut current_resume_hint = resume_hint;
 
         loop {
@@ -1893,18 +1943,23 @@ impl TransferQueue {
             }
 
             let acquired = match self.inner.sftp.acquire_transfer_session(&endpoint).await {
-                Ok(session) => {
-                    active_session_started = true;
-                    session
-                }
+                Ok(session) => session,
                 Err(err) => {
-                    let drop_err = is_transport_drop_error(&err);
-                    if active_session_started
-                        && drop_err
+                    let drop_err = err.is_connection_error();
+                    if drop_err
                         && transport_retries < self.inner.config.max_transport_retries
                     {
                         transport_retries += 1;
+                        current_resume_hint =
+                            self.current_bytes_transferred(id, generation).max(1);
                         self.inner.sftp.pool().invalidate(&endpoint.key);
+                        self.set_reconnecting_notice(
+                            id,
+                            generation,
+                            current_resume_hint,
+                            transport_retries,
+                            &err.to_string(),
+                        );
                         if self
                             .wait_reconnect_backoff(
                                 transport_retries,
@@ -2009,7 +2064,7 @@ impl TransferQueue {
                         self.apply_interrupt(id, generation, signal);
                         return;
                     }
-                    let drop_err = is_transport_drop_error(&err);
+                    let drop_err = err.is_connection_error();
                     if drop_err {
                         self.inner.sftp.pool().invalidate(&endpoint.key);
                     }
@@ -2021,6 +2076,7 @@ impl TransferQueue {
                             generation,
                             current_resume_hint,
                             transport_retries,
+                            &err.to_string(),
                         );
                         if self
                             .wait_reconnect_backoff(
@@ -2590,7 +2646,21 @@ impl TransferQueue {
                 return;
             };
             entry.snapshot.transport_mode = Some(mode);
-            entry.snapshot.status_notice = notice;
+            if entry.was_reconnecting
+                || matches!(
+                    entry.snapshot.reconnect_state,
+                    TransferReconnectState::AutoReconnecting { .. }
+                )
+            {
+                entry.was_reconnecting = false;
+                entry.snapshot.reconnect_state = TransferReconnectState::Reconnected;
+                entry.snapshot.status_notice = Some(match notice {
+                    Some(n) => format!("Reconnected successfully ({n})"),
+                    None => "Reconnected successfully; resuming transfer...".to_string(),
+                });
+            } else {
+                entry.snapshot.status_notice = notice;
+            }
             build_queue_snapshot(&entries)
         };
         self.publish_snapshot(snap);
@@ -2671,6 +2741,19 @@ impl TransferQueue {
             }
             entry.snapshot.throughput_bytes_per_sec = rate;
             entry.snapshot.status = TransferStatus::Completed;
+            if entry.was_reconnecting
+                || matches!(
+                    entry.snapshot.reconnect_state,
+                    TransferReconnectState::AutoReconnecting { .. }
+                        | TransferReconnectState::Reconnected
+                )
+            {
+                entry.was_reconnecting = false;
+                entry.snapshot.reconnect_state = TransferReconnectState::Reconnected;
+                entry.snapshot.status_notice = Some("Reconnected successfully".to_string());
+            } else {
+                entry.snapshot.reconnect_state = TransferReconnectState::None;
+            }
             build_queue_snapshot(&entries)
         };
         self.publish_snapshot(snap);
@@ -2822,6 +2905,7 @@ impl TransferQueue {
         generation: u64,
         resume_hint: u64,
         attempt: u32,
+        reason: &str,
     ) {
         let snap = {
             let mut entries = self.inner.entries.lock().expect("entries mutex poisoned");
@@ -2832,9 +2916,14 @@ impl TransferQueue {
                 return;
             };
             entry.resume_hint = resume_hint;
+            entry.was_reconnecting = true;
             entry.snapshot.throughput_bytes_per_sec = 0;
+            entry.snapshot.reconnect_state = TransferReconnectState::AutoReconnecting {
+                attempt,
+                reason: reason.to_string(),
+            };
             entry.snapshot.status_notice = Some(format!(
-                "Transfer Transport dropped; reconnecting (attempt {attempt})..."
+                "Auto-reconnecting transfer (attempt {attempt}): {reason}"
             ));
             build_queue_snapshot(&entries)
         };
@@ -2863,6 +2952,8 @@ impl TransferQueue {
                 return;
             }
             entry.failed_on_transport_drop = failed_on_transport_drop;
+            entry.was_reconnecting = false;
+            entry.snapshot.reconnect_state = TransferReconnectState::None;
             entry.snapshot.status = TransferStatus::Failed { error };
             entry.snapshot.throughput_bytes_per_sec = 0;
             build_queue_snapshot(&entries)
@@ -2989,20 +3080,6 @@ fn is_part_fallback_status(err: &SshError) -> bool {
     )
 }
 
-fn is_transport_drop_error(err: &SshError) -> bool {
-    matches!(
-        err,
-        SshError::TransferTransportDropped(_)
-            | SshError::Disconnected
-            | SshError::Russh(_)
-            | SshError::Connection { .. }
-            | SshError::SftpStatus {
-                status_code: StatusCode::ConnectionLost,
-                ..
-            }
-    )
-}
-
 fn current_interrupt(control_rx: &watch::Receiver<ControlSignal>) -> Option<ControlSignal> {
     match *control_rx.borrow() {
         ControlSignal::Run => None,
@@ -3034,13 +3111,17 @@ fn compute_throughput(session_bytes: u64, started_at: Instant) -> u64 {
 }
 
 fn build_queue_snapshot(entries: &[TransferEntry]) -> TransferQueueSnapshot {
+    let transfers: Vec<TransferSnapshot> = entries.iter().map(|e| e.snapshot.clone()).collect();
+    build_snapshot_from_transfers(transfers)
+}
+
+fn build_snapshot_from_transfers(transfers: Vec<TransferSnapshot>) -> TransferQueueSnapshot {
     let mut snap = TransferQueueSnapshot {
-        transfers: entries.iter().map(|e| e.snapshot.clone()).collect(),
+        transfers,
         ..Default::default()
     };
 
-    for entry in entries {
-        let s = &entry.snapshot;
+    for s in &snap.transfers {
         match &s.status {
             TransferStatus::Queued => {
                 snap.queued_count += 1;

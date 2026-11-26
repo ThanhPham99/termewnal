@@ -53,6 +53,7 @@ target_port = 5432
 
     let cfg = ProfilesConfig {
         schema_version: 1,
+        groups: Vec::new(),
         profiles: vec![profile],
     };
     save_profiles(&paths, &cfg).expect("save profiles");
@@ -113,6 +114,7 @@ fn remote_tunnel_rule_roundtrips_and_does_not_trigger_local_public_bind_guard() 
 
     let cfg = ProfilesConfig {
         schema_version: 1,
+        groups: Vec::new(),
         profiles: vec![profile],
     };
     save_profiles(&paths, &cfg).expect("save profiles");

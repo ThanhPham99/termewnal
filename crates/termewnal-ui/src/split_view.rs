@@ -11,9 +11,9 @@ use iced::{
 use crate::app::{Message, shortcut_for_key_event_with_palette};
 use crate::workspace::{MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, PaneId, SplitAxis, SplitId, TabId};
 
-const DIVIDER_THICKNESS: f32 = 2.0;
-const DIVIDER_HIT_PADDING: f32 = 4.0;
-const PANE_BORDER_WIDTH: f32 = 1.5;
+const DIVIDER_THICKNESS: f32 = 1.0;
+const DIVIDER_HIT_PADDING: f32 = 5.0;
+const PANE_BORDER_WIDTH: f32 = 1.0;
 
 #[derive(Debug, Default)]
 struct SplitDragState {
@@ -315,7 +315,10 @@ impl Widget<Message, Theme, iced::Renderer> for SplitView<'_> {
             let color = if state.dragging || state.hovered {
                 ext.primary.strong.color
             } else {
-                ext.background.strong.color
+                Color {
+                    a: 0.42,
+                    ..ext.background.strong.color
+                }
             };
             renderer.fill_quad(
                 Quad {
@@ -572,7 +575,11 @@ impl Widget<Message, Theme, iced::Renderer> for PaneFrame<'_> {
 /// Top-level wrapper intercepting workspace keyboard shortcuts before terminal panes consume them.
 pub struct ShortcutInterceptor<'a> {
     active_tab: Option<TabId>,
+    active_session: Option<crate::app::SessionId>,
     palette_open: bool,
+    capturing_shortcut: bool,
+    resolver: std::sync::Arc<termewnal_core::KeybindingResolver>,
+    pending_chords: Vec<termewnal_core::KeyChord>,
     content: Element<'a, Message, Theme, iced::Renderer>,
 }
 
@@ -591,9 +598,35 @@ impl<'a> ShortcutInterceptor<'a> {
         active_tab: Option<TabId>,
         palette_open: bool,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
+        let resolver = std::sync::Arc::new(termewnal_core::KeybindingConfig::default().resolver());
+        Self::with_keybindings(
+            content,
+            active_tab,
+            None,
+            palette_open,
+            false,
+            resolver,
+            Vec::new(),
+        )
+    }
+
+    /// Wraps `content` with dynamic [`KeybindingResolver`], multi-chord prefix, and capture awareness.
+    pub fn with_keybindings(
+        content: Element<'a, Message, Theme, iced::Renderer>,
+        active_tab: Option<TabId>,
+        active_session: Option<crate::app::SessionId>,
+        palette_open: bool,
+        capturing_shortcut: bool,
+        resolver: std::sync::Arc<termewnal_core::KeybindingResolver>,
+        pending_chords: Vec<termewnal_core::KeyChord>,
+    ) -> Element<'a, Message, Theme, iced::Renderer> {
         Element::new(Self {
             active_tab,
+            active_session,
             palette_open,
+            capturing_shortcut,
+            resolver,
+            pending_chords,
             content,
         })
     }
@@ -646,13 +679,84 @@ impl Widget<Message, Theme, iced::Renderer> for ShortcutInterceptor<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if let Event::Keyboard(keyboard::Event::KeyPressed { key, modifiers, .. }) = event
-            && let Some(msg) =
-                shortcut_for_key_event_with_palette(key, *modifiers, self.active_tab, self.palette_open)
+        if let Event::Keyboard(keyboard::Event::KeyPressed {
+            key,
+            modified_key,
+            modifiers,
+            ..
+        }) = event
         {
-            shell.publish(msg);
-            shell.capture_event();
-            return;
+            if self.capturing_shortcut {
+                if *key == keyboard::Key::Named(keyboard::key::Named::Escape)
+                    && modifiers.is_empty()
+                {
+                    shell.publish(Message::SettingsCancelShortcutCapture);
+                    shell.capture_event();
+                    return;
+                }
+                if let Some(chord) = crate::keybinding_bridge::iced_key_to_chord(
+                    key,
+                    Some(modified_key),
+                    *modifiers,
+                ) {
+                    shell.publish(Message::SettingsShortcutCaptured(chord.canonical()));
+                    shell.capture_event();
+                    return;
+                }
+            }
+
+            if !self.palette_open
+                && let Some(chord) = crate::keybinding_bridge::iced_key_to_chord(
+                    key,
+                    Some(modified_key),
+                    *modifiers,
+                )
+            {
+                let is_fn_key = chord.key.starts_with('F')
+                    && chord.key.len() >= 2
+                    && chord.key[1..].chars().all(|c| c.is_ascii_digit());
+                if !modifiers.is_empty() || !self.pending_chords.is_empty() || is_fn_key {
+                    match crate::keybinding_bridge::resolve_keybinding_message(
+                        &self.resolver,
+                        &self.pending_chords,
+                        &chord,
+                        self.active_tab,
+                        self.active_session,
+                    ) {
+                        crate::keybinding_bridge::KeybindingStepOutcome::PendingPrefix(ch) => {
+                            shell.publish(Message::PushPendingKeyChord(ch));
+                            shell.capture_event();
+                            return;
+                        }
+                        crate::keybinding_bridge::KeybindingStepOutcome::Matched(msg_opt) => {
+                            shell.publish(Message::ClearPendingKeyChord);
+                            if let Some(msg) = msg_opt {
+                                shell.publish(msg);
+                            }
+                            shell.capture_event();
+                            return;
+                        }
+                        crate::keybinding_bridge::KeybindingStepOutcome::NoMatch => {
+                            if !self.pending_chords.is_empty() {
+                                shell.publish(Message::ClearPendingKeyChord);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if self.palette_open
+                && let Some(msg) = shortcut_for_key_event_with_palette(
+                    key,
+                    *modifiers,
+                    self.active_tab,
+                    true,
+                )
+            {
+                shell.publish(msg);
+                shell.capture_event();
+                return;
+            }
         }
 
         self.content.as_widget_mut().update(

@@ -7,20 +7,26 @@ use russh::keys::PublicKeyOrCertificate;
 use russh::{Channel, ChannelMsg, ChannelOpenFailure, Disconnect};
 use socket2::{SockRef, TcpKeepalive};
 use termewnal_core::{
-    DEFAULT_KEEPALIVE_INTERVAL_SECS, OpenSshHost, Profile, ProfileTarget, SshAuthMethod,
-    vault::SecretStore,
+    DEFAULT_KEEPALIVE_INTERVAL_SECS, LoginScriptStep, OpenSshHost, Profile, ProfileTarget,
+    SshAuthMethod, SshProxyConfig, vault::SecretStore,
 };
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, watch};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::auth::{AgentConnector, SshInteractionHandler, authenticate_session};
 use crate::error::SshError;
 use crate::known_hosts::{
     KnownHostStatus, default_known_hosts_path, record_known_host_path, verify_known_host_path,
 };
+use crate::proxy_cmd::ProxyCommandStream;
 use crate::proxy_jump::{JumpHopSpec, connect_chain_parts, resolve_proxy_jump_hops};
+use crate::proxy_net::dial_via_proxy;
+use crate::server_stats::{
+    POSIX_SERVER_STATS_COMMAND, ServerStatsCollector, ServerStatsSnapshot, parse_raw_server_stats,
+};
+use crate::x11::{X11AuthInfo, X11DisplayTarget, connect_x11_target, resolve_x11_auth};
 
 /// Connection and PTY configuration for establishing an SSH `Transport` and `Session`.
 #[derive(Debug, Clone)]
@@ -31,6 +37,12 @@ pub struct SshConnectConfig {
     pub auth: SshAuthMethod,
     pub known_hosts_path: Option<PathBuf>,
     pub proxy_jump: Vec<JumpHopSpec>,
+    pub proxy_command: Option<String>,
+    pub proxy: Option<SshProxyConfig>,
+    pub forward_agent: bool,
+    pub forward_x11: bool,
+    pub x11_display: Option<String>,
+    pub login_scripts: Vec<LoginScriptStep>,
     pub nodelay: bool,
     pub term_name: String,
     pub cols: u16,
@@ -47,6 +59,12 @@ impl Default for SshConnectConfig {
             auth: SshAuthMethod::Agent,
             known_hosts_path: None,
             proxy_jump: Vec::new(),
+            proxy_command: None,
+            proxy: None,
+            forward_agent: false,
+            forward_x11: false,
+            x11_display: None,
+            login_scripts: Vec::new(),
             nodelay: true,
             term_name: "xterm-256color".to_string(),
             cols: 80,
@@ -84,6 +102,11 @@ impl SshConnectConfig {
                 username,
                 auth,
                 proxy_jump,
+                proxy_command,
+                proxy,
+                forward_agent,
+                forward_x11,
+                login_scripts,
                 ..
             } => {
                 let resolved_hops = resolve_proxy_jump_hops(
@@ -100,6 +123,12 @@ impl SshConnectConfig {
                     auth: auth.clone(),
                     known_hosts_path: None,
                     proxy_jump: resolved_hops,
+                    proxy_command: proxy_command.clone(),
+                    proxy: proxy.clone(),
+                    forward_agent: *forward_agent,
+                    forward_x11: *forward_x11,
+                    x11_display: None,
+                    login_scripts: login_scripts.clone(),
                     nodelay: true,
                     term_name: "xterm-256color".to_string(),
                     cols: cols.max(1),
@@ -107,10 +136,10 @@ impl SshConnectConfig {
                     scrollback_lines,
                 })
             }
-            ProfileTarget::LocalShell { .. } => Err(SshError::Connection {
+            _ => Err(SshError::Connection {
                 host: profile.name.clone(),
                 port: 0,
-                reason: "profile target is a local shell, not SSH".to_string(),
+                reason: "profile target is not SSH".to_string(),
             }),
         }
     }
@@ -278,6 +307,9 @@ pub struct SshClientHandler {
     interaction: Arc<dyn SshInteractionHandler>,
     banner: Arc<Mutex<Option<String>>>,
     remote_forwards: Arc<Mutex<RemoteForwardRegistry>>,
+    forward_agent: bool,
+    agent_connector: Option<Arc<dyn AgentConnector>>,
+    x11_target: Option<X11DisplayTarget>,
     closed_tx: watch::Sender<bool>,
 }
 
@@ -289,21 +321,28 @@ impl SshClientHandler {
         known_hosts_path: PathBuf,
         interaction: Arc<dyn SshInteractionHandler>,
     ) -> Self {
-        Self::with_remote_forwards(
+        Self::with_options(
             host,
             port,
             known_hosts_path,
             interaction,
             Arc::new(Mutex::new(RemoteForwardRegistry::default())),
+            false,
+            None,
+            None,
         )
     }
 
-    fn with_remote_forwards(
+    #[allow(clippy::too_many_arguments)]
+    fn with_options(
         host: impl Into<String>,
         port: u16,
         known_hosts_path: PathBuf,
         interaction: Arc<dyn SshInteractionHandler>,
         remote_forwards: Arc<Mutex<RemoteForwardRegistry>>,
+        forward_agent: bool,
+        agent_connector: Option<Arc<dyn AgentConnector>>,
+        x11_target: Option<X11DisplayTarget>,
     ) -> Self {
         let (closed_tx, _) = watch::channel(false);
         Self {
@@ -313,6 +352,9 @@ impl SshClientHandler {
             interaction,
             banner: Arc::new(Mutex::new(None)),
             remote_forwards,
+            forward_agent,
+            agent_connector,
+            x11_target,
             closed_tx,
         }
     }
@@ -428,6 +470,68 @@ impl client::Handler for SshClientHandler {
         Ok(())
     }
 
+    async fn server_channel_open_agent_forward(
+        &mut self,
+        channel: Channel<client::Msg>,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let Some(connector) = self
+            .agent_connector
+            .as_ref()
+            .filter(|_| self.forward_agent)
+            .cloned()
+        else {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        reply.accept().await;
+        tokio::spawn(async move {
+            match connector.connect().await {
+                Ok(agent) => {
+                    let mut agent_stream = agent.into_inner();
+                    let mut ch_stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut ch_stream, &mut agent_stream).await;
+                }
+                Err(err) => {
+                    warn!(error = %err, "SSH agent forwarding connection failed");
+                }
+            }
+        });
+        Ok(())
+    }
+
+    async fn server_channel_open_x11(
+        &mut self,
+        channel: Channel<client::Msg>,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: client::ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let Some(target) = self.x11_target.clone() else {
+            reply
+                .reject(ChannelOpenFailure::AdministrativelyProhibited)
+                .await;
+            return Ok(());
+        };
+        reply.accept().await;
+        tokio::spawn(async move {
+            match connect_x11_target(&target).await {
+                Ok(mut x11_stream) => {
+                    let mut ch_stream = channel.into_stream();
+                    let _ = tokio::io::copy_bidirectional(&mut ch_stream, &mut x11_stream).await;
+                }
+                Err(err) => {
+                    warn!(error = %err, "SSH X11 forwarding local display connect failed");
+                }
+            }
+        });
+        Ok(())
+    }
+
     async fn disconnected(
         &mut self,
         reason: client::DisconnectReason<Self::Error>,
@@ -464,6 +568,7 @@ pub struct SshTransport {
     used_interactive_auth: bool,
     remote_forwards: Arc<Mutex<RemoteForwardRegistry>>,
     upstream_hops: Vec<Arc<SshTransport>>,
+    x11_auth: Option<X11AuthInfo>,
 }
 
 impl SshTransport {
@@ -522,6 +627,52 @@ impl SshTransport {
         interaction: Arc<dyn SshInteractionHandler>,
         agent_connector: Arc<dyn AgentConnector>,
     ) -> Result<Self, SshError> {
+        if let Some(proxy_cmd) = config
+            .proxy_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let stream = ProxyCommandStream::spawn(
+                proxy_cmd,
+                &config.host,
+                config.port,
+                &config.username,
+            )?;
+            return Self::connect_over_stream(stream, config, vault, interaction, agent_connector)
+                .await;
+        }
+
+        if let Some(proxy_cfg) = config
+            .proxy
+            .as_ref()
+            .filter(|p| !p.host.trim().is_empty())
+        {
+            let proxy_secret = match (vault, proxy_cfg.vault_secret_ref.as_deref()) {
+                (Some(store), Some(secret_ref)) => store.get_secret(secret_ref)?,
+                (None, Some(_)) => {
+                    return Err(SshError::Connection {
+                        host: config.host.clone(),
+                        port: config.port,
+                        reason: "proxy password stored in Vault, but Vault is unavailable"
+                            .to_string(),
+                    });
+                }
+                _ => None,
+            };
+            let stream = dial_via_proxy(
+                proxy_cfg,
+                proxy_secret.as_deref().map(String::as_str),
+                &config.host,
+                config.port,
+                config.nodelay,
+                keepalive,
+            )
+            .await?;
+            return Self::connect_over_stream(stream, config, vault, interaction, agent_connector)
+                .await;
+        }
+
         let tcp = TcpStream::connect((config.host.as_str(), config.port))
             .await
             .map_err(|err| SshError::Connection {
@@ -540,7 +691,7 @@ impl SshTransport {
     }
 
     /// Performs SSH handshake, host key verification, and authentication over an existing stream
-    /// (direct `TcpStream` or nested `ProxyJump` `direct-tcpip` channel stream).
+    /// (direct `TcpStream`, `ProxyCommand`, or nested `ProxyJump` `direct-tcpip` channel stream).
     pub async fn connect_over_stream<S>(
         stream: S,
         config: &SshConnectConfig,
@@ -556,17 +707,26 @@ impl SshTransport {
             None => default_known_hosts_path()?,
         };
 
+        let x11_auth = if config.forward_x11 {
+            resolve_x11_auth(config.x11_display.as_deref())
+        } else {
+            None
+        };
+
         let russh_cfg = Arc::new(client::Config {
             nodelay: config.nodelay,
             ..client::Config::default()
         });
         let remote_forwards = Arc::new(Mutex::new(RemoteForwardRegistry::default()));
-        let handler = SshClientHandler::with_remote_forwards(
+        let handler = SshClientHandler::with_options(
             config.host.clone(),
             config.port,
             known_hosts_path,
             Arc::clone(&interaction),
             Arc::clone(&remote_forwards),
+            config.forward_agent,
+            config.forward_agent.then(|| Arc::clone(&agent_connector)),
+            x11_auth.as_ref().map(|a| a.target.clone()),
         );
         let closed_rx = handler.subscribe_closed();
 
@@ -601,6 +761,7 @@ impl SshTransport {
             used_interactive_auth: outcome.used_interactive_auth,
             remote_forwards,
             upstream_hops: Vec::new(),
+            x11_auth,
         })
     }
 
@@ -650,6 +811,11 @@ impl SshTransport {
         }
     }
 
+    /// Returns resolved X11 forwarding parameters if enabled and display was detected.
+    pub fn x11_auth(&self) -> Option<&X11AuthInfo> {
+        self.x11_auth.as_ref()
+    }
+
     /// Borrows the underlying `russh::client::Handle` for supervisor, tunnel, or SFTP operations.
     pub fn handle(&self) -> &client::Handle<SshClientHandler> {
         &self.handle
@@ -682,6 +848,68 @@ impl SshTransport {
     /// Opens an additional SSH session channel (used for PTY shell or multiplexed SFTP fallback).
     pub async fn open_session_channel(&self) -> Result<Channel<client::Msg>, SshError> {
         Ok(self.handle.channel_open_session().await?)
+    }
+
+    /// Executes a non-interactive command on a multiplexed SSH `exec` channel within `timeout`.
+    pub async fn exec_command(
+        &self,
+        command: &str,
+        timeout: Duration,
+    ) -> Result<(Option<u32>, Vec<u8>, Vec<u8>), SshError> {
+        let fut = async {
+            let mut channel = self.open_session_channel().await?;
+            channel
+                .exec(true, command)
+                .await
+                .map_err(|err| SshError::Channel(err.to_string()))?;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            let mut exit_status: Option<u32> = None;
+            await_channel_reply(&mut channel, "exec request", |data| {
+                stdout.extend_from_slice(data);
+            })
+            .await?;
+
+            while let Some(msg) = channel.wait().await {
+                match msg {
+                    ChannelMsg::Data { data } => stdout.extend_from_slice(&data),
+                    ChannelMsg::ExtendedData { data, ext } => {
+                        if ext == 1 {
+                            stderr.extend_from_slice(&data);
+                        } else {
+                            stdout.extend_from_slice(&data);
+                        }
+                    }
+                    ChannelMsg::ExitStatus { exit_status: code } => exit_status = Some(code),
+                    ChannelMsg::Eof => {
+                        if exit_status.is_some() {
+                            break;
+                        }
+                    }
+                    ChannelMsg::Close => break,
+                    _ => {}
+                }
+            }
+            let _ = channel.close().await;
+            Ok((exit_status, stdout, stderr))
+        };
+        match tokio::time::timeout(timeout, fut).await {
+            Ok(inner) => inner,
+            Err(_) => Err(SshError::Channel("exec command timed out".to_string())),
+        }
+    }
+
+    /// Collects live remote server stats (`CPU`, `RAM`, `DISK`, `NET`) over an `exec` channel.
+    pub async fn collect_server_stats(
+        &self,
+        collector: &mut ServerStatsCollector,
+        timeout: Duration,
+    ) -> Result<ServerStatsSnapshot, SshError> {
+        let (_status, stdout, _stderr) =
+            self.exec_command(POSIX_SERVER_STATS_COMMAND, timeout).await?;
+        let text = String::from_utf8_lossy(&stdout);
+        let raw = parse_raw_server_stats(&text).map_err(SshError::Channel)?;
+        Ok(collector.update(raw, std::time::Instant::now()))
     }
 
     /// Sends an SSH `SSH_MSG_DISCONNECT` cleanly without consuming the shared transport handle,
@@ -726,7 +954,7 @@ impl SshTransport {
     }
 }
 
-fn apply_tcp_keepalive(tcp: &TcpStream, settings: TcpKeepaliveSettings) {
+pub(crate) fn apply_tcp_keepalive(tcp: &TcpStream, settings: TcpKeepaliveSettings) {
     let mut keepalive = TcpKeepalive::new().with_time(settings.interval);
     #[cfg(not(any(
         target_os = "openbsd",
@@ -798,6 +1026,44 @@ where
                 )));
             }
             Some(_) => {}
+        }
+    }
+}
+
+pub(crate) async fn request_channel_forwarding(
+    tx: &russh::ChannelWriteHalf<client::Msg>,
+    rx: &mut russh::ChannelReadHalf,
+    forward_agent: bool,
+    x11_auth: Option<&X11AuthInfo>,
+    on_data: &mut (dyn FnMut(&[u8]) + Send),
+) {
+    if forward_agent {
+        match tx.agent_forward(true).await {
+            Ok(()) => {
+                if let Err(err) = await_channel_reply(rx, "agent forwarding", |d| on_data(d)).await
+                {
+                    warn!(error = %err, "remote SSH server declined agent forwarding");
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "failed sending agent forwarding request");
+            }
+        }
+    }
+
+    if let Some(x11) = x11_auth {
+        match tx
+            .request_x11(true, false, &x11.protocol, &x11.cookie_hex, x11.screen)
+            .await
+        {
+            Ok(()) => {
+                if let Err(err) = await_channel_reply(rx, "X11 forwarding", |d| on_data(d)).await {
+                    warn!(error = %err, "remote SSH server declined X11 forwarding");
+                }
+            }
+            Err(err) => {
+                warn!(error = %err, "failed sending X11 forwarding request");
+            }
         }
     }
 }

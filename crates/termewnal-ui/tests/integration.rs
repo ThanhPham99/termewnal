@@ -24,5 +24,11 @@ mod ssh_session_ui;
 mod tabby_ui_ux;
 #[path = "suite/tunnels_ui.rs"]
 mod tunnels_ui;
+#[path = "suite/v2_protocols_collections_and_sync.rs"]
+mod v2_protocols_collections_and_sync;
+#[path = "suite/v2_quake_tray_and_cli.rs"]
+mod v2_quake_tray_and_cli;
+#[path = "suite/v2_ux_keybindings_tabs_and_menu.rs"]
+mod v2_ux_keybindings_tabs_and_menu;
 #[path = "suite/workspace_tree.rs"]
 mod workspace_tree;

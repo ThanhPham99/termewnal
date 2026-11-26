@@ -31,6 +31,8 @@ fn layout_round_trip_preserves_windows_tabs_nested_splits_and_session_descriptor
                 tabs: vec![
                     TabLayout {
                         title: Some("Dev".to_string()),
+                        color: None,
+                        pinned: false,
                         focused_pane: 1,
                         zoomed_pane: Some(1),
                         root: LayoutSplitNode::Split {
@@ -70,6 +72,8 @@ fn layout_round_trip_preserves_windows_tabs_nested_splits_and_session_descriptor
                     },
                     TabLayout {
                         title: None,
+                        color: None,
+                        pinned: false,
                         focused_pane: 0,
                         zoomed_pane: None,
                         root: LayoutSplitNode::Leaf {
@@ -91,6 +95,8 @@ fn layout_round_trip_preserves_windows_tabs_nested_splits_and_session_descriptor
                 active_tab: 0,
                 tabs: vec![TabLayout {
                     title: Some("Logs".to_string()),
+                    color: None,
+                    pinned: false,
                     focused_pane: 0,
                     zoomed_pane: None,
                     root: LayoutSplitNode::Leaf {
@@ -161,4 +167,74 @@ fn profile_auto_connect_on_startup_defaults_false_and_round_trips_in_profiles_to
     let reloaded = load_profiles(&paths).expect("reload profiles");
     assert!(!reloaded.profiles[0].auto_connect_on_startup());
     assert!(reloaded.profiles[1].auto_connect_on_startup());
+}
+
+#[test]
+fn sftp_state_round_trip_records_normalizes_and_removes_profiles() {
+    let temp = TempDir::new().expect("create temp root");
+    let paths = ConfigPaths::from_root(temp.path());
+
+    let mut state = termewnal_core::load_sftp_state(&paths).expect("load missing sftp_state.toml");
+    assert_eq!(state.schema_version, CURRENT_SCHEMA_VERSION);
+    assert!(state.last_profile_dirs.is_empty());
+    assert_eq!(
+        paths.sftp_state_file().file_name().and_then(|n| n.to_str()),
+        Some("sftp_state.toml")
+    );
+
+    assert!(!state.record_dir("", "/var/www"));
+    assert!(!state.record_dir("p1", "   "));
+    assert!(state.record_dir("p1", " /var/www/app "));
+    assert!(!state.record_dir("p1", "/var/www/app"));
+    assert!(state.record_dir("p2", "/etc/nginx"));
+    assert_eq!(state.last_dir("p1"), Some("/var/www/app"));
+    assert_eq!(state.last_dir("p2"), Some("/etc/nginx"));
+
+    termewnal_core::save_sftp_state(&paths, &state).expect("save sftp_state v1");
+    let reloaded = termewnal_core::load_sftp_state(&paths).expect("reload sftp_state");
+    assert_eq!(reloaded, state);
+
+    assert!(state.remove_profile("p1"));
+    assert!(!state.remove_profile("p1"));
+    termewnal_core::save_sftp_state(&paths, &state).expect("save sftp_state v2");
+    assert!(backup_path(&paths.sftp_state_file(), 1).is_file());
+    let reloaded_v2 = termewnal_core::load_sftp_state(&paths).expect("reload v2");
+    assert_eq!(reloaded_v2.last_dir("p1"), None);
+    assert_eq!(reloaded_v2.last_dir("p2"), Some("/etc/nginx"));
+}
+
+#[test]
+fn sftp_state_bookmarks_persist_toggle_and_remove_with_profile() {
+    let temp = TempDir::new().expect("create temp root");
+    let paths = ConfigPaths::from_root(temp.path());
+
+    let mut state = termewnal_core::load_sftp_state(&paths).expect("load empty sftp state");
+    assert!(state.local_bookmarks().is_empty());
+
+    assert!(state.toggle_local_bookmark(" /home/user/projects "));
+    assert!(state.toggle_local_bookmark("/tmp/logs"));
+    assert_eq!(
+        state.local_bookmarks(),
+        &["/home/user/projects".to_string(), "/tmp/logs".to_string()]
+    );
+    assert!(!state.toggle_local_bookmark("/home/user/projects"));
+    assert_eq!(state.local_bookmarks(), &["/tmp/logs".to_string()]);
+
+    assert!(state.toggle_remote_bookmark("p1", " /var/www/app "));
+    assert!(state.toggle_remote_bookmark("p1", "/etc/nginx"));
+    assert!(state.toggle_remote_bookmark("p2", "/opt/data"));
+    assert_eq!(
+        state.remote_bookmarks("p1"),
+        &["/var/www/app".to_string(), "/etc/nginx".to_string()]
+    );
+
+    termewnal_core::save_sftp_state(&paths, &state).expect("save sftp bookmarks");
+    let reloaded = termewnal_core::load_sftp_state(&paths).expect("reload sftp bookmarks");
+    assert_eq!(reloaded, state);
+
+    let mut cleaned = reloaded;
+    assert!(cleaned.remove_profile("p1"));
+    assert!(cleaned.remote_bookmarks("p1").is_empty());
+    assert_eq!(cleaned.remote_bookmarks("p2"), &["/opt/data".to_string()]);
+    assert_eq!(cleaned.local_bookmarks(), &["/tmp/logs".to_string()]);
 }

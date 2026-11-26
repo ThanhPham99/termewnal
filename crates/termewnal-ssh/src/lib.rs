@@ -5,12 +5,16 @@ pub mod client;
 mod dir_transfer;
 pub mod error;
 pub mod known_hosts;
+pub mod proxy_cmd;
 pub mod proxy_jump;
+pub mod proxy_net;
+pub mod server_stats;
 pub mod session;
 pub mod sftp;
 pub mod supervisor;
 pub mod transfer;
 pub mod tunnel;
+pub mod x11;
 
 pub use auth::{
     AgentConnector, AuthOutcome, BoxFuture, BoxedAgentClient, HostKeyDecision, HostKeyPrompt,
@@ -27,14 +31,18 @@ pub use known_hosts::{
     record_known_host_path, verify_known_host, verify_known_host_path,
 };
 pub use proxy_jump::{JumpHopSpec, SshTransportChain, connect_transport_chain, resolve_proxy_jump_hops};
+pub use server_stats::{
+    POSIX_SERVER_STATS_COMMAND, RawServerStatsSample, ServerStatsCollector, ServerStatsSnapshot,
+    parse_raw_server_stats,
+};
 pub use session::SshSession;
 pub use sftp::{
     AcquiredSftpSession, DEFAULT_SFTP_MAX_CONCURRENT_READS, DEFAULT_SFTP_MAX_CONCURRENT_WRITES,
     DEFAULT_SFTP_MAX_PACKET_LEN, DEFAULT_SFTP_MAX_WRITE_PACKET_LEN,
     DEFAULT_SFTP_REQUEST_TIMEOUT_SECS, ProfileTransportKey, RemoteDirEntry, RemoteEntryKind,
     RemoteListing, SftpChannelRole, SftpEndpoint, SftpManager, SftpStatusNotice, SftpTransportMode,
-    TransferTransportPool, join_remote_path, open_sftp_session, parent_remote_path,
-    pipelined_sftp_client_config, validate_remote_entry_name,
+    SftpTransportStatus, TransferTransportPool, join_remote_path, open_sftp_session,
+    parent_remote_path, pipelined_sftp_client_config, validate_remote_entry_name,
 };
 pub use supervisor::{
     ConnectionSupervisor, DEFAULT_BACKOFF_MAX, DEFAULT_BACKOFF_MIN, DEFAULT_WAKE_PROBE_TIMEOUT,
@@ -47,8 +55,9 @@ pub use transfer::{
     DEFAULT_MAX_TRANSPORT_RETRIES, DEFAULT_RECONNECT_RETRY_DELAY, DEFAULT_TRANSFER_CHUNK_SIZE,
     DirectTransferHook, DirectoryTransferSummary, DownloadTargetPlan, ResilientTransferHook,
     TransferConflict, TransferDirection, TransferExecutorHook, TransferId, TransferNotice,
-    TransferQueue, TransferQueueConfig, TransferQueueSnapshot, TransferSnapshot, TransferStatus,
-    UploadPlanOptions, UploadTargetPlan, disambiguate_filename, part_path_for,
+    TransferQueue, TransferQueueConfig, TransferQueueSnapshot, TransferReconnectState,
+    TransferSnapshot, TransferStatus, UploadPlanOptions, UploadTargetPlan, disambiguate_filename,
+    part_path_for,
 };
 pub use tunnel::{
     DEFAULT_TUNNEL_HOLD_GRACE, RemoteForwardBackoffConfig, StandaloneTransportSpec, TunnelManager,

@@ -1,14 +1,16 @@
 use iced::widget::{
-    Id, button, column, container, row, rule, scrollable, space, text, text_input,
+    Id, button, column, container, row, scrollable, space, text, text_input,
 };
-use iced::{Alignment, Background, Border, Color, Element, Length, Theme};
+use iced::{Alignment, Background, Color, Element, Length, Theme};
 use termewnal_core::{Profile, ProfileTarget, ThemePalette};
 
 use crate::app::{LaunchDisposition, Message, SessionId, default_os_username};
 use crate::sidebar::{ActiveTunnelEntry, SystemSshProfile, profile_target_summary};
 use crate::ui_theme::{
-    ChromePalette, PillTone, badge_pill, keycap_pill, modal_card_style, modal_overlay,
-    pill_button_style, styled_input_style,
+    ChromePalette, FONT_BODY, FONT_META, FONT_SUBHEAD, PillTone, hairline_h, keycap_pill,
+    list_row_button_style, modal_body_height, modal_card_style, modal_overlay, modal_width,
+    mono_font, pill_button_style, styled_input_style, tab_bar_button_style,
+    tabby_scrollable_style, ui_font_medium,
 };
 use crate::workspace::SplitAxis;
 
@@ -136,6 +138,11 @@ fn parse_valid_port(raw: &str) -> Option<u16> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteAction {
     NewTab,
+    DuplicateTab,
+    RenameTab,
+    ClearTerminal,
+    SaveScrollback,
+    ToggleSessionLogging,
     SplitPane(SplitAxis),
     TogglePaneZoom,
     ToggleBroadcastInput,
@@ -144,6 +151,7 @@ pub enum PaletteAction {
     CloseFocusedPane,
     OpenSettings,
     OpenNewProfile,
+    CreateProfileGroup,
     OpenQuickConnectPrompt,
     OpenTabbyImporter,
     OpenTunnelCreator,
@@ -161,6 +169,11 @@ pub enum PaletteAction {
         disposition: LaunchDisposition,
     },
     ToggleTunnel(String),
+    OpenQuickCommands,
+    OpenWorkspaces,
+    OpenProtocolLauncher,
+    TriggerZmodemSend,
+    RunQuickCommand(String),
 }
 
 /// Lightweight active `Session` summary supplied to the Command Palette switcher.
@@ -389,7 +402,45 @@ impl CommandPaletteState {
         tunnels: &[ActiveTunnelEntry],
         can_lock_vault: bool,
     ) -> Vec<PaletteItem> {
+        self.filtered_items_with_quick_commands(
+            profiles,
+            sessions,
+            system_ssh,
+            tunnels,
+            &[],
+            can_lock_vault,
+        )
+    }
+
+    /// Builds and fuzzy-filters Command Palette items including saved `QuickCommand` snippets.
+    pub fn filtered_items_with_quick_commands(
+        &self,
+        profiles: &[Profile],
+        sessions: &[PaletteSessionEntry],
+        system_ssh: &[SystemSshProfile],
+        tunnels: &[ActiveTunnelEntry],
+        quick_commands: &[termewnal_core::QuickCommand],
+        can_lock_vault: bool,
+    ) -> Vec<PaletteItem> {
         let mut base_items = workspace_command_items();
+        for qc in quick_commands {
+            let group_desc = qc.group.as_deref().unwrap_or("Snippet");
+            base_items.push(PaletteItem {
+                id: format!("qcmd:{}", qc.id),
+                category: PaletteCategory::Command,
+                title: format!("Run Quick Command: {}", qc.name),
+                subtitle: format!("{group_desc} · {}", qc.command),
+                keywords: vec![
+                    "quick".to_string(),
+                    "command".to_string(),
+                    qc.name.clone(),
+                    qc.command.clone(),
+                    group_desc.to_string(),
+                ],
+                shortcut: None,
+                action: PaletteAction::RunQuickCommand(qc.id.clone()),
+            });
+        }
         if can_lock_vault {
             base_items.push(PaletteItem {
                 id: "cmd:lock-vault".to_string(),
@@ -430,6 +481,9 @@ impl CommandPaletteState {
             let kind = match profile.target {
                 ProfileTarget::LocalShell { .. } => "Local",
                 ProfileTarget::Ssh { .. } => "SSH",
+                ProfileTarget::Serial { .. } => "Serial",
+                ProfileTarget::Telnet { .. } => "Telnet",
+                ProfileTarget::Docker { .. } => "Docker",
             };
             let group_label = profile.group.as_deref().unwrap_or("Ungrouped");
             let mut keywords = vec![
@@ -595,6 +649,21 @@ fn workspace_command_items() -> Vec<PaletteItem> {
             action: PaletteAction::OpenNewProfile,
         },
         PaletteItem {
+            id: "cmd:create-profile-group".to_string(),
+            category: PaletteCategory::Command,
+            title: "New Profile Group...".to_string(),
+            subtitle: "Create a group in the Profiles sidebar and save to profiles.toml".to_string(),
+            keywords: vec![
+                "group".to_string(),
+                "folder".to_string(),
+                "profile".to_string(),
+                "new".to_string(),
+                "sidebar".to_string(),
+            ],
+            shortcut: None,
+            action: PaletteAction::CreateProfileGroup,
+        },
+        PaletteItem {
             id: "cmd:probe-reconnect-all".to_string(),
             category: PaletteCategory::Command,
             title: "Probe / Reconnect All SSH Sessions".to_string(),
@@ -650,6 +719,55 @@ fn workspace_command_items() -> Vec<PaletteItem> {
             action: PaletteAction::NewTab,
         },
         PaletteItem {
+            id: "cmd:duplicate-tab".to_string(),
+            category: PaletteCategory::Command,
+            title: "Duplicate Active Tab".to_string(),
+            subtitle: "Open a copy of the active Local or SSH tab next to the current tab"
+                .to_string(),
+            keywords: vec!["tab".to_string(), "duplicate".to_string(), "clone".to_string()],
+            shortcut: Some("Ctrl+Shift+N".to_string()),
+            action: PaletteAction::DuplicateTab,
+        },
+        PaletteItem {
+            id: "cmd:rename-tab".to_string(),
+            category: PaletteCategory::Command,
+            title: "Rename Active Tab...".to_string(),
+            subtitle: "Assign a custom title to the active workspace tab".to_string(),
+            keywords: vec!["tab".to_string(), "rename".to_string(), "title".to_string()],
+            shortcut: Some("Ctrl+Shift+R".to_string()),
+            action: PaletteAction::RenameTab,
+        },
+        PaletteItem {
+            id: "cmd:clear-terminal".to_string(),
+            category: PaletteCategory::Command,
+            title: "Clear Terminal & Scrollback".to_string(),
+            subtitle: "Erase visible rows and scrollback history in the active session"
+                .to_string(),
+            keywords: vec!["clear".to_string(), "reset".to_string(), "scrollback".to_string()],
+            shortcut: Some("Ctrl+Shift+L".to_string()),
+            action: PaletteAction::ClearTerminal,
+        },
+        PaletteItem {
+            id: "cmd:save-scrollback".to_string(),
+            category: PaletteCategory::Command,
+            title: "Save Scrollback to File".to_string(),
+            subtitle: "Export current terminal buffer and scrollback text to a log file"
+                .to_string(),
+            keywords: vec!["save".to_string(), "export".to_string(), "scrollback".to_string()],
+            shortcut: None,
+            action: PaletteAction::SaveScrollback,
+        },
+        PaletteItem {
+            id: "cmd:toggle-logging".to_string(),
+            category: PaletteCategory::Command,
+            title: "Toggle Session Output Logging".to_string(),
+            subtitle: "Start or stop streaming active session output to a log file"
+                .to_string(),
+            keywords: vec!["log".to_string(), "record".to_string(), "transcript".to_string()],
+            shortcut: None,
+            action: PaletteAction::ToggleSessionLogging,
+        },
+        PaletteItem {
             id: "cmd:split-vertical".to_string(),
             category: PaletteCategory::Command,
             title: "Split Pane Vertically".to_string(),
@@ -690,19 +808,6 @@ fn workspace_command_items() -> Vec<PaletteItem> {
             action: PaletteAction::ToggleBroadcastInput,
         },
         PaletteItem {
-            id: "cmd:toggle-sidebar".to_string(),
-            category: PaletteCategory::Command,
-            title: "Toggle Left Sidebar".to_string(),
-            subtitle: "Show or collapse Profiles, System SSH, and Tunnels sidebar".to_string(),
-            keywords: vec![
-                "sidebar".to_string(),
-                "profiles".to_string(),
-                "tunnels".to_string(),
-            ],
-            shortcut: Some("Ctrl+B".to_string()),
-            action: PaletteAction::ToggleSidebar,
-        },
-        PaletteItem {
             id: "cmd:toggle-sftp-drawer".to_string(),
             category: PaletteCategory::Command,
             title: "Toggle SFTP Browser & Transfers".to_string(),
@@ -733,6 +838,58 @@ fn workspace_command_items() -> Vec<PaletteItem> {
             action: PaletteAction::OpenTunnelCreator,
         },
         PaletteItem {
+            id: "cmd:quick-commands".to_string(),
+            category: PaletteCategory::Command,
+            title: "Quick Commands...".to_string(),
+            subtitle: "Manage and execute reusable command snippets (focused or broadcast)"
+                .to_string(),
+            keywords: vec![
+                "quick".to_string(),
+                "commands".to_string(),
+                "snippets".to_string(),
+                "macros".to_string(),
+            ],
+            shortcut: Some("Ctrl+Shift+Q".to_string()),
+            action: PaletteAction::OpenQuickCommands,
+        },
+        PaletteItem {
+            id: "cmd:named-workspaces".to_string(),
+            category: PaletteCategory::Command,
+            title: "Named Workspaces...".to_string(),
+            subtitle: "Save or launch multi-tab split layouts from workspaces.toml".to_string(),
+            keywords: vec![
+                "workspace".to_string(),
+                "template".to_string(),
+                "layout".to_string(),
+            ],
+            shortcut: Some("Ctrl+Shift+M".to_string()),
+            action: PaletteAction::OpenWorkspaces,
+        },
+        PaletteItem {
+            id: "cmd:protocol-launcher".to_string(),
+            category: PaletteCategory::Command,
+            title: "Containers, Serial & Telnet...".to_string(),
+            subtitle: "Attach Docker/Podman containers, serial ports, or Telnet hosts".to_string(),
+            keywords: vec![
+                "docker".to_string(),
+                "podman".to_string(),
+                "serial".to_string(),
+                "telnet".to_string(),
+                "container".to_string(),
+            ],
+            shortcut: None,
+            action: PaletteAction::OpenProtocolLauncher,
+        },
+        PaletteItem {
+            id: "cmd:zmodem-send".to_string(),
+            category: PaletteCategory::Command,
+            title: "Zmodem Send File (rz)...".to_string(),
+            subtitle: "Transmit a local file over active terminal stream via Zmodem".to_string(),
+            keywords: vec!["zmodem".to_string(), "rz".to_string(), "sz".to_string()],
+            shortcut: None,
+            action: PaletteAction::TriggerZmodemSend,
+        },
+        PaletteItem {
             id: "cmd:close-pane".to_string(),
             category: PaletteCategory::Command,
             title: "Close Focused Pane".to_string(),
@@ -751,59 +908,66 @@ pub fn render_command_palette<'a>(
     last_error: Option<&'a str>,
     terminal_palette: &ThemePalette,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
+    render_command_palette_responsive(palette, items, last_error, terminal_palette, 1280.0, 800.0)
+}
+
+/// Renders the Spotlight-style Command Palette clamped responsively inside `window_width` x `window_height`.
+pub fn render_command_palette_responsive<'a>(
+    palette: &'a CommandPaletteState,
+    items: Vec<PaletteItem>,
+    last_error: Option<&'a str>,
+    terminal_palette: &ThemePalette,
+    window_width: f32,
+    window_height: f32,
+) -> Element<'a, Message, Theme, iced::Renderer> {
     let chrome = ChromePalette::from_palette(terminal_palette);
+    let card_w = modal_width(PALETTE_MAX_WIDTH, window_width);
+    let list_h = modal_body_height(PALETTE_LIST_MAX_HEIGHT, window_height, 220.0);
+    let top_pad = if window_height < 580.0 { 20.0 } else { 56.0 };
     let card_content: Element<'a, Message, Theme, iced::Renderer> = match palette.mode() {
-        CommandPaletteMode::Search => render_search_mode(palette, items, chrome),
+        CommandPaletteMode::Search => render_search_mode(palette, items, chrome, list_h, card_w),
         CommandPaletteMode::QuickConnect => render_quick_connect_mode(palette, last_error, chrome),
     };
 
     let card = container(card_content)
-        .width(Length::Fixed(PALETTE_MAX_WIDTH))
-        .padding(14)
+        .width(Length::Fixed(card_w))
         .style(move |_theme: &Theme| modal_card_style(chrome, true));
 
-    modal_overlay(card.into(), Some(Message::CloseCommandPalette), 64.0)
-}
-
-fn category_pill_colors(category: PaletteCategory, chrome: ChromePalette) -> (Color, Color) {
-    match category {
-        PaletteCategory::QuickConnect | PaletteCategory::Profile => {
-            (chrome.accent, chrome.accent_soft)
-        }
-        PaletteCategory::Session => (chrome.success, chrome.success_soft),
-        PaletteCategory::Tunnel => (chrome.warning, chrome.warning_soft),
-        PaletteCategory::Command | PaletteCategory::SystemSsh => {
-            (chrome.text_secondary, chrome.card_hover)
-        }
-    }
+    modal_overlay(card.into(), Some(Message::CloseCommandPalette), top_pad)
 }
 
 fn render_search_mode<'a>(
     palette: &'a CommandPaletteState,
     items: Vec<PaletteItem>,
     chrome: ChromePalette,
+    list_height: f32,
+    card_w: f32,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
-    let header = row![
-        text("Command Palette")
-            .size(14)
-            .color(chrome.text_primary),
-        space::horizontal(),
-        keycap_pill("Ctrl+K", chrome),
-        keycap_pill("Esc", chrome),
-    ]
-    .spacing(6)
-    .align_y(Alignment::Center);
-
-    let input = text_input(
-        "Type command, profile, session, or user@host[:port]...",
-        palette.query(),
+    // Matches Tabby's `selector-modal` (`selectorModal.component.pug`): flush top
+    // filter input + borderless `.list-group-light` rows with selected highlight & ENTER hint.
+    let input = container(
+        text_input(
+            "Type command, profile, session, or user@host[:port]...",
+            palette.query(),
+        )
+        .id(command_palette_input_id())
+        .on_input(Message::CommandPaletteQueryChanged)
+        .on_submit(Message::CommandPaletteConfirm)
+        .size(FONT_SUBHEAD)
+        .padding([10, 14])
+        .style(move |_theme, status| {
+            let mut st = styled_input_style(chrome)(_theme, status);
+            st.background = Background::Color(chrome.bg_more);
+            st.border.color = Color::TRANSPARENT;
+            st.border.width = 0.0;
+            st
+        }),
     )
-    .id(command_palette_input_id())
-    .on_input(Message::CommandPaletteQueryChanged)
-    .on_submit(Message::CommandPaletteConfirm)
-    .size(13)
-    .padding([9, 12])
-    .style(styled_input_style(chrome));
+    .width(Length::Fill)
+    .style(move |_| container::Style {
+        background: Some(Background::Color(chrome.bg_more)),
+        ..Default::default()
+    });
 
     let selected = if items.is_empty() {
         0
@@ -811,110 +975,140 @@ fn render_search_mode<'a>(
         palette.selected_index().min(items.len() - 1)
     };
 
-    let mut list_col = column![].spacing(4);
+    let mut list_col = column![].spacing(0);
     if items.is_empty() {
         list_col = list_col.push(
             container(
                 text("No matching commands, profiles, or sessions")
-                    .size(12)
+                    .size(FONT_BODY)
                     .color(chrome.text_muted),
             )
-            .padding([16, 10]),
+            .padding([18, 16]),
         );
     } else {
+        let total = items.len();
         for (idx, item) in items.into_iter().enumerate() {
             let is_selected = idx == selected;
             let badge_label = item.category.badge();
-            let (badge_fg, badge_bg) = category_pill_colors(item.category, chrome);
             let shortcut_text = item.shortcut.clone().unwrap_or_default();
             let split_profile_id = match &item.action {
                 PaletteAction::LaunchProfile { profile_id, .. } => Some(profile_id.clone()),
                 _ => None,
             };
 
-            let accent_bar = container(space::horizontal().width(3).height(26)).style(move |_| {
-                container::Style {
-                    background: Some(Background::Color(if is_selected {
+            let title_row = row![
+                text(item.title)
+                    .size(FONT_BODY)
+                    .font(if is_selected {
+                        ui_font_medium()
+                    } else {
+                        crate::ui_theme::ui_font()
+                    })
+                    .color(if is_selected {
+                        chrome.text_emphasis
+                    } else {
+                        chrome.text_primary
+                    }),
+                text(badge_label)
+                    .size(FONT_META)
+                    .font(mono_font())
+                    .color(if is_selected {
                         chrome.accent
                     } else {
-                        Color::TRANSPARENT
-                    })),
-                    border: Border {
-                        radius: 2.0.into(),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                }
-            });
-
-            let title_row = row![
-                badge_pill(badge_label, badge_fg, badge_bg, Color::TRANSPARENT),
-                text(item.title)
-                    .size(13)
-                    .color(if is_selected {
-                        chrome.text_primary
-                    } else {
-                        chrome.text_secondary
+                        chrome.text_muted
                     }),
             ]
             .spacing(8)
-            .align_y(Alignment::Center);
+            .align_y(Alignment::Center)
+            .wrap()
+            .vertical_spacing(2);
 
             let text_col = column![
                 title_row,
-                text(item.subtitle).size(11).color(chrome.text_muted),
+                text(item.subtitle)
+                    .size(FONT_META)
+                    .font(mono_font())
+                    .color(chrome.text_muted),
             ]
-            .spacing(3)
+            .spacing(2)
             .width(Length::Fill);
 
-            let mut row_items = row![accent_bar, text_col]
-                .spacing(8)
-                .align_y(Alignment::Center);
+            let mut row_items = row![text_col].spacing(8).align_y(Alignment::Center);
             if !shortcut_text.is_empty() {
                 row_items = row_items.push(keycap_pill(shortcut_text, chrome));
             }
+            if is_selected && card_w >= 460.0 {
+                row_items = row_items.push(keycap_pill("ENTER", chrome));
+            }
 
             let main_btn = button(row_items)
-                .padding([7, 10])
+                .padding([8, 14])
                 .width(Length::Fill)
-                .style(pill_button_style(
-                    chrome,
-                    if is_selected {
-                        PillTone::ActiveAccent
-                    } else {
-                        PillTone::Ghost
-                    },
-                ))
+                .style(list_row_button_style(chrome, is_selected))
                 .on_press(Message::CommandPaletteExecuteItem(item.action));
 
             if let Some(pid) = split_profile_id {
-                let split_btn = button(text("Split V").size(11))
-                    .padding([7, 10])
-                    .style(pill_button_style(chrome, PillTone::Subtle))
+                let split_btn = button(text("Split |").size(FONT_META))
+                    .padding([6, 8])
+                    .style(tab_bar_button_style(chrome, false, false))
                     .on_press(Message::LaunchProfile {
                         profile_id: pid,
                         disposition: LaunchDisposition::Split(SplitAxis::Vertical),
                     });
                 list_col = list_col.push(
                     row![main_btn, split_btn]
-                        .spacing(6)
+                        .spacing(4)
+                        .padding(iced::Padding {
+                            top: 0.0,
+                            right: 8.0,
+                            bottom: 0.0,
+                            left: 0.0,
+                        })
                         .align_y(Alignment::Center),
                 );
             } else {
                 list_col = list_col.push(main_btn);
             }
+
+            if idx + 1 < total {
+                list_col = list_col.push(hairline_h(chrome));
+            }
         }
     }
 
+    let footer_hint = container(
+        row![
+            keycap_pill("↑/↓", chrome),
+            text("Navigate").size(FONT_META).color(chrome.text_muted),
+            keycap_pill("Enter", chrome),
+            text("Select").size(FONT_META).color(chrome.text_muted),
+            space::horizontal(),
+            keycap_pill("Esc", chrome),
+            text("Close").size(FONT_META).color(chrome.text_muted),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center)
+        .wrap()
+        .vertical_spacing(4),
+    )
+    .width(Length::Fill)
+    .padding([7, 14])
+    .style(move |_| container::Style {
+        background: Some(Background::Color(chrome.bg_more)),
+        ..Default::default()
+    });
+
     column![
-        header,
         input,
-        rule::horizontal(1),
+        hairline_h(chrome),
         scrollable(list_col)
+            .style(tabby_scrollable_style(chrome))
             .width(Length::Fill)
-            .height(Length::Fixed(PALETTE_LIST_MAX_HEIGHT)),
+            .height(Length::Fixed(list_height)),
+        hairline_h(chrome),
+        footer_hint,
     ]
-    .spacing(10)
+    .spacing(0)
     .into()
 }
 
@@ -934,26 +1128,29 @@ fn render_quick_connect_mode<'a>(
 
     let header = row![
         text("Quick Connect (SSH)")
-            .size(14)
+            .size(FONT_SUBHEAD)
+            .font(ui_font_medium())
             .color(chrome.text_primary),
         space::horizontal(),
-        button(text("Back").size(11))
-            .padding([4, 10])
-            .style(pill_button_style(chrome, PillTone::Subtle))
+        button(text("Back").size(FONT_META))
+            .padding([4, 9])
+            .style(tab_bar_button_style(chrome, false, false))
             .on_press(Message::CommandPaletteExitQuickConnect),
     ]
+    .spacing(8)
     .align_y(Alignment::Center);
 
     let input = text_input("alice@10.0.0.5:2222", palette.quick_connect_input())
         .id(quick_connect_input_id())
         .on_input(Message::CommandPaletteQuickConnectInputChanged)
         .on_submit(Message::CommandPaletteConfirm)
-        .size(13)
-        .padding([9, 12])
+        .font(mono_font())
+        .size(FONT_SUBHEAD)
+        .padding([8, 12])
         .style(styled_input_style(chrome));
 
-    let mut connect_btn = button(text("Connect").size(12))
-        .padding([6, 14])
+    let mut connect_btn = button(text("Connect").size(FONT_BODY).font(ui_font_medium()))
+        .padding([6, 16])
         .style(pill_button_style(chrome, PillTone::Primary));
     if let Some(target) = parsed {
         connect_btn = connect_btn.on_press(Message::QuickConnect(target));
@@ -961,18 +1158,26 @@ fn render_quick_connect_mode<'a>(
 
     let mut col = column![
         header,
+        hairline_h(chrome),
         input,
         row![
-            text(preview).size(12).color(preview_color),
-            space::horizontal(),
+            text(preview)
+                .size(FONT_META)
+                .font(mono_font())
+                .color(preview_color)
+                .width(Length::Fill),
             connect_btn,
         ]
-        .align_y(Alignment::Center),
+        .spacing(8)
+        .align_y(Alignment::Center)
+        .wrap()
+        .vertical_spacing(6),
     ]
-    .spacing(10);
+    .spacing(10)
+    .padding(16);
 
     if let Some(err) = last_error {
-        col = col.push(text(err).size(11).color(chrome.danger));
+        col = col.push(text(err).size(FONT_BODY).color(chrome.danger));
     }
 
     col.into()

@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/termewnal-core",
+    "crates/termewnal-protocols",
     "crates/termewnal-pty",
     "crates/termewnal-ssh",
     "crates/termewnal-ui",
@@ -17,6 +18,7 @@ aes-gcm = { version = "0.11", features = ["zeroize"] }
 alacritty_terminal = "0.26"
 arboard = { version = "3.7", features = ["wayland-data-control"] }
 argon2 = { version = "0.6", features = ["zeroize"] }
+base64 = "0.22"
 chrono = "0.4"
 data-encoding = "2.3"
 directories = "6.0"
@@ -32,9 +34,12 @@ open = "5.4"
 portable-pty = "0.9"
 rand = "0.10"
 regex = "1.13"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 russh = "0.65.4"
 russh-sftp = "4.0.0"
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serial2 = "0.2"
 sha1 = "0.11"
 socket2 = "0.6"
 ssh2-config = "0.9"
@@ -44,6 +49,8 @@ tokio = { version = "1.54", features = ["full"] }
 toml = "1.2"
 tracing = "0.1"
 uuid = { version = "1.29", features = ["v4", "serde"] }
+x11rb = "0.13"
+zbus = "5.19"
 zeroize = { version = "1.9", features = ["derive"] }
 
 [profile.dev]

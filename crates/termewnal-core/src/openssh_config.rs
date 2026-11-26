@@ -23,6 +23,8 @@ pub struct OpenSshHost {
     pub identity_files: Vec<PathBuf>,
     pub proxy_jump: Vec<String>,
     pub forward_agent: Option<bool>,
+    pub forward_x11: Option<bool>,
+    pub proxy_command: Option<String>,
 }
 
 impl OpenSshHost {
@@ -89,6 +91,17 @@ pub fn parse_openssh_config_file(
             let params = parsed.query(&alias);
             let identity_files = deduplicate_paths(params.identity_file.unwrap_or_default());
             let proxy_jump = clean_proxy_jump(params.proxy_jump);
+            let forward_x11 = lookup_ssh_bool_field(
+                &params.unsupported_fields,
+                &params.ignored_fields,
+                "forwardx11",
+            );
+            let proxy_command = lookup_ssh_string_field(
+                &params.unsupported_fields,
+                &params.ignored_fields,
+                "proxycommand",
+            )
+            .filter(|cmd| !cmd.eq_ignore_ascii_case("none"));
 
             hosts.push(OpenSshHost {
                 alias,
@@ -98,6 +111,8 @@ pub fn parse_openssh_config_file(
                 identity_files,
                 proxy_jump,
                 forward_agent: params.forward_agent,
+                forward_x11,
+                proxy_command,
             });
         }
     }
@@ -180,6 +195,42 @@ fn clean_proxy_jump(raw: Option<Vec<String>>) -> Vec<String> {
     cleaned
 }
 
+fn lookup_ssh_string_field(
+    unsupported: &std::collections::HashMap<String, Vec<String>>,
+    ignored: &std::collections::HashMap<String, Vec<String>>,
+    target_key_lower: &str,
+) -> Option<String> {
+    for map in [unsupported, ignored] {
+        for (k, values) in map {
+            if k.eq_ignore_ascii_case(target_key_lower) {
+                let joined = values
+                    .iter()
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if !joined.is_empty() {
+                    return Some(joined);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn lookup_ssh_bool_field(
+    unsupported: &std::collections::HashMap<String, Vec<String>>,
+    ignored: &std::collections::HashMap<String, Vec<String>>,
+    target_key_lower: &str,
+) -> Option<bool> {
+    let val = lookup_ssh_string_field(unsupported, ignored, target_key_lower)?;
+    match val.trim().to_ascii_lowercase().as_str() {
+        "yes" | "true" | "1" | "on" => Some(true),
+        "no" | "false" | "0" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// Converts a read-only [`OpenSshHost`] entry into a standalone editable [`Profile`].
 ///
 /// Secrets are never read from or written to `~/.ssh/config`.
@@ -211,6 +262,11 @@ pub fn clone_openssh_host_to_profile(host: &OpenSshHost, default_username: &str)
             username,
             auth,
             proxy_jump: host.proxy_jump.clone(),
+            proxy_command: host.proxy_command.clone(),
+            proxy: None,
+            forward_agent: host.forward_agent.unwrap_or(false),
+            forward_x11: host.forward_x11.unwrap_or(false),
+            login_scripts: Vec::new(),
             auto_connect_on_startup: false,
             tmux_reattach: None,
             keepalive_interval_secs: None,

@@ -1,10 +1,12 @@
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-use iced::widget::{button, column, container, opaque, row, rule, space, stack, text};
+use iced::widget::{button, column, container, opaque, row, stack, text};
 use iced::{Alignment, Background, Color, Element, Length, Theme, window};
 use termewnal_core::ThemePalette;
 
-use crate::ui_theme::{ChromePalette, PillTone, modal_card_style, pill_button_style, status_dot};
+use crate::ui_theme::{
+    ChromePalette, PillTone, hairline_h, modal_card_style, pill_button_style, status_dot,
+};
 
 /// Snapshot of active background operations that would be terminated on process exit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -187,13 +189,12 @@ pub fn wrap_with_close_guard_modal<'a, Msg: Clone + 'a>(
             .spacing(8)
             .align_y(Alignment::Center),
             text(summary).size(13).color(chrome.text_secondary),
-            rule::horizontal(1),
+            hairline_h(chrome),
             row![
                 button(text("Cancel").size(12))
                     .padding([6, 12])
                     .style(pill_button_style(chrome, PillTone::Subtle))
                     .on_press(on_cancel),
-                space::horizontal(),
                 button(text("Keep Running in Background").size(12))
                     .padding([6, 12])
                     .style(pill_button_style(chrome, PillTone::Primary))
@@ -204,22 +205,24 @@ pub fn wrap_with_close_guard_modal<'a, Msg: Clone + 'a>(
                     .on_press(on_stop_and_quit),
             ]
             .spacing(8)
-            .align_y(Alignment::Center),
+            .wrap()
+            .vertical_spacing(6),
         ]
         .spacing(12)
         .padding(18),
     )
-    .max_width(540)
+    .max_width(520)
     .style(move |_theme: &Theme| modal_card_style(chrome, true));
 
     let backdrop = opaque(
         container(dialog_card)
             .width(Length::Fill)
             .height(Length::Fill)
+            .padding(16)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
             .style(|_theme: &Theme| container::Style {
-                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.6))),
+                background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.46))),
                 ..Default::default()
             }),
     );
