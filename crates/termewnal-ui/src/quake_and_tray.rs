@@ -1,20 +1,29 @@
 //! Quake drop-down console window geometry, X11 global hotkey listener, and Linux
 //! `org.kde.StatusNotifierItem` (`zbus`) System Tray adapter.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
+#[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
 use iced::window;
 use iced::{Point, Size};
 use termewnal_core::{QuakeConfig, QuakeEdge};
 use tokio::sync::mpsc;
+#[cfg(target_os = "linux")]
 use tracing::{debug, warn};
+#[cfg(target_os = "linux")]
 use x11rb::connection::Connection as X11Connection;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::Event as X11Event;
+#[cfg(target_os = "linux")]
 use x11rb::protocol::xproto::{ConnectionExt as _, GrabMode, Keycode, ModMask};
+#[cfg(target_os = "linux")]
 use zbus::interface;
+#[cfg(target_os = "linux")]
 use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
 const DEFAULT_MONITOR_WIDTH: f32 = 1440.0;
@@ -260,13 +269,43 @@ impl GlobalHotkeyRegistrar for NullGlobalHotkeyRegistrar {
     }
 }
 
+/// Returns the default platform global hotkey registrar.
+pub fn default_global_hotkey_registrar() -> Arc<dyn GlobalHotkeyRegistrar> {
+    #[cfg(target_os = "linux")]
+    {
+        Arc::new(X11GlobalHotkeyRegistrar)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Arc::new(NullGlobalHotkeyRegistrar)
+    }
+}
+
+/// Returns the default platform desktop System Tray adapter.
+pub fn default_system_tray(
+    action_tx: mpsc::UnboundedSender<TrayAction>,
+) -> Arc<dyn SystemTrayAdapter> {
+    #[cfg(target_os = "linux")]
+    {
+        ZbusStatusNotifierItem::spawn(action_tx)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = action_tx;
+        Arc::new(NullSystemTray)
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct X11HotkeyGuard {
     stop: Arc<AtomicBool>,
     handle: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
+#[cfg(target_os = "linux")]
 impl HotkeyRegistrationGuard for X11HotkeyGuard {}
 
+#[cfg(target_os = "linux")]
 impl Drop for X11HotkeyGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::SeqCst);
@@ -282,9 +321,11 @@ impl Drop for X11HotkeyGuard {
 ///
 /// Falls back cleanly (returns `Ok(None)`) when `$DISPLAY` is absent or Wayland/headless
 /// runs without XWayland, allowing compositors or `termewnal --toggle-quake` IPC to toggle Quake.
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 pub struct X11GlobalHotkeyRegistrar;
 
+#[cfg(target_os = "linux")]
 impl GlobalHotkeyRegistrar for X11GlobalHotkeyRegistrar {
     fn register(
         &self,
@@ -549,7 +590,11 @@ impl SystemTrayAdapter for RecordingSystemTray {
     }
 }
 
-struct SniService {
+#[cfg(target_os = "linux")]
+mod linux_sni {
+    use super::*;
+
+    struct SniService {
     snapshot: Arc<Mutex<TrayStateSnapshot>>,
     action_tx: mpsc::UnboundedSender<TrayAction>,
 }
@@ -825,3 +870,7 @@ impl SystemTrayAdapter for ZbusStatusNotifierItem {
             .expect("tray snapshot mutex poisoned") = snapshot;
     }
 }
+}
+
+#[cfg(target_os = "linux")]
+pub use linux_sni::ZbusStatusNotifierItem;

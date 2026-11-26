@@ -1,0 +1,178 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (without leading v, defaults to Cargo.toml version)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-linux:
+    name: Build Linux (x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            pkg-config \
+            dpkg-dev \
+            libx11-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev \
+            libwayland-dev \
+            libfontconfig1-dev \
+            libfreetype-dev \
+            libdbus-1-dev \
+            libssl-dev
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Determine version
+        id: meta
+        shell: bash
+        run: |
+          VER="${{ inputs.version }}"
+          if [[ -z "$VER" && "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF#refs/tags/v}"
+          fi
+          if [[ -z "$VER" ]]; then
+            VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          fi
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+      - name: Run workspace checks & tests
+        run: |
+          cargo check --workspace --all-targets
+          cargo test --workspace
+
+      - name: Build Linux .deb and .tar.gz
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          chmod +x scripts/build-linux.sh
+          ./scripts/build-linux.sh
+
+      - name: Upload Linux release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-artifacts
+          path: |
+            dist/termewnal_${{ steps.meta.outputs.version }}_amd64.deb
+            dist/termewnal-${{ steps.meta.outputs.version }}-linux-x86_64.tar.gz
+
+  build-windows:
+    name: Build Windows (x86_64)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Ensure NSIS is available
+        shell: pwsh
+        run: |
+          if (-not (Get-Command makensis.exe -ErrorAction SilentlyContinue)) {
+            choco install nsis -y
+          }
+
+      - name: Determine version
+        id: meta
+        shell: pwsh
+        run: |
+          $ver = "${{ inputs.version }}"
+          if (-not $ver -and "$env:GITHUB_REF" -like "refs/tags/v*") {
+            $ver = "$env:GITHUB_REF".Substring("refs/tags/v".Length)
+          }
+          if (-not $ver) {
+            $match = Select-String -Path "Cargo.toml" -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+            $ver = $match.Matches[0].Groups[1].Value
+          }
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+
+      - name: Run workspace checks & tests
+        run: |
+          cargo check --workspace --all-targets
+          cargo test --workspace
+
+      - name: Build Windows release binary
+        run: cargo build --release -p termewnal-ui --bin termewnal
+
+      - name: Package Windows NSIS installer and portable ZIP
+        shell: pwsh
+        run: |
+          $ver = "${{ steps.meta.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          $nsisArgs = @(
+            "/DVERSION=$ver",
+            "/DBIN_PATH=..\target\release\termewnal.exe",
+            "/DOUT_FILE=..\dist\termewnal-$ver-windows-x86_64-setup.exe",
+            "scripts\termewnal.nsi"
+          )
+          makensis.exe @nsisArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+          $zipStage = "target\pkg\termewnal-$ver-windows-x86_64"
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue $zipStage
+          New-Item -ItemType Directory -Force -Path $zipStage | Out-Null
+          Copy-Item "target\release\termewnal.exe" "$zipStage\termewnal.exe"
+          Copy-Item "README.md" "$zipStage\README.md"
+          Compress-Archive -Path "$zipStage\*" -DestinationPath "dist\termewnal-$ver-windows-x86_64.zip" -Force
+
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-artifacts
+          path: |
+            dist/termewnal-${{ steps.meta.outputs.version }}-windows-x86_64-setup.exe
+            dist/termewnal-${{ steps.meta.outputs.version }}-windows-x86_64.zip
+
+  publish-release:
+    name: Publish GitHub Release
+    needs: [build-linux, build-windows]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256SUMS.txt
+        run: |
+          cd release-assets
+          sha256sum termewnal* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: release-assets/*

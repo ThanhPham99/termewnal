@@ -9,11 +9,12 @@ use tempfile::TempDir;
 use termewnal_core::{
     AppConfig, ConfigPaths, Profile, ProfilesConfig, QuakeEdge, save_config, save_profiles,
 };
+#[cfg(target_os = "linux")]
+use termewnal_ui::X11GlobalHotkeyRegistrar;
 use termewnal_ui::{
     DaemonLifecycle, GlobalHotkeyRegistrar, HotkeyRegistrationGuard, IpcCommand, LaunchOutcome,
-    Message, QuakeBounds, RecordingSystemTray, TrayAction, X11GlobalHotkeyRegistrar,
-    acquire_or_forward, compute_quake_bounds, parse_cli_launch_command, parse_global_hotkey,
-    quake_window_settings,
+    Message, QuakeBounds, RecordingSystemTray, TrayAction, acquire_or_forward,
+    compute_quake_bounds, parse_cli_launch_command, parse_global_hotkey, quake_window_settings,
 };
 
 use crate::common::boot_test_app;
@@ -176,9 +177,12 @@ fn global_hotkey_parser_mock_guard_and_x11_fallback() {
     assert!(parse_global_hotkey("Ctrl+A+B").is_err());
 
     // X11GlobalHotkeyRegistrar degrades safely without panicking even if DISPLAY is absent/unreachable.
-    let x11 = X11GlobalHotkeyRegistrar;
-    let res = x11.register("Ctrl+Alt+Space", Arc::new(|| {}));
-    assert!(res.is_ok());
+    #[cfg(target_os = "linux")]
+    {
+        let x11 = X11GlobalHotkeyRegistrar;
+        let res = x11.register("Ctrl+Alt+Space", Arc::new(|| {}));
+        assert!(res.is_ok());
+    }
 
     let dir = TempDir::new().unwrap();
     let paths = ConfigPaths::from_root(dir.path().to_path_buf());

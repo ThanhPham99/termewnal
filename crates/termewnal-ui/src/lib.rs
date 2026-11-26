@@ -48,18 +48,23 @@ pub use ipc::{
     IpcCommand, IpcError, IpcServerHandle, LaunchOutcome, acquire_or_forward,
     parse_cli_launch_command, send_command,
 };
+#[cfg(target_os = "linux")]
+pub use notifications::ZbusDesktopNotifier;
 pub use notifications::{
-    DesktopNotifier, NullDesktopNotifier, RecordingDesktopNotifier, ZbusDesktopNotifier,
+    DesktopNotifier, NullDesktopNotifier, RecordingDesktopNotifier, default_desktop_notifier,
 };
 pub use profile_ui::{
     JumpHostCandidate, JumpHostKind, ProfileAuthChoice, ProfileEditorState, ProfileEditorTab,
     ProfileKindChoice, ProxyEndpointDraft, SavedProfileDraft, SshConnectionMode,
 };
+#[cfg(target_os = "linux")]
+pub use quake_and_tray::{X11GlobalHotkeyRegistrar, ZbusStatusNotifierItem};
 pub use quake_and_tray::{
     GlobalHotkeyRegistrar, HotkeyRegistrationGuard, NullGlobalHotkeyRegistrar, NullSystemTray,
     ParsedGlobalHotkey, QuakeBounds, QuakeController, RecordingSystemTray, SystemTrayAdapter,
-    TrayAction, TrayMenuItem, TrayStateSnapshot, X11GlobalHotkeyRegistrar,
-    ZbusStatusNotifierItem, compute_quake_bounds, parse_global_hotkey, quake_window_settings,
+    TrayAction, TrayMenuItem, TrayStateSnapshot, compute_quake_bounds,
+    default_global_hotkey_registrar, default_system_tray, parse_global_hotkey,
+    quake_window_settings,
 };
 pub use settings_ui::{SettingsTab, SettingsUiState, ThemeOverrideField};
 pub use sftp_drawer::{

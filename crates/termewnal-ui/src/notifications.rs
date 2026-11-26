@@ -1,8 +1,10 @@
-//! Desktop notification abstraction for background terminal bell alerts (`org.freedesktop.Notifications`).
+//! Desktop notification abstraction for background terminal bell alerts.
 
+#[cfg(target_os = "linux")]
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+#[cfg(target_os = "linux")]
 use tracing::debug;
 
 /// Sends non-blocking desktop notifications on terminal bell / transfer completion.
@@ -48,16 +50,31 @@ impl DesktopNotifier for RecordingDesktopNotifier {
     }
 }
 
+/// Returns the default platform [`DesktopNotifier`] implementation.
+pub fn default_desktop_notifier() -> Arc<dyn DesktopNotifier> {
+    #[cfg(target_os = "linux")]
+    {
+        ZbusDesktopNotifier::shared()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Arc::new(NullDesktopNotifier)
+    }
+}
+
 /// Linux FreeDesktop D-Bus notifier via `zbus` (`org.freedesktop.Notifications`).
+#[cfg(target_os = "linux")]
 #[derive(Debug, Default)]
 pub struct ZbusDesktopNotifier;
 
+#[cfg(target_os = "linux")]
 impl ZbusDesktopNotifier {
     pub fn shared() -> Arc<dyn DesktopNotifier> {
         Arc::new(Self)
     }
 }
 
+#[cfg(target_os = "linux")]
 impl DesktopNotifier for ZbusDesktopNotifier {
     fn notify(&self, summary: &str, body: &str) {
         let summary = summary.to_string();

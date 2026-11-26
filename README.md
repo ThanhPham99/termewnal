@@ -95,10 +95,13 @@ Requires Rust **1.91+** (edition `2024`).
 
 ```bash
 # Run the desktop application
-cargo run -p termewnal-ui
+cargo run -p termewnal-ui --bin termewnal
 
 # Build release binary
-cargo build --release -p termewnal-ui
+cargo build --release -p termewnal-ui --bin termewnal
+
+# Build Linux .deb and .tar.gz installers (dist/)
+./scripts/build-linux.sh
 ```
 
 ### Verification

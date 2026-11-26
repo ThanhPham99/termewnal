@@ -1,8 +1,17 @@
 [package]
 name = "termewnal-ui"
+description = "Pure-Rust native terminal emulator and multi-protocol workspace"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+
+[lib]
+name = "termewnal_ui"
+path = "src/lib.rs"
+
+[[bin]]
+name = "termewnal"
+path = "src/main.rs"
 
 [dependencies]
 arboard.workspace = true
@@ -19,9 +28,14 @@ thiserror.workspace = true
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
 x11rb.workspace = true
 zbus.workspace = true
-zeroize.workspace = true
+
+[build-dependencies]
+winresource.workspace = true
 
 [dev-dependencies]
 rand.workspace = true

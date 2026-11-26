@@ -73,15 +73,15 @@ use crate::drag_drop::{
     DropZoneKind, render_drag_overlay,
 };
 use crate::ipc::{IpcCommand, IpcServerHandle};
-use crate::notifications::{DesktopNotifier, ZbusDesktopNotifier};
+use crate::notifications::{DesktopNotifier, default_desktop_notifier};
 use crate::profile_ui::{
     JumpHostCandidate, JumpHostKind, ProfileAuthChoice, ProfileEditorState, ProfileEditorTab,
     ProfileKindChoice, SshConnectionMode,
 };
 use crate::quake_and_tray::{
     GlobalHotkeyRegistrar, HotkeyRegistrationGuard, NullGlobalHotkeyRegistrar, NullSystemTray,
-    QuakeController, SystemTrayAdapter, TrayAction, TrayStateSnapshot, X11GlobalHotkeyRegistrar,
-    ZbusStatusNotifierItem, quake_window_settings,
+    QuakeController, SystemTrayAdapter, TrayAction, TrayStateSnapshot,
+    default_global_hotkey_registrar, default_system_tray, quake_window_settings,
 };
 use crate::server_stats_bar::render_server_stats_bar;
 use crate::settings_ui::{SettingsTab, SettingsUiState, ThemeOverrideField};
@@ -1668,10 +1668,10 @@ impl AppState {
     fn enable_desktop_integrations(&mut self) {
         if self.config.tray.enabled {
             let (tray_tx, tray_rx) = mpsc::unbounded_channel();
-            self.tray_adapter = ZbusStatusNotifierItem::spawn(tray_tx);
+            self.tray_adapter = default_system_tray(tray_tx);
             self.tray_rx = Some(Arc::new(Mutex::new(Some(tray_rx))));
         }
-        self.hotkey_registrar = Arc::new(X11GlobalHotkeyRegistrar);
+        self.hotkey_registrar = default_global_hotkey_registrar();
         let (hk_tx, hk_rx) = mpsc::unbounded_channel();
         self.hotkey_tx = Some(hk_tx);
         self.hotkey_rx = Some(Arc::new(Mutex::new(Some(hk_rx))));
@@ -1819,7 +1819,7 @@ impl AppState {
             last_copied: None,
             url_opener: Arc::new(open_url_with_system),
             file_opener: Arc::new(open_local_file_with_system),
-            notifier: ZbusDesktopNotifier::shared(),
+            notifier: default_desktop_notifier(),
             keybinding_resolver,
             pending_key_chords: Vec::new(),
             compiled_highlights,
