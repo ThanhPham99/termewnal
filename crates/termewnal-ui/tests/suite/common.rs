@@ -4,14 +4,26 @@ use std::sync::Arc;
 use termewnal_core::{AppConfig, ConfigPaths, VaultSession};
 use termewnal_ui::AppState;
 
-/// Seeds `config.toml` with `/bin/sh` on Unix when no config file exists yet so headless UI tests
-/// spawn fast, deterministic shells without sourcing user interactive shell rc files.
+/// Seeds `config.toml` with a fast deterministic shell when no config file exists yet so
+/// headless UI tests spawn quickly without sourcing user interactive shell rc files.
 pub fn seed_fast_test_shell(paths: &ConfigPaths) {
+    if paths.config_file().exists() {
+        return;
+    }
+
     #[cfg(unix)]
-    if Path::new("/bin/sh").exists() && !paths.config_file().exists() {
+    let fast_shell = Path::new("/bin/sh")
+        .exists()
+        .then(|| "/bin/sh".to_string());
+    #[cfg(windows)]
+    let fast_shell = Some(std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()));
+    #[cfg(not(any(unix, windows)))]
+    let fast_shell: Option<String> = None;
+
+    if let Some(shell) = fast_shell {
         std::fs::create_dir_all(paths.config_dir()).expect("create test config dir");
         let mut cfg = AppConfig::default();
-        cfg.terminal.shell = Some("/bin/sh".to_string());
+        cfg.terminal.shell = Some(shell);
         let raw = toml::to_string_pretty(&cfg).expect("serialize test AppConfig");
         std::fs::write(paths.config_file(), raw).expect("write test config.toml");
     }

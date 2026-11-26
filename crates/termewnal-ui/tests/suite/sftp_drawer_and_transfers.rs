@@ -38,12 +38,7 @@ use tokio::sync::{mpsc, oneshot};
 fn boot_test_state() -> (TempDir, AppState) {
     let temp = TempDir::new().expect("create temp XDG root");
     let paths = ConfigPaths::from_root(temp.path());
-    #[cfg(unix)]
-    if Path::new("/bin/sh").exists() {
-        let mut cfg = AppConfig::default();
-        cfg.terminal.shell = Some("/bin/sh".to_string());
-        save_config(&paths, &cfg).expect("write deterministic test shell config");
-    }
+    super::common::seed_fast_test_shell(&paths);
     let state = AppState::boot_with_paths(paths).expect("boot AppState");
     (temp, state)
 }
@@ -117,28 +112,40 @@ fn file_drop_routes_to_sftp_upload_on_drawer_or_shift_ssh_and_pastes_path_otherw
     let local_sid = state.active_session_id().expect("local session");
 
     // 1. Shift+drop onto LOCAL terminal pane still pastes shell-escaped path, never enqueues SFTP.
-    let _ = state.update(Message::TerminalInput {
-        session_id: local_sid,
-        bytes: b"printf 'L:%s\\n' ".to_vec(),
-    });
-    let _ = state.update(Message::FileDropped {
-        session_id: local_sid,
-        path: PathBuf::from("/tmp/local file.txt"),
-        shift_held: true,
-    });
-    let _ = state.update(Message::TerminalInput {
-        session_id: local_sid,
-        bytes: b"\r".to_vec(),
-    });
-    assert!(state.sftp_drawer().transfers().is_empty());
-    let local_pty = state.session(local_sid).unwrap().pty().clone();
-    assert!(
-        local_pty.wait_for_output(Duration::from_secs(5), |s| {
-            s.visible_text().contains("L:/tmp/local file.txt")
-        }),
-        "expected dropped shell path output, got:\n{}",
-        local_pty.snapshot().visible_text()
-    );
+    #[cfg(unix)]
+    {
+        let _ = state.update(Message::TerminalInput {
+            session_id: local_sid,
+            bytes: b"printf 'L:%s\\n' ".to_vec(),
+        });
+        let _ = state.update(Message::FileDropped {
+            session_id: local_sid,
+            path: PathBuf::from("/tmp/local file.txt"),
+            shift_held: true,
+        });
+        let _ = state.update(Message::TerminalInput {
+            session_id: local_sid,
+            bytes: b"\r".to_vec(),
+        });
+        assert!(state.sftp_drawer().transfers().is_empty());
+        let local_pty = state.session(local_sid).unwrap().pty().clone();
+        assert!(
+            local_pty.wait_for_output(Duration::from_secs(5), |s| {
+                s.visible_text().contains("L:/tmp/local file.txt")
+            }),
+            "expected dropped shell path output, got:\n{}",
+            local_pty.snapshot().visible_text()
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = state.update(Message::FileDropped {
+            session_id: local_sid,
+            path: PathBuf::from("/tmp/local file.txt"),
+            shift_held: true,
+        });
+        assert!(state.sftp_drawer().transfers().is_empty());
+    }
 
     // 2. Open an SSH Session slot.
     let profile = Profile::ssh("Prod Box", "10.0.0.10", 22, "ops", SshAuthMethod::Agent);
@@ -1042,6 +1049,12 @@ fn remember_last_sftp_working_folder_per_profile_across_sessions_and_restarts() 
     #[cfg(unix)]
     if Path::new("/bin/sh").exists() {
         cfg.terminal.shell = Some("/bin/sh".to_string());
+    }
+    #[cfg(windows)]
+    {
+        cfg.terminal.shell = Some(
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+        );
     }
     save_config(&paths, &cfg).expect("write deterministic test shell config");
 

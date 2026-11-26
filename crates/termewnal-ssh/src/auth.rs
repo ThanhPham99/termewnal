@@ -144,12 +144,7 @@ impl AgentConnector for OsAgentConnector {
             Box::pin(async move {
                 match AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
                     Ok(client) => Ok(client.dynamic()),
-                    Err(pipe_err) => match AgentClient::connect_pageant().await {
-                        Ok(client) => Ok(client.dynamic()),
-                        Err(pageant_err) => Err(SshError::Agent(format!(
-                            "OpenSSH pipe failed ({pipe_err}); Pageant failed ({pageant_err})"
-                        ))),
-                    },
+                    Err(_pipe_err) => Ok(AgentClient::connect_pageant().await.dynamic()),
                 }
             })
         }

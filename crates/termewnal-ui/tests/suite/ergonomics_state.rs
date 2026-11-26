@@ -5,7 +5,7 @@ use std::time::Duration;
 use iced::advanced::input_method;
 use iced::{Rectangle, Size, Theme, window};
 use tempfile::TempDir;
-use termewnal_core::{AppConfig, BuiltinTheme, ConfigPaths, CursorStyle, save_config};
+use termewnal_core::{BuiltinTheme, ConfigPaths, CursorStyle};
 use termewnal_pty::{CursorShape, PtyEvent, SelectionType, Side};
 use termewnal_ui::{
     AppState, FileDropAction, ImeComposition, ImeUpdate, Message, TerminalPalette,
@@ -15,12 +15,7 @@ use termewnal_ui::{
 fn boot_fast_test_state() -> (TempDir, AppState) {
     let temp = TempDir::new().expect("create temp XDG root");
     let paths = ConfigPaths::from_root(temp.path());
-    #[cfg(unix)]
-    if Path::new("/bin/sh").exists() {
-        let mut cfg = AppConfig::default();
-        cfg.terminal.shell = Some("/bin/sh".to_string());
-        save_config(&paths, &cfg).expect("write deterministic test shell config");
-    }
+    super::common::seed_fast_test_shell(&paths);
     let state = AppState::boot_with_paths(paths).expect("boot AppState");
     (temp, state)
 }
@@ -81,10 +76,27 @@ fn ctrl_f_search_updates_matches_navigates_next_prev_and_closes_on_escape() {
         cols: 80,
         rows: 8,
     });
-    let _ = state.update(Message::TerminalInput {
-        session_id,
-        bytes: b"printf '%s_%s_%s\\n' NEEDLE ONE 1; i=1; while [ \"$i\" -le 20 ]; do echo \"pad_$i\"; i=$((i+1)); done; printf '%s_%s_%s\\n' NEEDLE ONE 2; printf 'READY_%s\\n' SEARCH\r".to_vec(),
-    });
+    #[cfg(unix)]
+    {
+        let _ = state.update(Message::TerminalInput {
+            session_id,
+            bytes: b"printf '%s_%s_%s\\n' NEEDLE ONE 1; i=1; while [ \"$i\" -le 20 ]; do echo \"pad_$i\"; i=$((i+1)); done; printf '%s_%s_%s\\n' NEEDLE ONE 2; printf 'READY_%s\\n' SEARCH\r".to_vec(),
+        });
+    }
+    #[cfg(windows)]
+    {
+        for cmd in [
+            b"echo NEEDLE^_ONE^_1\r".as_slice(),
+            b"for /L %i in (1,1,20) do @echo pad_%i\r".as_slice(),
+            b"echo NEEDLE^_ONE^_2\r".as_slice(),
+            b"echo READY^_SEARCH\r".as_slice(),
+        ] {
+            let _ = state.update(Message::TerminalInput {
+                session_id,
+                bytes: cmd.to_vec(),
+            });
+        }
+    }
 
     let pty = state.session(session_id).unwrap().pty().clone();
     assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
@@ -132,9 +144,15 @@ fn copy_on_select_copies_dragged_selection_only_when_enabled() {
     let (_temp, mut state) = boot_fast_test_state();
     let session_id = state.active_session_id().expect("active session");
 
+    #[cfg(unix)]
     let _ = state.update(Message::TerminalInput {
         session_id,
         bytes: b"printf 'COPY_%s_LINE\\n' TARGET\r".to_vec(),
+    });
+    #[cfg(windows)]
+    let _ = state.update(Message::TerminalInput {
+        session_id,
+        bytes: b"echo COPY^_TARGET^_LINE\r".to_vec(),
     });
     let pty = state.session(session_id).unwrap().pty().clone();
     assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
@@ -233,7 +251,16 @@ fn multiline_paste_guard_prompts_confirms_cancels_and_respects_config_toggle() {
     // Single-line paste without newlines goes straight through without prompting.
     let _ = state.update(Message::PasteText {
         session_id,
-        text: "printf 'PLAIN_%s\\n' FAST".to_string(),
+        text: {
+            #[cfg(unix)]
+            {
+                "printf 'PLAIN_%s\\n' FAST".to_string()
+            }
+            #[cfg(windows)]
+            {
+                "echo PLAIN^_FAST".to_string()
+            }
+        },
     });
     assert!(state.pending_paste().is_none());
     let _ = state.update(Message::TerminalInput {
@@ -247,7 +274,16 @@ fn multiline_paste_guard_prompts_confirms_cancels_and_respects_config_toggle() {
     // Multi-line paste pauses in PendingPaste and Cancel drops it cleanly.
     let _ = state.update(Message::PasteText {
         session_id,
-        text: "printf 'CANCELED_%s\\n' LINE1\nprintf 'CANCELED_%s\\n' LINE2\n".to_string(),
+        text: {
+            #[cfg(unix)]
+            {
+                "printf 'CANCELED_%s\\n' LINE1\nprintf 'CANCELED_%s\\n' LINE2\n".to_string()
+            }
+            #[cfg(windows)]
+            {
+                "echo CANCELED^_LINE1\necho CANCELED^_LINE2\n".to_string()
+            }
+        },
     });
     let pending = state.pending_paste().expect("multiline paste must prompt");
     assert!(pending.line_count >= 2);
@@ -255,7 +291,16 @@ fn multiline_paste_guard_prompts_confirms_cancels_and_respects_config_toggle() {
     assert!(state.pending_paste().is_none());
     let _ = state.update(Message::TerminalInput {
         session_id,
-        bytes: b"printf 'AFTER_CANCEL_%s\\n' OK\r".to_vec(),
+        bytes: {
+            #[cfg(unix)]
+            {
+                b"printf 'AFTER_CANCEL_%s\\n' OK\r".to_vec()
+            }
+            #[cfg(windows)]
+            {
+                b"echo AFTER^_CANCEL^_OK\r".to_vec()
+            }
+        },
     });
     assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
         s.visible_text().contains("AFTER_CANCEL_OK")
@@ -265,7 +310,16 @@ fn multiline_paste_guard_prompts_confirms_cancels_and_respects_config_toggle() {
     // ConfirmPendingPaste dispatches buffered multi-line text to active Session.
     let _ = state.update(Message::PasteText {
         session_id,
-        text: "printf 'CONFIRMED_%s\\n' ONE\nprintf 'CONFIRMED_%s\\n' TWO\n".to_string(),
+        text: {
+            #[cfg(unix)]
+            {
+                "printf 'CONFIRMED_%s\\n' ONE\nprintf 'CONFIRMED_%s\\n' TWO\n".to_string()
+            }
+            #[cfg(windows)]
+            {
+                "echo CONFIRMED^_ONE\necho CONFIRMED^_TWO\n".to_string()
+            }
+        },
     });
     assert!(state.pending_paste().is_some());
     let _ = state.update(Message::ConfirmPendingPaste);
@@ -280,7 +334,16 @@ fn multiline_paste_guard_prompts_confirms_cancels_and_respects_config_toggle() {
     let _ = state.update(Message::ApplyTerminalConfig(cfg));
     let _ = state.update(Message::PasteText {
         session_id,
-        text: "printf 'DIRECT_%s\\n' MULTI\n".to_string(),
+        text: {
+            #[cfg(unix)]
+            {
+                "printf 'DIRECT_%s\\n' MULTI\n".to_string()
+            }
+            #[cfg(windows)]
+            {
+                "echo DIRECT^_MULTI\n".to_string()
+            }
+        },
     });
     assert!(state.pending_paste().is_none());
     assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
@@ -333,9 +396,28 @@ fn ime_preedit_commit_and_cursor_anchor_handle_vietnamese_and_cjk() {
     assert!(anchor.x >= 10.0 && anchor.y >= 20.0);
 
     // Committing UTF-8 Vietnamese + CJK text dispatches intact bytes into active Session.
+    #[cfg(windows)]
+    {
+        let _ = state.update(Message::TerminalInput {
+            session_id,
+            bytes: b"chcp 65001>nul & echo CHCP^_OK\r".to_vec(),
+        });
+        assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
+            s.visible_text().contains("CHCP_OK")
+        }));
+    }
     let _ = state.update(Message::TerminalInput {
         session_id,
-        bytes: b"printf 'IME:%s\\n' '".to_vec(),
+        bytes: {
+            #[cfg(unix)]
+            {
+                b"printf 'IME:%s\\n' '".to_vec()
+            }
+            #[cfg(windows)]
+            {
+                b"echo IME^:".to_vec()
+            }
+        },
     });
     let _ = state.update(Message::ImeCommitted {
         session_id,
@@ -343,7 +425,16 @@ fn ime_preedit_commit_and_cursor_anchor_handle_vietnamese_and_cjk() {
     });
     let _ = state.update(Message::TerminalInput {
         session_id,
-        bytes: b"'\r".to_vec(),
+        bytes: {
+            #[cfg(unix)]
+            {
+                b"'\r".to_vec()
+            }
+            #[cfg(windows)]
+            {
+                b"\r".to_vec()
+            }
+        },
     });
     assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
         s.visible_text().contains("IME:Tiếng Việt 日本語")
@@ -354,6 +445,7 @@ fn ime_preedit_commit_and_cursor_anchor_handle_vietnamese_and_cjk() {
 fn file_dropped_inserts_shell_escaped_path_and_classifies_sftp_routing() {
     let (_temp, mut state) = boot_fast_test_state();
     let session_id = state.active_session_id().expect("active session");
+    #[cfg(unix)]
     let pty = state.session(session_id).unwrap().pty().clone();
 
     // Pure routing classifier leaves Shift-drop SFTP upload ready for Ticket 13.
@@ -372,21 +464,24 @@ fn file_dropped_inserts_shell_escaped_path_and_classifies_sftp_routing() {
         }
     );
 
-    let _ = state.update(Message::TerminalInput {
-        session_id,
-        bytes: b"printf 'DROP:%s\\n' ".to_vec(),
-    });
-    let _ = state.update(Message::FileDropped {
-        session_id,
-        path: PathBuf::from("/tmp/My File's (1).txt"),
-        shift_held: false,
-    });
-    let _ = state.update(Message::TerminalInput {
-        session_id,
-        bytes: b"\r".to_vec(),
-    });
+    #[cfg(unix)]
+    {
+        let _ = state.update(Message::TerminalInput {
+            session_id,
+            bytes: b"printf 'DROP:%s\\n' ".to_vec(),
+        });
+        let _ = state.update(Message::FileDropped {
+            session_id,
+            path: PathBuf::from("/tmp/My File's (1).txt"),
+            shift_held: false,
+        });
+        let _ = state.update(Message::TerminalInput {
+            session_id,
+            bytes: b"\r".to_vec(),
+        });
 
-    assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
-        s.visible_text().contains("DROP:/tmp/My File's (1).txt")
-    }));
+        assert!(pty.wait_for_output(Duration::from_secs(5), |s| {
+            s.visible_text().contains("DROP:/tmp/My File's (1).txt")
+        }));
+    }
 }

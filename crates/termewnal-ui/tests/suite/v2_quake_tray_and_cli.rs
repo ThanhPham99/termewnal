@@ -19,6 +19,23 @@ use termewnal_ui::{
 
 use crate::common::boot_test_app;
 
+fn fast_test_shell() -> Option<String> {
+    #[cfg(unix)]
+    {
+        std::path::Path::new("/bin/sh")
+            .exists()
+            .then(|| "/bin/sh".to_string())
+    }
+    #[cfg(windows)]
+    {
+        Some(std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
+
 struct MockHotkeyGuard {
     released: Arc<AtomicBool>,
 }
@@ -97,7 +114,7 @@ fn quake_edge_geometry_bounds_and_toggle_lifecycle() {
     let dir = TempDir::new().unwrap();
     let paths = ConfigPaths::from_root(dir.path().to_path_buf());
     let mut cfg = AppConfig::default();
-    cfg.terminal.shell = Some("/bin/sh".to_string());
+    cfg.terminal.shell = fast_test_shell();
     cfg.quake.enabled = true;
     cfg.quake.edge = QuakeEdge::Bottom;
     cfg.quake.size_percent = 40;
@@ -187,7 +204,7 @@ fn global_hotkey_parser_mock_guard_and_x11_fallback() {
     let dir = TempDir::new().unwrap();
     let paths = ConfigPaths::from_root(dir.path().to_path_buf());
     let mut cfg = AppConfig::default();
-    cfg.terminal.shell = Some("/bin/sh".to_string());
+    cfg.terminal.shell = fast_test_shell();
     cfg.quake.enabled = true;
     cfg.quake.hotkey = "Ctrl+Alt+Space".to_string();
     save_config(&paths, &cfg).unwrap();
@@ -219,7 +236,7 @@ fn system_tray_hide_show_tunnel_telemetry_profile_launch_and_quit() {
     let dir = TempDir::new().unwrap();
     let paths = ConfigPaths::from_root(dir.path().to_path_buf());
     let mut profiles = ProfilesConfig::default();
-    let p1 = Profile::local_shell("Ops Shell", Some("/bin/sh".to_string()));
+    let p1 = Profile::local_shell("Ops Shell", fast_test_shell());
     let p1_id = p1.id.clone();
     profiles.profiles.push(p1);
     save_profiles(&paths, &profiles).unwrap();
@@ -309,7 +326,7 @@ fn cli_flags_parse_and_ipc_cwd_profile_and_toggle_quake_dispatch() {
     let paths = ConfigPaths::from_root(dir.path().to_path_buf());
 
     let mut profiles = ProfilesConfig::default();
-    let mut prof = Profile::local_shell("Custom Dev", Some("/bin/sh".to_string()));
+    let mut prof = Profile::local_shell("Custom Dev", fast_test_shell());
     prof.id = "custom-dev-id".to_string();
     profiles.profiles.push(prof);
     save_profiles(&paths, &profiles).unwrap();
@@ -355,7 +372,10 @@ fn cli_flags_parse_and_ipc_cwd_profile_and_toggle_quake_dispatch() {
     let sid = state.active_session_id().unwrap();
     assert_eq!(state.session(sid).unwrap().profile_id(), Some("custom-dev-id"));
     let pty = Arc::clone(state.session(sid).unwrap().pty());
+    #[cfg(unix)]
     pty.write_bytes(b"pwd\r").unwrap();
+    #[cfg(windows)]
+    pty.write_bytes(b"cd\r").unwrap();
     assert!(pty.wait_for_output(Duration::from_secs(3), |s| s
         .visible_text()
         .contains("workspace_cwd")));

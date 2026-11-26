@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+#[cfg(unix)]
 use futures::stream;
+#[cfg(unix)]
 use russh::keys::agent::client::AgentClient;
 use russh::keys::ssh_key::LineEnding;
 use russh::keys::{Algorithm, EcdsaCurve, PrivateKey, PublicKey};
@@ -21,7 +23,9 @@ use termewnal_ssh::{
     OsAgentConnector, ServerStatsCollector, SshConnectConfig, SshError, SshInteractionHandler,
     SshSession, SshTransport, TransportStatus, fingerprint_sha256, record_known_host_path,
 };
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::oneshot;
 use zeroize::Zeroizing;
 

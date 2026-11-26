@@ -21,6 +21,11 @@ fn test_pty_config(cols: u16, rows: u16, scrollback_lines: usize) -> PtySpawnCon
     if Path::new("/bin/sh").exists() {
         cfg.shell = ShellSpec::custom("/bin/sh", Vec::new());
     }
+    #[cfg(windows)]
+    {
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        cfg.shell = ShellSpec::custom(comspec, Vec::new());
+    }
     cfg
 }
 
@@ -33,11 +38,21 @@ fn scrollback_defaults_to_10000_respects_custom_limit_and_scrolls_display() {
     let session =
         PtySession::spawn(test_pty_config(80, 10, 10_000)).expect("spawn PTY with 10k scrollback");
 
+    #[cfg(unix)]
     session
         .write_bytes(
             b"i=1; while [ \"$i\" -le 80 ]; do echo \"HIST_ROW_$i\"; i=$((i+1)); done; printf 'DONE_%s\\n' SCROLL\r",
         )
         .expect("emit 80 lines to PTY");
+    #[cfg(windows)]
+    {
+        session
+            .write_bytes(b"for /L %i in (1,1,80) do @echo HIST_ROW_%i\r")
+            .expect("emit 80 lines to PTY");
+        session
+            .write_bytes(b"echo DONE^_SCROLL\r")
+            .expect("emit completion marker");
+    }
 
     assert!(
         session.wait_for_output(Duration::from_secs(5), |snap| {
@@ -72,11 +87,21 @@ fn scrollback_defaults_to_10000_respects_custom_limit_and_scrolls_display() {
     // Custom small scrollback limit caps history retention and dynamic apply_options shrinks/updates cursor.
     let capped = PtySession::spawn(test_pty_config(80, 5, 15)).expect("spawn capped PTY");
 
+    #[cfg(unix)]
     capped
         .write_bytes(
             b"i=1; while [ \"$i\" -le 45 ]; do echo \"CAP_ROW_$i\"; i=$((i+1)); done; printf 'CAP_%s\\n' DONE\r",
         )
         .expect("emit 45 lines");
+    #[cfg(windows)]
+    {
+        capped
+            .write_bytes(b"for /L %i in (1,1,45) do @echo CAP_ROW_%i\r")
+            .expect("emit 45 lines");
+        capped
+            .write_bytes(b"echo CAP^_DONE\r")
+            .expect("emit completion marker");
+    }
 
     assert!(capped.wait_for_output(Duration::from_secs(5), |s| {
         s.visible_text().contains("CAP_DONE")
@@ -96,11 +121,27 @@ fn search_scrollback_finds_history_and_screen_matches_and_scrolls_to_match() {
     let session =
         PtySession::spawn(test_pty_config(80, 8, 500)).expect("spawn PTY for scrollback search");
 
+    #[cfg(unix)]
     session
         .write_bytes(
             b"printf '%s_%s_%s\\n' ALPHA HIT 1; i=1; while [ \"$i\" -le 25 ]; do echo \"spacer_$i\"; i=$((i+1)); done; printf '%s_%s_%s\\n' ALPHA HIT 2; printf 'SEARCH_%s\\n' READY\r",
         )
         .expect("write search corpus");
+    #[cfg(windows)]
+    {
+        session
+            .write_bytes(b"echo ALPHA^_HIT^_1\r")
+            .expect("write first hit");
+        session
+            .write_bytes(b"for /L %i in (1,1,25) do @echo spacer_%i\r")
+            .expect("write spacer lines");
+        session
+            .write_bytes(b"echo ALPHA^_HIT^_2\r")
+            .expect("write second hit");
+        session
+            .write_bytes(b"echo SEARCH^_READY\r")
+            .expect("write ready marker");
+    }
 
     assert!(session.wait_for_output(Duration::from_secs(5), |s| {
         s.visible_text().contains("SEARCH_READY")
@@ -136,6 +177,7 @@ fn search_scrollback_finds_history_and_screen_matches_and_scrolls_to_match() {
     assert!(scrolled_snap.visible_text().contains("ALPHA_HIT_1"));
 }
 
+#[cfg(unix)]
 #[test]
 fn url_detection_handles_punctuation_wrapping_cjk_offset_and_cell_hit_testing() {
     let session = PtySession::spawn(test_pty_config(40, 24, 200)).expect("spawn 40-col PTY");
@@ -217,11 +259,49 @@ fn url_detection_handles_punctuation_wrapping_cjk_offset_and_cell_hit_testing() 
 }
 
 #[test]
+fn url_detection_buffer_handles_punctuation_wrapping_and_cjk_offset() {
+    let buffer = TerminalBuffer::new(40, 12, 50);
+    buffer.feed_bytes(
+        b"See https://example.com/docs_(v1). and (http://127.0.0.1:8080/ok)!\r\n\
+          https://example.org/alpha/beta/gamma/delta/epsilon/wrapped\r\n\
+          \xe6\x97\xa5\xe6\x9c\xac https://rust-lang.org/learn\r\n",
+    );
+    let snap = buffer.snapshot();
+    let urls = detect_urls_in_snapshot(&snap);
+    let url_strings: Vec<&str> = urls.iter().map(|u| u.url.as_str()).collect();
+    assert!(url_strings.contains(&"https://example.com/docs_(v1)"));
+    assert!(url_strings.contains(&"http://127.0.0.1:8080/ok"));
+    assert!(url_strings.contains(&"https://example.org/alpha/beta/gamma/delta/epsilon/wrapped"));
+    assert!(url_strings.contains(&"https://rust-lang.org/learn"));
+
+    let wrapped = urls
+        .iter()
+        .find(|u| u.url == "https://example.org/alpha/beta/gamma/delta/epsilon/wrapped")
+        .expect("wrapped URL");
+    assert_eq!(wrapped.spans.len(), 2);
+    assert_eq!(
+        url_at_cell(&snap, wrapped.spans[1].start_col, wrapped.spans[1].row).map(|u| u.url),
+        Some(wrapped.url.clone())
+    );
+
+    let cjk = urls
+        .iter()
+        .find(|u| u.url == "https://rust-lang.org/learn")
+        .expect("cjk URL");
+    assert_eq!(cjk.spans[0].start_col, 5);
+}
+
+#[test]
 fn selection_extracts_dragged_text_and_ignores_bare_clicks() {
     let session = PtySession::spawn(test_pty_config(80, 10, 200)).expect("spawn PTY for selection");
 
+    #[cfg(unix)]
     session
         .write_bytes(b"printf 'PICK_%s_HERE\\n' TARGET\r")
+        .expect("write selection line");
+    #[cfg(windows)]
+    session
+        .write_bytes(b"echo PICK^_TARGET^_HERE\r")
         .expect("write selection line");
     assert!(session.wait_for_output(Duration::from_secs(5), |s| {
         s.visible_text().contains("PICK_TARGET_HERE")

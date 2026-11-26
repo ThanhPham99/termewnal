@@ -19,7 +19,9 @@ use termewnal_ssh::{
     SshSession, SupervisorConfig, TransportStatus, record_known_host_path,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, UnixListener};
+use tokio::net::TcpListener;
+#[cfg(unix)]
+use tokio::net::UnixListener;
 use tokio::sync::{Notify, mpsc, oneshot};
 use zeroize::Zeroizing;
 
@@ -367,6 +369,7 @@ fn default_server_state() -> AdvServerState {
     }
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn agent_forwarding_bridges_channel_open_agent_to_unix_socket_and_rejects_when_disabled() {
     let temp = TempDir::new().unwrap();
@@ -451,6 +454,7 @@ async fn agent_forwarding_bridges_channel_open_agent_to_unix_socket_and_rejects_
     session2.disconnect();
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn x11_forwarding_requests_x11_and_bridges_remote_x11_channel_to_local_display() {
     let temp = TempDir::new().unwrap();
@@ -591,11 +595,22 @@ s2c()
     record_known_host_path("127.0.0.1", srv.addr.port(), &srv.host_pubkey, &known_hosts).unwrap();
 
     let mut cfg = base_connect_cfg(srv.addr, &known_hosts);
-    cfg.proxy_command = Some(format!(
-        "python3 -u '{}' %h %p %r '{}'",
-        relay_script.display(),
-        marker.display()
-    ));
+    #[cfg(unix)]
+    {
+        cfg.proxy_command = Some(format!(
+            "python3 -u '{}' %h %p %r '{}'",
+            relay_script.display(),
+            marker.display()
+        ));
+    }
+    #[cfg(windows)]
+    {
+        cfg.proxy_command = Some(format!(
+            "python -u \"{}\" %h %p %r \"{}\"",
+            relay_script.display(),
+            marker.display()
+        ));
+    }
 
     let interaction: Arc<dyn SshInteractionHandler> = Arc::new(FixedPasswordInteraction {
         password: "secret".to_string(),

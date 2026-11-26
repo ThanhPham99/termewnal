@@ -17,6 +17,11 @@ fn sh_pty_config(working_dir: Option<PathBuf>) -> PtySpawnConfig {
     if Path::new("/bin/sh").exists() {
         cfg.shell = ShellSpec::custom("/bin/sh", Vec::new());
     }
+    #[cfg(windows)]
+    {
+        let comspec = std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string());
+        cfg.shell = ShellSpec::custom(comspec, Vec::new());
+    }
     cfg
 }
 
@@ -161,6 +166,7 @@ fn exiting_shell_delivers_eof_and_exited_event_without_hanging() {
     assert_eq!(exited.expect("timed out waiting for PtyEvent::Exited"), Some(Some(0)));
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn pty_captures_working_dir_after_cd_and_respawns_in_captured_directory() {
     let temp = TempDir::new().expect("create temp workspace dir");
@@ -222,6 +228,7 @@ fn pty_captures_working_dir_after_cd_and_respawns_in_captured_directory() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn pty_retains_osc7_working_dir_after_shell_exits() {
     let temp = TempDir::new().expect("create temp dir");

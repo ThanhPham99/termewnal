@@ -616,6 +616,15 @@ fn parse_osc7_path(raw: &str) -> Option<PathBuf> {
     };
 
     let decoded = percent_decode(encoded_path);
+    #[cfg(windows)]
+    let decoded = if decoded.starts_with('/')
+        && decoded.as_bytes().get(1).is_some_and(u8::is_ascii_alphabetic)
+        && decoded.as_bytes().get(2) == Some(&b':')
+    {
+        decoded[1..].to_string()
+    } else {
+        decoded
+    };
     (!decoded.is_empty()).then(|| PathBuf::from(decoded))
 }
 
@@ -656,4 +665,23 @@ fn read_proc_cwd(pid: Option<u32>) -> Option<PathBuf> {
 #[cfg(not(target_os = "linux"))]
 fn read_proc_cwd(_pid: Option<u32>) -> Option<PathBuf> {
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_osc7_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parses_osc7_file_urls_cleanly() {
+        assert_eq!(
+            parse_osc7_path("file://localhost/tmp/work%20dir"),
+            Some(PathBuf::from("/tmp/work dir"))
+        );
+        #[cfg(windows)]
+        assert_eq!(
+            parse_osc7_path("file://localhost/C:/Users/dev%20user/proj"),
+            Some(PathBuf::from("C:/Users/dev user/proj"))
+        );
+    }
 }

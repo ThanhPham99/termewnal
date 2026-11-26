@@ -276,16 +276,29 @@ fn restart_restores_tabs_split_geometry_and_respawns_local_sessions_at_captured_
             .is_some()
     );
 
-    // Move each split pane to a distinct working directory via real shells.
-    let pty1 = state.session(s1).unwrap().pty().clone();
-    pty1.write_bytes(format!("cd '{}' && printf \"CD_A_%s\\n\" OK\r", dir_a.display()).as_bytes())
+    // Move each split pane to a distinct working directory via real shells on Linux (`/proc/<pid>/cwd`).
+    #[cfg(not(target_os = "linux"))]
+    let _ = &dir_a;
+    #[cfg(target_os = "linux")]
+    {
+        let pty1 = state.session(s1).unwrap().pty().clone();
+        pty1.write_bytes(
+            format!("cd '{}' && printf \"CD_A_%s\\n\" OK\r", dir_a.display()).as_bytes(),
+        )
         .unwrap();
-    assert!(pty1.wait_for_output(Duration::from_secs(5), |s| s.visible_text().contains("CD_A_OK")));
+        assert!(pty1.wait_for_output(Duration::from_secs(5), |s| {
+            s.visible_text().contains("CD_A_OK")
+        }));
 
-    let pty2 = state.session(s2).unwrap().pty().clone();
-    pty2.write_bytes(format!("cd '{}' && printf \"CD_B_%s\\n\" OK\r", dir_b.display()).as_bytes())
+        let pty2 = state.session(s2).unwrap().pty().clone();
+        pty2.write_bytes(
+            format!("cd '{}' && printf \"CD_B_%s\\n\" OK\r", dir_b.display()).as_bytes(),
+        )
         .unwrap();
-    assert!(pty2.wait_for_output(Duration::from_secs(5), |s| s.visible_text().contains("CD_B_OK")));
+        assert!(pty2.wait_for_output(Duration::from_secs(5), |s| {
+            s.visible_text().contains("CD_B_OK")
+        }));
+    }
 
     // Add a second tab in w1 and a second window w2, then keep tab1 active on w1.
     let _ = state.update(Message::NewTab);
@@ -321,41 +334,44 @@ fn restart_restores_tabs_split_geometry_and_respawns_local_sessions_at_captured_
     let restored_sessions = rtab1.root.session_ids();
     assert_eq!(restored_sessions.len(), 2);
 
-    let rpty1 = restored.session(restored_sessions[0]).unwrap().pty().clone();
-    rpty1
-        .write_bytes(b"pwd && printf \"RESTORE_A_%s\\n\" OK\r")
-        .unwrap();
-    assert!(
-        rpty1.wait_for_output(Duration::from_secs(5), |s| {
-            s.visible_text().contains("RESTORE_A_OK")
-        })
-    );
-    assert!(
+    #[cfg(target_os = "linux")]
+    {
+        let rpty1 = restored.session(restored_sessions[0]).unwrap().pty().clone();
         rpty1
-            .snapshot()
-            .visible_text()
-            .contains(&dir_a.to_string_lossy().to_string()),
-        "restored pane 1 pwd mismatch:\n{}",
-        rpty1.snapshot().visible_text()
-    );
+            .write_bytes(b"pwd && printf \"RESTORE_A_%s\\n\" OK\r")
+            .unwrap();
+        assert!(
+            rpty1.wait_for_output(Duration::from_secs(5), |s| {
+                s.visible_text().contains("RESTORE_A_OK")
+            })
+        );
+        assert!(
+            rpty1
+                .snapshot()
+                .visible_text()
+                .contains(&dir_a.to_string_lossy().to_string()),
+            "restored pane 1 pwd mismatch:\n{}",
+            rpty1.snapshot().visible_text()
+        );
 
-    let rpty2 = restored.session(restored_sessions[1]).unwrap().pty().clone();
-    rpty2
-        .write_bytes(b"pwd && printf \"RESTORE_B_%s\\n\" OK\r")
-        .unwrap();
-    assert!(
-        rpty2.wait_for_output(Duration::from_secs(5), |s| {
-            s.visible_text().contains("RESTORE_B_OK")
-        })
-    );
-    assert!(
+        let rpty2 = restored.session(restored_sessions[1]).unwrap().pty().clone();
         rpty2
-            .snapshot()
-            .visible_text()
-            .contains(&dir_b.to_string_lossy().to_string()),
-        "restored pane 2 pwd mismatch:\n{}",
-        rpty2.snapshot().visible_text()
-    );
+            .write_bytes(b"pwd && printf \"RESTORE_B_%s\\n\" OK\r")
+            .unwrap();
+        assert!(
+            rpty2.wait_for_output(Duration::from_secs(5), |s| {
+                s.visible_text().contains("RESTORE_B_OK")
+            })
+        );
+        assert!(
+            rpty2
+                .snapshot()
+                .visible_text()
+                .contains(&dir_b.to_string_lossy().to_string()),
+            "restored pane 2 pwd mismatch:\n{}",
+            rpty2.snapshot().visible_text()
+        );
+    }
 
     let ws2 = restored.window_workspace(rw2).expect("restored window 2");
     assert_eq!(ws2.tab_count(), 1);

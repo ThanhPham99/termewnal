@@ -237,18 +237,36 @@ fn selecting_saved_profile_opens_local_pty_or_ssh_session_slot_in_tab_or_split_p
     assert_eq!(local_session.profile_id(), Some("prof-local-alpha"));
     let pty = local_session.pty().clone();
 
-    let _ = state.update(Message::TerminalInput {
-        session_id: local_sid,
-        bytes: b"pwd\r".to_vec(),
-    });
-    let expected_dir = canonical_work_dir.to_string_lossy().into_owned();
-    assert!(
-        pty.wait_for_output(Duration::from_secs(5), |s| {
-            s.visible_text().contains(&expected_dir)
-        }),
-        "expected PTY cwd {expected_dir}, got:\n{}",
-        pty.snapshot().visible_text()
-    );
+    #[cfg(unix)]
+    {
+        let _ = state.update(Message::TerminalInput {
+            session_id: local_sid,
+            bytes: b"pwd\r".to_vec(),
+        });
+        let expected_dir = canonical_work_dir.to_string_lossy().into_owned();
+        assert!(
+            pty.wait_for_output(Duration::from_secs(5), |s| {
+                s.visible_text().contains(&expected_dir)
+            }),
+            "expected PTY cwd {expected_dir}, got:\n{}",
+            pty.snapshot().visible_text()
+        );
+    }
+    #[cfg(windows)]
+    {
+        let _ = canonical_work_dir;
+        let _ = state.update(Message::TerminalInput {
+            session_id: local_sid,
+            bytes: b"cd\r".to_vec(),
+        });
+        assert!(
+            pty.wait_for_output(Duration::from_secs(5), |s| {
+                s.visible_text().contains("repo_alpha")
+            }),
+            "expected PTY cwd to include repo_alpha, got:\n{}",
+            pty.snapshot().visible_text()
+        );
+    }
 
     // Launching a saved SSH Profile with Split(Vertical) splits the active tab into an SSH Session slot.
     let _ = state.update(Message::LaunchProfile {

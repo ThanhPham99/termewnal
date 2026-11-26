@@ -791,7 +791,16 @@ async fn slice6_part_fallback_notice_and_config_hot_reload_propagate_to_queue() 
     // Hot-reload `config.toml` and verify TransferConfig propagates to TransferQueue.
     let paths = ConfigPaths::from_root(temp.path());
     let mut cfg = AppConfig::default();
-    cfg.terminal.shell = Some("/bin/sh".to_string());
+    #[cfg(unix)]
+    {
+        cfg.terminal.shell = Some("/bin/sh".to_string());
+    }
+    #[cfg(windows)]
+    {
+        cfg.terminal.shell = Some(
+            std::env::var("COMSPEC").unwrap_or_else(|_| "cmd.exe".to_string()),
+        );
+    }
     cfg.transfer.default_conflict_policy = TransferConflictPolicy::Overwrite;
     cfg.transfer.follow_symlinks = true;
     cfg.transfer.part_threshold_bytes = 2_097_152;
