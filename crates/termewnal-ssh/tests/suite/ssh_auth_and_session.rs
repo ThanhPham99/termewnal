@@ -18,8 +18,10 @@ use termewnal_core::{
     vault::{EncryptedVault, InMemorySecretStore, SecretStore, VaultSession},
 };
 use termewnal_pty::PtyEvent;
+#[cfg(unix)]
+use termewnal_ssh::AgentConnector;
 use termewnal_ssh::{
-    AgentConnector, BoxFuture, HostKeyDecision, HostKeyPrompt, KeyboardInteractiveChallenge,
+    BoxFuture, HostKeyDecision, HostKeyPrompt, KeyboardInteractiveChallenge,
     OsAgentConnector, ServerStatsCollector, SshConnectConfig, SshError, SshInteractionHandler,
     SshSession, SshTransport, TransportStatus, fingerprint_sha256, record_known_host_path,
 };

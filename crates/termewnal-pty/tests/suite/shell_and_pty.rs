@@ -2,6 +2,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use tempfile::TempDir;
 use termewnal_pty::{
     PtyEvent, PtySession, PtySpawnConfig, ShellKind, ShellSpec, detect_default_shell,

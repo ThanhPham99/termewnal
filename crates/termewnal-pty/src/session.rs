@@ -251,7 +251,7 @@ impl Write for SharedPtyWriter {
 pub struct PtySession {
     shell: ShellSpec,
     child_pid: Option<u32>,
-    master: Mutex<Box<dyn MasterPty + Send>>,
+    master: Arc<Mutex<Option<Box<dyn MasterPty + Send>>>>,
     writer: Arc<Mutex<Option<Box<dyn Write + Send>>>>,
     killer: Mutex<Box<dyn ChildKiller + Send + Sync>>,
     buffer: Arc<TerminalBuffer>,
@@ -316,10 +316,14 @@ impl PtySession {
         let last_working_dir = Arc::new(Mutex::new(config.working_dir.clone()));
         let osc7_working_dir = Arc::new(Mutex::new(None));
 
+        let master = Arc::new(Mutex::new(Some(pair.master)));
+
         spawn_reader_thread(
             reader,
             child,
             child_pid,
+            Arc::clone(&master),
+            Arc::clone(&writer),
             Arc::clone(&buffer),
             Arc::clone(&last_working_dir),
             Arc::clone(&osc7_working_dir),
@@ -328,7 +332,7 @@ impl PtySession {
         Ok(Self {
             shell: config.shell,
             child_pid,
-            master: Mutex::new(pair.master),
+            master,
             writer,
             killer: Mutex::new(killer),
             buffer,
@@ -359,7 +363,11 @@ impl PtySession {
                 .master
                 .lock()
                 .ok()
-                .and_then(|master| master.process_group_leader())
+                .and_then(|master| {
+                    master
+                        .as_ref()
+                        .and_then(|inner| inner.process_group_leader())
+                })
                 .and_then(|pid| u32::try_from(pid).ok());
 
             if let Some(cwd) = read_proc_cwd(self.child_pid).or_else(|| read_proc_cwd(fg_pid)) {
@@ -409,19 +417,21 @@ impl PtySession {
         }
 
         {
-            let master = self.master.lock().expect("master pty mutex poisoned");
-            master
-                .resize(PtySize {
-                    rows: dims.rows,
-                    cols: dims.cols,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                })
-                .map_err(|err| PtyError::Resize {
-                    cols: dims.cols,
-                    rows: dims.rows,
-                    reason: err.to_string(),
-                })?;
+            let guard = self.master.lock().expect("master pty mutex poisoned");
+            if let Some(master) = guard.as_ref() {
+                master
+                    .resize(PtySize {
+                        rows: dims.rows,
+                        cols: dims.cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .map_err(|err| PtyError::Resize {
+                        cols: dims.cols,
+                        rows: dims.rows,
+                        reason: err.to_string(),
+                    })?;
+            }
         }
 
         self.buffer.resize(dims.cols, dims.rows);
@@ -529,10 +539,17 @@ impl Drop for PtySession {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_reader_thread(
     mut reader: Box<dyn Read + Send>,
-    mut child: Box<dyn portable_pty::Child + Send + Sync>,
+    #[cfg_attr(windows, allow(unused_mut))] mut child: Box<dyn portable_pty::Child + Send + Sync>,
     child_pid: Option<u32>,
+    #[cfg_attr(not(windows), allow(unused_variables))] master: Arc<
+        Mutex<Option<Box<dyn MasterPty + Send>>>,
+    >,
+    #[cfg_attr(not(windows), allow(unused_variables))] writer: Arc<
+        Mutex<Option<Box<dyn Write + Send>>>,
+    >,
     buffer: Arc<TerminalBuffer>,
     last_working_dir: Arc<Mutex<Option<PathBuf>>>,
     osc7_working_dir: Arc<Mutex<Option<PathBuf>>>,
@@ -540,6 +557,27 @@ fn spawn_reader_thread(
     thread::Builder::new()
         .name("termewnal-pty-reader".to_string())
         .spawn(move || {
+            #[cfg(windows)]
+            let waiter = thread::Builder::new()
+                .name("termewnal-pty-waiter".to_string())
+                .spawn(move || {
+                    let code = match child.wait() {
+                        Ok(status) => Some(status.exit_code() as i32),
+                        Err(err) => {
+                            warn!(error = %err, "failed to wait on PTY child");
+                            None
+                        }
+                    };
+                    // Close ConPTY input and release MasterPty (`ClosePseudoConsole`) once the child
+                    // process exits so the reader pipe drains any final output and observes EOF.
+                    let popped_writer = writer.lock().ok().and_then(|mut w| w.take());
+                    drop(popped_writer);
+                    let popped_master = master.lock().ok().and_then(|mut m| m.take());
+                    drop(popped_master);
+                    code
+                })
+                .expect("spawn PTY waiter thread");
+
             let mut osc7_parser = VteParser::new();
             let mut osc7_tracker = Osc7Tracker {
                 osc7_working_dir: Arc::clone(&osc7_working_dir),
@@ -569,6 +607,9 @@ fn spawn_reader_thread(
                 }
             }
 
+            #[cfg(windows)]
+            let exit_code = waiter.join().ok().flatten();
+            #[cfg(not(windows))]
             let exit_code = match child.wait() {
                 Ok(status) => Some(status.exit_code() as i32),
                 Err(err) => {

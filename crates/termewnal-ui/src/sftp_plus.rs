@@ -698,10 +698,10 @@ pub fn copy_local_path_recursive(src: &Path, dst: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(src)
         .map_err(|err| format!("failed to inspect {}: {err}", src.display()))?;
     if meta.file_type().is_symlink() {
-        let target = fs::read_link(src)
-            .map_err(|err| format!("failed to read symlink {}: {err}", src.display()))?;
         #[cfg(unix)]
         {
+            let target = fs::read_link(src)
+                .map_err(|err| format!("failed to read symlink {}: {err}", src.display()))?;
             std::os::unix::fs::symlink(&target, dst)
                 .map_err(|err| format!("failed to create symlink {}: {err}", dst.display()))?;
             return Ok(());
