@@ -197,6 +197,7 @@ pub struct TerminalPalette {
     pub background: Color,
     pub cursor: Color,
     pub selection_bg: Color,
+    pub selection_fg: Option<Color>,
     pub match_bg: Color,
     pub match_fg: Color,
     pub active_match_bg: Color,
@@ -223,6 +224,7 @@ impl TerminalPalette {
             background: rgb_to_iced(core.background),
             cursor: rgb_to_iced(core.cursor),
             selection_bg: rgb_to_iced(core.selection_bg),
+            selection_fg: core.selection_fg.map(rgb_to_iced),
             match_bg: rgb_to_iced(core.match_bg),
             match_fg: rgb_to_iced(core.match_fg),
             active_match_bg: rgb_to_iced(core.active_match_bg),
@@ -347,7 +349,8 @@ struct ViewportState {
     cursor_cell: Option<(usize, usize)>,
     hovered_link: Option<DetectedLink>,
     dragging_selection: bool,
-    last_click: Option<(Instant, usize, usize, u8)>,
+    last_drag_scroll_delta: i32,
+    last_click: Option<(Instant, Point, u8)>,
     held_mouse_button: Option<PtyMouseButton>,
     last_motion_cell: Option<(usize, usize)>,
 }
@@ -362,6 +365,7 @@ impl Default for ViewportState {
             cursor_cell: None,
             hovered_link: None,
             dragging_selection: false,
+            last_drag_scroll_delta: 0,
             last_click: None,
             held_mouse_button: None,
             last_motion_cell: None,
@@ -457,22 +461,40 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             Event::Mouse(mouse::Event::CursorMoved { position }) => {
                 let prev_hover = state.hovered_link.clone();
                 let pty_mouse_active = self.snapshot.mouse_mode && !state.modifiers.shift();
-                if bounds.contains(*position) {
+                if state.dragging_selection {
                     let (col, row, side) = point_to_cell(*position, inner, cell_size, &self.snapshot);
+                    let delta_lines = compute_drag_scroll_delta(position.y, inner, cell_size.height);
+                    if bounds.contains(*position) {
+                        state.cursor_cell = Some((col, row));
+                    } else {
+                        state.cursor_cell = None;
+                        state.hovered_link = None;
+                    }
+                    shell.publish(Message::SelectionUpdate {
+                        session_id: self.session_id,
+                        col,
+                        row,
+                        side,
+                    });
+                    if delta_lines != state.last_drag_scroll_delta || delta_lines != 0 {
+                        state.last_drag_scroll_delta = delta_lines;
+                        shell.publish(Message::SelectionDragScroll {
+                            session_id: self.session_id,
+                            col,
+                            row,
+                            side,
+                            delta_lines,
+                        });
+                    }
+                } else if bounds.contains(*position) {
+                    let (col, row, _side) = point_to_cell(*position, inner, cell_size, &self.snapshot);
                     state.cursor_cell = Some((col, row));
                     state.hovered_link = if state.modifiers.control() {
                         link_at_cell(&self.snapshot, col, row)
                     } else {
                         None
                     };
-                    if state.dragging_selection {
-                        shell.publish(Message::SelectionUpdate {
-                            session_id: self.session_id,
-                            col,
-                            row,
-                            side,
-                        });
-                    } else if pty_mouse_active
+                    if pty_mouse_active
                         && (state.held_mouse_button.is_some() || self.snapshot.mouse_motion)
                         && state.last_motion_cell != Some((col, row))
                     {
@@ -515,6 +537,8 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 if !clicked_inside {
                     state.ime.clear();
                     state.dragging_selection = false;
+                    state.last_drag_scroll_delta = 0;
+                    state.last_click = None;
                     return;
                 }
 
@@ -561,20 +585,43 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                         return;
                     }
 
-                    let click_count = next_click_count(&mut state.last_click, col, row);
-                    let selection_type = match click_count {
-                        2 => SelectionType::Semantic,
-                        3 => SelectionType::Lines,
-                        _ => SelectionType::Simple,
-                    };
+                    let shift = state.modifiers.shift();
+                    let alt = state.modifiers.alt();
                     state.dragging_selection = true;
-                    shell.publish(Message::SelectionStart {
-                        session_id: self.session_id,
-                        col,
-                        row,
-                        side,
-                        selection_type,
-                    });
+                    state.last_drag_scroll_delta = 0;
+
+                    if alt {
+                        state.last_click = None;
+                        shell.publish(Message::SelectionStart {
+                            session_id: self.session_id,
+                            col,
+                            row,
+                            side,
+                            selection_type: SelectionType::Block,
+                        });
+                    } else if shift {
+                        state.last_click = None;
+                        shell.publish(Message::SelectionExtend {
+                            session_id: self.session_id,
+                            col,
+                            row,
+                            side,
+                        });
+                    } else {
+                        let click_count = next_click_count(&mut state.last_click, abs);
+                        let selection_type = match click_count {
+                            2 => SelectionType::Semantic,
+                            3 => SelectionType::Lines,
+                            _ => SelectionType::Simple,
+                        };
+                        shell.publish(Message::SelectionStart {
+                            session_id: self.session_id,
+                            col,
+                            row,
+                            side,
+                            selection_type,
+                        });
+                    }
                     shell.capture_event();
                 }
             }
@@ -598,6 +645,7 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
                 }
                 if state.dragging_selection {
                     state.dragging_selection = false;
+                    state.last_drag_scroll_delta = 0;
                     shell.publish(Message::SelectionFinish {
                         session_id: self.session_id,
                     });
@@ -863,7 +911,9 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
         _renderer: &iced::Renderer,
     ) -> mouse::Interaction {
         let state = tree.state.downcast_ref::<ViewportState>();
-        if cursor.is_over(layout.bounds()) {
+        if state.dragging_selection {
+            mouse::Interaction::Text
+        } else if cursor.is_over(layout.bounds()) {
             if state.hovered_link.is_some() {
                 mouse::Interaction::Pointer
             } else {
@@ -925,6 +975,8 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             weight: iced::font::Weight::Bold,
             ..self.font
         };
+        let mut row_bgs = vec![palette.background; cols];
+        let mut row_fgs = vec![(palette.foreground, false); cols];
 
         for row in 0..rows {
             let y = inner.y + (row as f32) * cell_size.height;
@@ -936,101 +988,107 @@ impl Widget<Message, Theme, iced::Renderer> for TerminalViewport {
             }
 
             let grid_line = self.snapshot.top_line + row as i32;
+            row_bgs.fill(palette.background);
+            row_fgs.fill((palette.foreground, false));
+            for col in 0..cols {
+                let Some(cell) = self.snapshot.cell(col, row) else {
+                    break;
+                };
+                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                    continue;
+                }
+                let hl = highlight_grid.get(row * cols + col).copied().flatten();
+                let (fg, bg, bold) =
+                    self.resolve_cell_appearance(cell, palette, grid_line, col, row, cols, hl);
+                row_bgs[col] = bg;
+                row_fgs[col] = (fg, bold);
+                if cell.flags.contains(CellFlags::WIDE_CHAR) && col + 1 < cols {
+                    row_bgs[col + 1] = bg;
+                }
+            }
+
+            // Pass 1: Draw coalesced background quads across all cells (including spaces & wide chars).
+            for (span_start, span_end, bg) in coalesce_row_bg_spans(&row_bgs, palette.background) {
+                let span_x = inner.x + (span_start as f32) * cell_size.width;
+                let span_w = ((span_end - span_start) as f32) * cell_size.width;
+                renderer.fill_quad(
+                    Quad {
+                        bounds: Rectangle::new(
+                            Point::new(span_x, y),
+                            Size::new(span_w, cell_size.height),
+                        ),
+                        border: Border::default(),
+                        shadow: Shadow::default(),
+                        snap: true,
+                    },
+                    Background::Color(bg),
+                );
+            }
+
+            // Pass 2: Draw coalesced text runs on top so adjacent glyphs never leave background gaps.
             let mut col = 0;
             while col < cols {
                 let Some(cell) = self.snapshot.cell(col, row) else {
                     break;
                 };
 
-                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER)
+                    || cell.flags.contains(CellFlags::LEADING_WIDE_CHAR_SPACER)
+                    || cell.c == ' '
+                    || cell.c == '\0'
+                {
                     col += 1;
                     continue;
                 }
 
-                let hl = highlight_grid.get(row * cols + col).copied().flatten();
-                let (fg, bg, run_bold) =
-                    self.resolve_cell_appearance(cell, palette, grid_line, col, row, cols, hl);
+                let (run_fg, run_bold) = row_fgs[col];
+                let mut run = String::new();
+                run.push(cell.c);
+                let run_start_col = col;
+                let first_ascii = cell.c.is_ascii();
 
-                let cell_width_cells = if cell.flags.contains(CellFlags::WIDE_CHAR) {
-                    2.0
-                } else {
-                    1.0
-                };
-                let x = inner.x + (col as f32) * cell_size.width;
-
-                if bg != palette.background {
-                    renderer.fill_quad(
-                        Quad {
-                            bounds: Rectangle::new(
-                                Point::new(x, y),
-                                Size::new(cell_size.width * cell_width_cells, cell_size.height),
-                            ),
-                            border: Border::default(),
-                            shadow: Shadow::default(),
-                            snap: true,
-                        },
-                        Background::Color(bg),
-                    );
-                }
-
-                if cell.c != ' ' && cell.c != '\0' {
-                    let mut run = String::new();
-                    run.push(cell.c);
-                    let run_start_col = col;
-                    let run_fg = fg;
-                    let first_ascii = cell.c.is_ascii();
-
-                    if !cell.flags.contains(CellFlags::WIDE_CHAR) {
-                        while col + 1 < cols {
-                            let Some(next) = self.snapshot.cell(col + 1, row) else {
-                                break;
-                            };
-                            if next.c == ' '
-                                || next.c == '\0'
-                                || next.flags.contains(CellFlags::WIDE_CHAR)
-                                || next.flags.contains(CellFlags::WIDE_CHAR_SPACER)
-                            {
-                                break;
-                            }
-                            if !self.options.font_ligatures && (next.c.is_ascii() != first_ascii) {
-                                break;
-                            }
-                            let next_hl = highlight_grid.get(row * cols + col + 1).copied().flatten();
-                            let (next_fg, next_bg, next_bold) = self.resolve_cell_appearance(
-                                next,
-                                palette,
-                                grid_line,
-                                col + 1,
-                                row,
-                                cols,
-                                next_hl,
-                            );
-                            if next_fg != run_fg || next_bg != bg || next_bold != run_bold {
-                                break;
-                            }
-                            col += 1;
-                            run.push(next.c);
+                if !cell.flags.contains(CellFlags::WIDE_CHAR) {
+                    while col + 1 < cols {
+                        let Some(next) = self.snapshot.cell(col + 1, row) else {
+                            break;
+                        };
+                        if next.c == ' '
+                            || next.c == '\0'
+                            || next.flags.contains(CellFlags::WIDE_CHAR)
+                            || next.flags.contains(CellFlags::WIDE_CHAR_SPACER)
+                            || next.flags.contains(CellFlags::LEADING_WIDE_CHAR_SPACER)
+                        {
+                            break;
                         }
+                        if !self.options.font_ligatures && (next.c.is_ascii() != first_ascii) {
+                            break;
+                        }
+                        let (next_fg, next_bold) = row_fgs[col + 1];
+                        if next_fg != run_fg || next_bold != run_bold {
+                            break;
+                        }
+                        col += 1;
+                        run.push(next.c);
                     }
-
-                    let run_x = inner.x + (run_start_col as f32) * cell_size.width;
-                    renderer.fill_text(
-                        Text {
-                            content: run,
-                            bounds: Size::new(inner.width, cell_size.height),
-                            size: Pixels(self.options.font_size),
-                            line_height: LineHeight::Absolute(Pixels(cell_size.height)),
-                            font: if run_bold { bold_font } else { self.font },
-                            align_x: text::Alignment::Left,
-                            align_y: iced::alignment::Vertical::Top,
-                            shaping,
-                            wrapping: Wrapping::None,
-                        },
-                        Point::new(run_x, y),
-                        run_fg,
-                        clip_bounds,
-                    );
                 }
+
+                let run_x = inner.x + (run_start_col as f32) * cell_size.width;
+                renderer.fill_text(
+                    Text {
+                        content: run,
+                        bounds: Size::new(inner.width, cell_size.height),
+                        size: Pixels(self.options.font_size),
+                        line_height: LineHeight::Absolute(Pixels(cell_size.height)),
+                        font: if run_bold { bold_font } else { self.font },
+                        align_x: text::Alignment::Left,
+                        align_y: iced::alignment::Vertical::Top,
+                        shaping,
+                        wrapping: Wrapping::None,
+                    },
+                    Point::new(run_x, y),
+                    run_fg,
+                    clip_bounds,
+                );
 
                 col += 1;
             }
@@ -1248,8 +1306,13 @@ impl TerminalViewport {
                 fg = palette.match_fg;
                 bg = palette.match_bg;
             }
-        } else if self.snapshot.is_cell_selected(col, row) {
+        } else if self.snapshot.is_cell_visually_selected(col, row) {
             bg = palette.selection_bg;
+            fg = if cell.flags.contains(CellFlags::HIDDEN) {
+                bg
+            } else {
+                resolve_selection_fg(fg, bg, palette)
+            };
         }
 
         (fg, bg, bold)
@@ -1363,23 +1426,116 @@ fn point_to_cell(
 }
 
 fn next_click_count(
-    last_click: &mut Option<(Instant, usize, usize, u8)>,
-    col: usize,
-    row: usize,
+    last_click: &mut Option<(Instant, Point, u8)>,
+    pos: Point,
 ) -> u8 {
     let now = Instant::now();
     let count = match *last_click {
-        Some((prev_time, prev_col, prev_row, prev_count))
-            if prev_col == col
-                && prev_row == row
-                && now.duration_since(prev_time).as_millis() <= 400 =>
+        Some((prev_time, prev_pos, prev_count))
+            if now.duration_since(prev_time).as_millis() <= 400 =>
         {
-            if prev_count >= 3 { 1 } else { prev_count + 1 }
+            let dx = pos.x - prev_pos.x;
+            let dy = pos.y - prev_pos.y;
+            if dx * dx + dy * dy <= 36.0 {
+                if prev_count >= 3 { 1 } else { prev_count + 1 }
+            } else {
+                1
+            }
         }
         _ => 1,
     };
-    *last_click = Some((now, col, row, count));
+    *last_click = Some((now, pos, count));
     count
+}
+
+fn compute_drag_scroll_delta(pos_y: f32, inner: Rectangle, cell_height: f32) -> i32 {
+    let line_h = cell_height.max(8.0);
+    if pos_y < inner.y {
+        let overshoot = inner.y - pos_y;
+        ((overshoot / line_h).ceil() as i32).clamp(1, 5)
+    } else if pos_y >= inner.y + inner.height {
+        let overshoot = pos_y - (inner.y + inner.height);
+        -(((overshoot / line_h).ceil() as i32).clamp(1, 5))
+    } else {
+        0
+    }
+}
+
+fn coalesce_row_bg_spans(row_bgs: &[Color], default_bg: Color) -> Vec<(usize, usize, Color)> {
+    let mut spans = Vec::new();
+    let mut col = 0;
+    while col < row_bgs.len() {
+        let bg = row_bgs[col];
+        if bg == default_bg {
+            col += 1;
+            continue;
+        }
+        let start = col;
+        col += 1;
+        while col < row_bgs.len() && row_bgs[col] == bg {
+            col += 1;
+        }
+        spans.push((start, col, bg));
+    }
+    spans
+}
+
+fn linear_srgb_channel(c: f32) -> f32 {
+    if c <= 0.04045 {
+        c / 12.92
+    } else {
+        ((c + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn relative_luminance(c: Color) -> f32 {
+    0.2126 * linear_srgb_channel(c.r)
+        + 0.7152 * linear_srgb_channel(c.g)
+        + 0.0722 * linear_srgb_channel(c.b)
+}
+
+fn contrast_ratio(a: Color, b: Color) -> f32 {
+    let la = relative_luminance(a);
+    let lb = relative_luminance(b);
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+fn best_contrast_fg(bg_opaque: Color, palette: &TerminalPalette) -> Color {
+    let candidates = [
+        palette.foreground,
+        palette.background,
+        Color::WHITE,
+        Color::from_rgb8(15, 23, 42),
+    ];
+    candidates
+        .into_iter()
+        .max_by(|a, b| {
+            let ca = contrast_ratio(Color { a: 1.0, ..*a }, bg_opaque);
+            let cb = contrast_ratio(Color { a: 1.0, ..*b }, bg_opaque);
+            ca.total_cmp(&cb)
+        })
+        .map(|c| Color { a: 1.0, ..c })
+        .unwrap_or(Color::WHITE)
+}
+
+fn resolve_selection_fg(fg: Color, selection_bg: Color, palette: &TerminalPalette) -> Color {
+    if let Some(explicit) = palette.selection_fg {
+        return explicit;
+    }
+    let fg_opaque = Color { a: 1.0, ..fg };
+    let bg_opaque = Color {
+        a: 1.0,
+        ..selection_bg
+    };
+    if contrast_ratio(fg_opaque, bg_opaque) >= 3.2 {
+        Color {
+            a: fg.a.max(0.85),
+            ..fg
+        }
+    } else {
+        best_contrast_fg(bg_opaque, palette)
+    }
 }
 
 fn resolve_font(font_family: &str) -> Font {
@@ -1616,4 +1772,87 @@ fn indexed_color(idx: u8, ansi: &[Color; 16]) -> Color {
 
 fn rgb(r: u8, g: u8, b: u8) -> Color {
     Color::from_rgb8(r, g, b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn two_pass_bg_coalescing_merges_words_and_spaces_without_gaps() {
+        let default_bg = rgb(30, 30, 30);
+        let sel_bg = rgb(38, 79, 120);
+        let row_bgs = [
+            default_bg, default_bg, sel_bg, sel_bg, sel_bg, sel_bg, sel_bg, default_bg, sel_bg,
+        ];
+        assert_eq!(
+            coalesce_row_bg_spans(&row_bgs, default_bg),
+            vec![(2, 7, sel_bg), (8, 9, sel_bg)]
+        );
+    }
+
+    #[test]
+    fn selection_fg_contrast_ensures_legibility_for_explicit_inverse_and_light_themes() {
+        let mut dark_palette = TerminalPalette::from_core(&ThemePalette::for_name("Dark"));
+        let inverse_dark_fg = dark_palette.background;
+        let resolved_dark =
+            resolve_selection_fg(inverse_dark_fg, dark_palette.selection_bg, &dark_palette);
+        assert!(
+            contrast_ratio(
+                Color {
+                    a: 1.0,
+                    ..resolved_dark
+                },
+                Color {
+                    a: 1.0,
+                    ..dark_palette.selection_bg
+                }
+            ) >= 3.2
+        );
+
+        let light_palette = TerminalPalette::from_core(&ThemePalette::for_name("Light"));
+        let bright_fg = Color::WHITE;
+        let resolved_light =
+            resolve_selection_fg(bright_fg, light_palette.selection_bg, &light_palette);
+        assert!(
+            contrast_ratio(
+                Color {
+                    a: 1.0,
+                    ..resolved_light
+                },
+                Color {
+                    a: 1.0,
+                    ..light_palette.selection_bg
+                }
+            ) >= 3.2
+        );
+
+        let custom_fg = rgb(255, 215, 0);
+        dark_palette.selection_fg = Some(custom_fg);
+        assert_eq!(
+            resolve_selection_fg(inverse_dark_fg, dark_palette.selection_bg, &dark_palette),
+            custom_fg
+        );
+    }
+
+    #[test]
+    fn next_click_count_respects_pixel_drift_tolerance() {
+        let mut last_click = None;
+        assert_eq!(next_click_count(&mut last_click, Point::new(100.0, 40.0)), 1);
+        // 5.0 px Euclidean drift <= 6.0 px threshold still increments to double and triple click.
+        assert_eq!(next_click_count(&mut last_click, Point::new(104.0, 43.0)), 2);
+        assert_eq!(next_click_count(&mut last_click, Point::new(104.0, 46.0)), 3);
+        // Larger jump > 6.0 px starts a fresh single click.
+        assert_eq!(next_click_count(&mut last_click, Point::new(115.0, 46.0)), 1);
+    }
+
+    #[test]
+    fn drag_scroll_delta_scales_with_vertical_overshoot() {
+        let inner = Rectangle::new(Point::new(14.0, 20.0), Size::new(500.0, 200.0));
+        assert_eq!(compute_drag_scroll_delta(50.0, inner, 16.0), 0);
+        assert_eq!(compute_drag_scroll_delta(19.0, inner, 16.0), 1);
+        assert_eq!(compute_drag_scroll_delta(-80.0, inner, 16.0), 5);
+        assert_eq!(compute_drag_scroll_delta(221.0, inner, 16.0), -1);
+        assert_eq!(compute_drag_scroll_delta(350.0, inner, 16.0), -5);
+    }
 }

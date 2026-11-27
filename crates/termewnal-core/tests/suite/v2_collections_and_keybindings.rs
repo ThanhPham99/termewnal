@@ -45,6 +45,52 @@ fn keybindings_parse_resolve_single_and_multi_chord_sequences() {
 }
 
 #[test]
+fn toggle_sidebar_default_ctrl_shift_s_yields_to_user_overrides_and_keeps_ctrl_b_unbound() {
+    assert_eq!(KeyAction::ALL.len(), 47);
+    assert!(KeyAction::ALL.contains(&KeyAction::ToggleSidebar));
+
+    let default_cfg = KeybindingConfig::default();
+    let default_resolver = default_cfg.resolver();
+    let ctrl_shift_s = KeyChord::parse("Ctrl+Shift+S").unwrap();
+    let ctrl_shift_b = KeyChord::parse("Ctrl+Shift+B").unwrap();
+    let ctrl_b = KeyChord::parse("Ctrl+B").unwrap();
+
+    assert_eq!(
+        default_resolver.resolve_step(&[], &ctrl_shift_s),
+        ChordMatch::Matched(KeyAction::ToggleSidebar)
+    );
+    assert_eq!(
+        default_resolver.resolve_step(&[], &ctrl_shift_b),
+        ChordMatch::Matched(KeyAction::ToggleBroadcastInput)
+    );
+    assert_eq!(
+        default_resolver.resolve_step(&[], &ctrl_b),
+        ChordMatch::NoMatch
+    );
+
+    // Custom binding on a later action in KeyAction::ALL must override ToggleSidebar's default.
+    let mut override_cfg = KeybindingConfig::default();
+    override_cfg
+        .set_bindings(KeyAction::SaveScrollback, vec!["Ctrl+Shift+S".to_string()])
+        .expect("valid custom binding");
+    let override_resolver = override_cfg.resolver();
+    assert_eq!(
+        override_resolver.resolve_step(&[], &ctrl_shift_s),
+        ChordMatch::Matched(KeyAction::SaveScrollback)
+    );
+
+    // Explicit empty override disables ToggleSidebar default cleanly.
+    let mut unbound_cfg = KeybindingConfig::default();
+    unbound_cfg
+        .set_bindings(KeyAction::ToggleSidebar, Vec::new())
+        .expect("empty unbind succeeds");
+    assert_eq!(
+        unbound_cfg.resolver().resolve_step(&[], &ctrl_shift_s),
+        ChordMatch::NoMatch
+    );
+}
+
+#[test]
 fn quick_commands_and_workspaces_persist_atomically_with_backups() {
     let temp = TempDir::new().expect("temp root");
     let paths = ConfigPaths::from_root(temp.path());

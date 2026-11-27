@@ -463,3 +463,31 @@ fn cli_flags_parse_and_ipc_cwd_profile_and_toggle_quake_dispatch() {
     let _ = state.update(Message::IpcCommand(IpcCommand::ToggleQuake));
     assert!(!state.quake().is_visible());
 }
+
+#[test]
+fn quake_window_ignores_hide_on_blur_while_os_dialog_in_flight() {
+    let temp = TempDir::new().unwrap();
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut cfg = AppConfig::default();
+    cfg.quake.hide_on_blur = true;
+    save_config(&paths, &cfg).unwrap();
+
+    let mut state = boot_test_app(paths).unwrap();
+    let _ = state.update(Message::IpcCommand(IpcCommand::ToggleQuake));
+    let quake_win = state.quake().window_id().expect("quake win opened");
+    let _ = state.update(Message::WindowOpened(quake_win));
+    assert!(state.quake().is_visible());
+    assert_eq!(state.in_flight_os_dialogs(), 0);
+
+    // Launch an OS file picker dialog from Quake: in-flight guard blocks blur auto-hide.
+    let _ = state.update(Message::SettingsBrowseSftpDownloadDir);
+    assert_eq!(state.in_flight_os_dialogs(), 1);
+    let _ = state.update(Message::WindowUnfocused(quake_win));
+    assert!(state.quake().is_visible());
+
+    // Canceling or picking decrements in_flight_os_dialogs back to 0, re-enabling hide_on_blur.
+    let _ = state.update(Message::SettingsSftpDownloadDirPicked(None));
+    assert_eq!(state.in_flight_os_dialogs(), 0);
+    let _ = state.update(Message::WindowUnfocused(quake_win));
+    assert!(!state.quake().is_visible());
+}

@@ -13,12 +13,24 @@ An active runtime workspace opened from a Profile or quick-connect, owning a ter
 _Avoid_: Tab, connection, window
 
 **Pane**:
-A rectangular region within a workspace tab that hosts one **Session** and, for SSH **Session**s, an optional **SFTP Panel** docked on its right side.
+A rectangular region within a workspace tab that hosts one **Session** and, for SSH **Session**s, an optional **SFTP Panel** docked on its right side or opened as an overlay.
 _Avoid_: Split frame, terminal box
+
+**Start Page**:
+The calibrated onboarding landing view rendered inside an empty workspace tab when zero sessions are open, surfacing `New SSH connection`, `~/.ssh/config` import, direct protocol chips, recent Profiles, and core keyboard shortcuts.
+_Avoid_: Welcome screen, splash page
+
+**Quake Mode**:
+A compact top drop-down window toggled via global hotkey that pins its Left Sidebar closed by default and suppresses docked **SFTP Panel** splits into an in-pane overlay so terminal columns remain readable.
+_Avoid_: Scratchpad window, visor overlay
 
 **SFTP Panel**:
 A remote-only SFTP file browser and **Transfer** queue view (labeled `SFTP+` in the UI) docked to the right of an SSH **Session**'s **Pane**.
 _Avoid_: SFTP drawer, SFTP tab, dual-pane commander
+
+**Remote File Editor**:
+An in-app viewer and text editor opened from an **SFTP Panel** to inspect (`View`) or edit and save (`Edit`) a remote UTF-8 file directly over SFTP, distinct from launching a local application via `Open with...`.
+_Avoid_: SFTP popup, inline notepad, file modal
 
 **Tunnel**:
 A port forwarding rule (`Local`, `Remote`, or `Dynamic` SOCKS5) and its managed lifecycle bound to an SSH connection.

@@ -222,6 +222,7 @@ struct TitleDragLocal {
 pub struct TitleBarDragZone<'a> {
     window_id: window::Id,
     enabled: bool,
+    top_resize_guard_px: f32,
     content: Element<'a, Message, Theme, iced::Renderer>,
 }
 
@@ -231,11 +232,43 @@ impl<'a> TitleBarDragZone<'a> {
         enabled: bool,
         content: Element<'a, Message, Theme, iced::Renderer>,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
+        Self::with_resize_guard(
+            window_id,
+            enabled,
+            if enabled { EDGE_RESIZE_HIT_PX } else { 0.0 },
+            content,
+        )
+    }
+
+    pub fn with_resize_guard(
+        window_id: window::Id,
+        enabled: bool,
+        top_resize_guard_px: f32,
+        content: Element<'a, Message, Theme, iced::Renderer>,
+    ) -> Element<'a, Message, Theme, iced::Renderer> {
         Element::new(Self {
             window_id,
             enabled,
+            top_resize_guard_px: top_resize_guard_px.max(0.0),
             content,
         })
+    }
+
+    /// Evaluates whether the drag spacer accepts a mouse press without overlapping a top resize bezel or captured child.
+    pub fn allows_drag_at(
+        enabled: bool,
+        child_captured: bool,
+        top_resize_guard_px: f32,
+        bounds: Rectangle,
+        cursor_pos: Option<Point>,
+    ) -> bool {
+        let Some(pos) = cursor_pos else {
+            return false;
+        };
+        enabled
+            && !child_captured
+            && bounds.contains(pos)
+            && pos.y >= bounds.y + top_resize_guard_px.max(0.0)
     }
 }
 
@@ -305,7 +338,13 @@ impl Widget<Message, Theme, iced::Renderer> for TitleBarDragZone<'_> {
             viewport,
         );
 
-        if !self.enabled || shell.is_event_captured() || !cursor.is_over(layout.bounds()) {
+        if !Self::allows_drag_at(
+            self.enabled,
+            shell.is_event_captured(),
+            self.top_resize_guard_px,
+            layout.bounds(),
+            cursor.position(),
+        ) {
             return;
         }
 
@@ -414,9 +453,7 @@ impl<'a> BorderlessResizeFrame<'a> {
     fn edge_direction(bounds: Rectangle, pos: Point) -> Option<window::Direction> {
         let on_left = pos.x <= bounds.x + EDGE_RESIZE_HIT_PX;
         let on_right = pos.x >= bounds.x + bounds.width - EDGE_RESIZE_HIT_PX;
-        // Keep top-right window controls clickable right to the very top edge.
-        let on_top = pos.y <= bounds.y + EDGE_RESIZE_HIT_PX
-            && pos.x < bounds.x + bounds.width - 190.0;
+        let on_top = pos.y <= bounds.y + EDGE_RESIZE_HIT_PX;
         let on_bottom = pos.y >= bounds.y + bounds.height - EDGE_RESIZE_HIT_PX;
 
         match (on_left, on_right, on_top, on_bottom) {
@@ -430,6 +467,24 @@ impl<'a> BorderlessResizeFrame<'a> {
             (false, false, false, true) => Some(window::Direction::South),
             _ => None,
         }
+    }
+
+    /// Resolves whether an uncaptured left press on the outer borderless frame starts edge resizing.
+    pub fn resolve_resize_press(
+        enabled: bool,
+        child_captured: bool,
+        is_left_press: bool,
+        bounds: Rectangle,
+        cursor_pos: Option<Point>,
+    ) -> Option<window::Direction> {
+        if !enabled || child_captured || !is_left_press {
+            return None;
+        }
+        let pos = cursor_pos?;
+        if !bounds.contains(pos) {
+            return None;
+        }
+        Self::edge_direction(bounds, pos)
     }
 }
 
@@ -480,17 +535,6 @@ impl Widget<Message, Theme, iced::Renderer> for BorderlessResizeFrame<'_> {
         shell: &mut Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        if self.enabled
-            && let Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = event
-            && let Some(pos) = cursor.position()
-            && layout.bounds().contains(pos)
-            && let Some(dir) = Self::edge_direction(layout.bounds(), pos)
-        {
-            shell.publish(Message::WindowEdgeResize(self.window_id, dir));
-            shell.capture_event();
-            return;
-        }
-
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
@@ -501,6 +545,21 @@ impl Widget<Message, Theme, iced::Renderer> for BorderlessResizeFrame<'_> {
             shell,
             viewport,
         );
+
+        let is_left_press = matches!(
+            event,
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+        );
+        if let Some(dir) = Self::resolve_resize_press(
+            self.enabled,
+            shell.is_event_captured(),
+            is_left_press,
+            layout.bounds(),
+            cursor.position(),
+        ) {
+            shell.publish(Message::WindowEdgeResize(self.window_id, dir));
+            shell.capture_event();
+        }
     }
 
     fn mouse_interaction(
@@ -511,6 +570,16 @@ impl Widget<Message, Theme, iced::Renderer> for BorderlessResizeFrame<'_> {
         viewport: &Rectangle,
         renderer: &iced::Renderer,
     ) -> mouse::Interaction {
+        let child_cursor = self.content.as_widget().mouse_interaction(
+            &tree.children[0],
+            layout,
+            cursor,
+            viewport,
+            renderer,
+        );
+        if child_cursor != mouse::Interaction::None {
+            return child_cursor;
+        }
         if self.enabled
             && let Some(pos) = cursor.position()
             && layout.bounds().contains(pos)
@@ -532,13 +601,7 @@ impl Widget<Message, Theme, iced::Renderer> for BorderlessResizeFrame<'_> {
             };
         }
 
-        self.content.as_widget().mouse_interaction(
-            &tree.children[0],
-            layout,
-            cursor,
-            viewport,
-            renderer,
-        )
+        child_cursor
     }
 
     fn draw(
@@ -580,17 +643,24 @@ impl Widget<Message, Theme, iced::Renderer> for BorderlessResizeFrame<'_> {
     }
 }
 
-/// Renders the compact Tabby top System Title Bar used when the tab strip is docked Bottom/Left/Right.
+/// Renders the compact 40px top System Title Bar used when the tab strip is docked Bottom/Left/Right.
 pub fn render_top_system_title_bar<'a>(
     window_id: window::Id,
     title: String,
+    left_controls: Element<'a, Message, Theme, iced::Renderer>,
     right_controls: Element<'a, Message, Theme, iced::Renderer>,
     bar_height: f32,
     chrome: ChromePalette,
+    top_resize_guard: bool,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
-    let drag_spacer = TitleBarDragZone::new(
+    let drag_spacer = TitleBarDragZone::with_resize_guard(
         window_id,
         true,
+        if top_resize_guard {
+            EDGE_RESIZE_HIT_PX
+        } else {
+            0.0
+        },
         row![
             container(space::horizontal().width(6).height(6)).style(move |_| container::Style {
                 background: Some(Background::Color(chrome.accent)),
@@ -618,7 +688,7 @@ pub fn render_top_system_title_bar<'a>(
     );
 
     container(
-        row![drag_spacer, right_controls]
+        row![left_controls, drag_spacer, right_controls]
             .spacing(0)
             .height(Length::Fixed(bar_height))
             .align_y(Alignment::Center),

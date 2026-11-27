@@ -348,6 +348,7 @@ pub fn render_context_menu_overlay<'a>(
             if *is_ssh {
                 col = col.push(menu_row("Toggle SFTP+ Panel", Some("Ctrl+Shift+E"), chrome, Message::ToggleSftpDrawer));
             }
+            col = col.push(menu_row("Toggle Profiles Sidebar", Some("Ctrl+Shift+S"), chrome, Message::ToggleSidebar));
             col = col.push(hairline_h(chrome));
             col = col.push(menu_row("Close Pane", Some("Ctrl+Shift+W"), chrome, Message::CloseFocusedPane));
             col.into()
@@ -589,6 +590,12 @@ pub fn render_context_menu_overlay<'a>(
                     None,
                     chrome,
                     Message::OpenTabbyImportModal,
+                ));
+                col = col.push(menu_row(
+                    "Toggle Profiles Sidebar",
+                    Some("Ctrl+Shift+S"),
+                    chrome,
+                    Message::ToggleSidebar,
                 ));
             }
             col.into()

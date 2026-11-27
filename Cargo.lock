@@ -5390,6 +5390,7 @@ dependencies = [
  "notify-debouncer-mini",
  "open",
  "rand",
+ "regex",
  "rfd",
  "russh",
  "russh-sftp",

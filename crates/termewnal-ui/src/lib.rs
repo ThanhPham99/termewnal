@@ -12,6 +12,7 @@ pub mod keybinding_bridge;
 pub mod notifications;
 pub mod profile_ui;
 pub mod quake_and_tray;
+pub mod remote_editor;
 pub mod server_stats_bar;
 pub mod settings_ui;
 pub mod sftp_drawer;
@@ -79,6 +80,11 @@ pub use sftp_plus::{
     WatchedRemoteFile, render_sftp_context_menu_overlay, render_sftp_panel, render_sftp_plus_modal,
     visible_remote_entries,
 };
+pub use remote_editor::{
+    EditorLineEnding, EditorMatch, EditorSearchOptions, RemoteEditor, RemoteEditorEvent,
+    RemoteEditorState, UnsavedConfirmAction,
+};
+pub use split_view::RemoteEditorShortcut;
 pub use sidebar::{
     ActiveTunnelEntry, ProfileGroupView, SidebarDock, SidebarFilterScope, SidebarSection,
     SidebarSelectedEntry, SidebarSessionEntry, SidebarState, SystemSshProfile, TunnelRuntimeState,

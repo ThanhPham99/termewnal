@@ -22,9 +22,10 @@ use crate::context_menu::{SidebarRightClickCapture, TunnelRightClickCapture};
 use crate::drag_drop::{DragDropState, DragPayload, DragSource, DropTarget, DropTargetZone, DropZoneKind};
 use crate::ui_theme::{
     ChromePalette, DividerDragState, DividerPress, FONT_BODY, FONT_META, badge_pill,
-    clamp_sidebar_width, draw_interactive_divider, hairline_h, hairline_v, list_row_button_style,
-    mono_font, settings_nav_pill_style, sidebar_width_for_window, status_dot, styled_input_style,
-    tab_bar_button_style, tabby_scrollable_style, ui_font, ui_font_medium, ui_font_semibold,
+    clamp_sidebar_width, draw_interactive_divider, hairline_h, hairline_v, keycap_pill,
+    list_row_button_style, mono_font, settings_nav_pill_style, sidebar_width_for_window,
+    status_dot, styled_input_style, tab_bar_button_style, tabby_scrollable_style, ui_font,
+    ui_font_medium, ui_font_semibold,
 };
 use crate::workspace::TabId;
 
@@ -212,7 +213,7 @@ pub enum SidebarSelectedEntry {
     SystemSsh(String),
 }
 
-/// State backing the always-visible Left Sidebar.
+/// Collapsible Left Sidebar filter/group/section state (mirrored per-window by `AppState`).
 #[derive(Debug, Clone)]
 pub struct SidebarState {
     open: bool,
@@ -245,25 +246,25 @@ impl Default for SidebarState {
 }
 
 impl SidebarState {
-    /// Creates a new [`SidebarState`] (always expanded).
+    /// Creates a new [`SidebarState`] (expanded by default).
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Returns `true` (the Left Sidebar is always visible).
+    /// Returns whether the Left Sidebar is open.
     pub fn is_open(&self) -> bool {
         self.open
     }
 
-    /// Keeps the Left Sidebar open (toggling/collapsing is disabled).
-    pub fn set_open(&mut self, _open: bool) {
-        self.open = true;
+    /// Sets the Left Sidebar visibility.
+    pub fn set_open(&mut self, open: bool) {
+        self.open = open;
     }
 
-    /// Keeps the Left Sidebar open (toggling/collapsing is disabled).
+    /// Toggles the Left Sidebar visibility and returns the new state.
     pub fn toggle(&mut self) -> bool {
-        self.open = true;
-        true
+        self.open = !self.open;
+        self.open
     }
 
     /// Returns the active profile tree filter scope (`All` or `Active`).
@@ -921,34 +922,51 @@ fn render_sidebar_full_inner<'a>(
     );
 
     let footer = container(
-        row![
-            button(text("SSH").size(10.5).color(chrome.text_muted))
-                .padding([2, 5])
-                .style(tab_bar_button_style(chrome, false, false))
-                .on_press(Message::OpenQuickConnectPalette),
-            button(text("Import").size(10.5).color(chrome.text_muted))
-                .padding([2, 5])
-                .style(tab_bar_button_style(chrome, false, false))
-                .on_press(Message::OpenTabbyImportModal),
-            button(text("Cmds").size(10.5).color(chrome.text_muted))
-                .padding([2, 5])
-                .style(tab_bar_button_style(chrome, false, false))
-                .on_press(Message::OpenQuickCommandsModal),
-            button(text("Spaces").size(10.5).color(chrome.text_muted))
-                .padding([2, 5])
-                .style(tab_bar_button_style(chrome, false, false))
-                .on_press(Message::OpenWorkspacesModal),
-            space::horizontal(),
-            button(text("⚙").size(12.5).color(chrome.text_secondary))
-                .padding([2, 6])
-                .style(tab_bar_button_style(chrome, false, false))
-                .on_press(Message::OpenSettingsModal),
+        column![
+            row![
+                button(text("SSH").size(FONT_META).color(chrome.text_secondary))
+                    .padding([3, 6])
+                    .style(tab_bar_button_style(chrome, false, false))
+                    .on_press(Message::OpenQuickConnectPalette),
+                button(text("Import").size(FONT_META).color(chrome.text_secondary))
+                    .padding([3, 6])
+                    .style(tab_bar_button_style(chrome, false, false))
+                    .on_press(Message::OpenTabbyImportModal),
+                button(text("Commands").size(FONT_META).color(chrome.text_secondary))
+                    .padding([3, 6])
+                    .style(tab_bar_button_style(chrome, false, false))
+                    .on_press(Message::OpenQuickCommandsModal),
+                button(text("Templates").size(FONT_META).color(chrome.text_secondary))
+                    .padding([3, 6])
+                    .style(tab_bar_button_style(chrome, false, false))
+                    .on_press(Message::OpenWorkspacesModal),
+                button(text("Settings").size(FONT_META).color(chrome.text_secondary))
+                    .padding([3, 6])
+                    .style(tab_bar_button_style(chrome, false, false))
+                    .on_press(Message::OpenSettingsModal),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+            .wrap()
+            .vertical_spacing(3),
+            button(
+                row![
+                    text("Hide sidebar").size(FONT_META).color(chrome.text_muted),
+                    space::horizontal(),
+                    keycap_pill("Ctrl+Shift+S", chrome),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([3, 6])
+            .width(Length::Fill)
+            .style(list_row_button_style(chrome, false))
+            .on_press(Message::ToggleSidebar),
         ]
-        .spacing(2)
-        .align_y(Alignment::Center),
+        .spacing(4),
     )
     .width(Length::Fill)
-    .padding([4, 6])
+    .padding([6, 8])
     .style(move |_| container::Style {
         background: Some(Background::Color(chrome.bg_more)),
         ..Default::default()
@@ -978,6 +996,7 @@ fn render_sidebar_full_inner<'a>(
 /// Resizable container pairing the Left Sidebar on the left with the main workspace on the right.
 pub struct SidebarDock<'a> {
     sidebar_width: f32,
+    chrome: ChromePalette,
     children: [Element<'a, Message, Theme, iced::Renderer>; 2],
 }
 
@@ -985,11 +1004,13 @@ impl<'a> SidebarDock<'a> {
     /// Wraps `sidebar` on the left and `main` on the right with a draggable divider.
     pub fn new(
         sidebar_width: f32,
+        chrome: ChromePalette,
         sidebar: Element<'a, Message, Theme, iced::Renderer>,
         main: Element<'a, Message, Theme, iced::Renderer>,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
         Element::new(Self {
             sidebar_width: sidebar_width.clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH),
+            chrome,
             children: [sidebar, main],
         })
     }
@@ -1220,7 +1241,7 @@ impl Widget<Message, Theme, iced::Renderer> for SidebarDock<'_> {
 
         let state = tree.state.downcast_ref::<DividerDragState>();
         let (_sidebar_rect, visual_rect, _hit_rect) = self.layout_rects(layout.bounds());
-        draw_interactive_divider(renderer, theme, visual_rect, state, 0.35);
+        draw_interactive_divider(renderer, self.chrome, visual_rect, state, 0.35);
     }
 
     fn overlay<'b>(
@@ -1263,10 +1284,10 @@ fn render_active_sessions_section<'a>(
     let prefix = if collapsed { "▸" } else { "▾" };
     let header_btn = button(
         row![
-            text(format!("{prefix} ACTIVE SESSIONS"))
-                .size(10.5)
-                .font(ui_font_semibold())
-                .color(chrome.text_muted),
+            text(format!("{prefix} Active sessions"))
+                .size(FONT_META)
+                .font(ui_font_medium())
+                .color(chrome.text_secondary),
             space::horizontal(),
             container(
                 text(format!("{}", sessions.len()))
@@ -1412,7 +1433,7 @@ fn render_saved_profiles_section<'a>(
         let msg = if state.filter_scope() == SidebarFilterScope::Active {
             "No active saved profiles"
         } else {
-            "No saved profiles · Click + or right-click"
+            "No saved profiles — click + or right-click"
         };
         col = col.push(
             container(text(msg).size(FONT_META).color(chrome.text_muted)).padding([8, 12]),
@@ -1727,7 +1748,7 @@ fn render_system_ssh_section<'a>(
             host.display_target()
         } else {
             format!(
-                "{} · via {}",
+                "{} via {}",
                 host.display_target(),
                 host.proxy_jump.join(" → ")
             )

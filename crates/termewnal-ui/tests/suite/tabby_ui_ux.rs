@@ -518,15 +518,19 @@ fn responsive_apple_hig_layout_renders_across_all_viewport_tiers() {
     let _ = state.update(Message::SettingsShowStatusBarToggled(true));
     let _ = state.update(Message::SettingsHideTabIndexToggled(true));
     let _ = state.update(Message::SettingsFlexTabsToggled(true));
-    assert!(state.sidebar().is_open());
+    assert!(!state.sidebar().is_open());
+    assert!(!state.effective_sidebar_open(win));
     assert!(state.config().terminal.show_status_bar);
     assert!(state.config().terminal.hide_tab_index);
     assert!(state.config().terminal.flex_tabs);
     let _ = state.update(Message::SettingsSave);
 
-    // Sidebar remains open regardless of SetSidebarOpen/ToggleSidebar alongside SFTP+ Panel.
+    // Per-window sidebar visibility supports explicit toggle/set alongside SFTP+ Panel.
+    let _ = state.update(Message::SetSidebarOpen(true));
+    assert!(state.effective_sidebar_open(win));
     let _ = state.update(Message::SetSidebarOpen(false));
-    assert!(state.sidebar().is_open());
+    assert!(!state.effective_sidebar_open(win));
+    assert!(!state.sidebar().is_open());
     let _ = state.update(Message::ToggleSftpDrawer);
 
     let viewports = [
@@ -885,4 +889,178 @@ fn ssh_connection_mode_dropdown_and_proxy_settings_persist_with_vault_isolation(
         }
         other => panic!("expected HTTP CONNECT proxy target, got {other:?}"),
     }
+}
+
+fn srgb_luminance(c: iced::Color) -> f32 {
+    let lin = |ch: f32| {
+        if ch <= 0.04045 {
+            ch / 12.92
+        } else {
+            ((ch + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b)
+}
+
+fn wcag_contrast(a: iced::Color, b: iced::Color) -> f32 {
+    let la = srgb_luminance(a);
+    let lb = srgb_luminance(b);
+    let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+    (hi + 0.05) / (lo + 0.05)
+}
+
+#[test]
+fn all_28_themes_and_extreme_overrides_produce_monotonic_oklch_chrome_and_contrast() {
+    use termewnal_core::{ThemeOverrides, ThemePalette};
+    use termewnal_ui::ui_theme::{ChromePalette, TAB_BAR_HEIGHT};
+
+    assert!((TAB_BAR_HEIGHT - 40.0).abs() < f32::EPSILON);
+
+    let mut palettes: Vec<ThemePalette> = BuiltinTheme::ALL
+        .iter()
+        .map(|t| t.palette())
+        .collect();
+    palettes.push(ThemePalette::for_name_with_overrides(
+        BuiltinTheme::Dark.name(),
+        &ThemeOverrides {
+            background: Some("#000000".to_string()),
+            foreground: Some("#e5e5e5".to_string()),
+            ..ThemeOverrides::default()
+        },
+    ));
+    palettes.push(ThemePalette::for_name_with_overrides(
+        BuiltinTheme::Light.name(),
+        &ThemeOverrides {
+            background: Some("#ffffff".to_string()),
+            ui_accent: Some("#ffea00".to_string()),
+            ..ThemeOverrides::default()
+        },
+    ));
+
+    for pal in palettes {
+        let chrome = ChromePalette::from_palette(&pal);
+        for surface in [
+            chrome.term_bg,
+            chrome.bg_more,
+            chrome.chrome_bg,
+            chrome.well_bg,
+            chrome.panel_bg,
+            chrome.card_bg,
+            chrome.secondary,
+            chrome.secondary_hover,
+            chrome.hairline,
+            chrome.border_subtle,
+            chrome.border,
+        ] {
+            assert!(
+                (surface.a - 1.0).abs() < 1e-4,
+                "theme {} must have opaque surfaces/borders (found alpha {})",
+                pal.theme.name(),
+                surface.a
+            );
+        }
+
+        let l_more = srgb_luminance(chrome.bg_more);
+        let l_chrome = srgb_luminance(chrome.chrome_bg);
+        let l_term = srgb_luminance(chrome.term_bg);
+        let l_well = srgb_luminance(chrome.well_bg);
+        let l_panel = srgb_luminance(chrome.panel_bg);
+        let l_card = srgb_luminance(chrome.card_bg);
+        let l_hover = srgb_luminance(chrome.secondary_hover);
+
+        if chrome.is_light {
+            assert!(
+                l_hover < l_card && l_card < l_more && l_more <= l_chrome && l_chrome < l_well && l_well < l_term && l_term <= l_panel,
+                "light theme {} surface ordering broken: hover={l_hover:.4} card={l_card:.4} more={l_more:.4} chrome={l_chrome:.4} well={l_well:.4} term={l_term:.4} panel={l_panel:.4}",
+                pal.theme.name()
+            );
+        } else if l_term < 0.005 {
+            assert!(
+                l_term < l_more && l_more <= l_chrome && l_chrome < l_well && l_well < l_panel && l_panel < l_card && l_card < l_hover,
+                "ultra-dark theme {} surface ordering broken: term={l_term:.4} more={l_more:.4} chrome={l_chrome:.4} well={l_well:.4} panel={l_panel:.4} card={l_card:.4} hover={l_hover:.4}",
+                pal.theme.name()
+            );
+        } else {
+            assert!(
+                l_more <= l_chrome && l_chrome < l_term && l_term < l_well && l_well < l_panel && l_panel < l_card && l_card < l_hover,
+                "dark theme {} surface ordering broken: more={l_more:.4} chrome={l_chrome:.4} term={l_term:.4} well={l_well:.4} panel={l_panel:.4} card={l_card:.4} hover={l_hover:.4}",
+                pal.theme.name()
+            );
+        }
+
+        for bg in [chrome.term_bg, chrome.chrome_bg, chrome.panel_bg] {
+            assert!(wcag_contrast(chrome.text_primary, bg) >= 4.5);
+            assert!(wcag_contrast(chrome.text_secondary, bg) >= 4.5);
+            assert!(wcag_contrast(chrome.text_muted, bg) >= 3.1);
+            assert!(wcag_contrast(chrome.text_emphasis, bg) >= 7.0);
+        }
+        for semantic in [chrome.accent, chrome.success, chrome.warning, chrome.danger] {
+            assert!(
+                wcag_contrast(semantic, chrome.chrome_bg) >= 3.1
+                    && wcag_contrast(semantic, chrome.panel_bg) >= 3.1,
+                "theme {} semantic color lacks 3.1 contrast",
+                pal.theme.name()
+            );
+        }
+        assert!(wcag_contrast(chrome.accent_fg, chrome.accent) >= 4.5);
+    }
+}
+
+#[test]
+fn unified_40px_top_header_and_borderless_hit_precedence() {
+    use iced::{Point, Rectangle, Size, window};
+    use termewnal_core::TabBarPosition;
+    use termewnal_ui::ui_theme::TAB_BAR_HEIGHT;
+    use termewnal_ui::window_chrome::{BorderlessResizeFrame, TitleBarDragZone};
+
+    let bounds = Rectangle::new(Point::ORIGIN, Size::new(1200.0, 800.0));
+
+    // Clicking inside top-right Close/controls captured by child must never trigger East/NorthEast resize.
+    assert!(BorderlessResizeFrame::resolve_resize_press(
+        true,
+        true,
+        true,
+        bounds,
+        Some(Point::new(1198.0, 2.0)),
+    )
+    .is_none());
+
+    // Top 5px edge over uncaptured drag spacer triggers North resize, and TitleBarDragZone yields it.
+    let drag_bounds = Rectangle::new(Point::new(400.0, 0.0), Size::new(600.0, TAB_BAR_HEIGHT));
+    assert!(!TitleBarDragZone::allows_drag_at(
+        true,
+        false,
+        5.0,
+        drag_bounds,
+        Some(Point::new(600.0, 2.0)),
+    ));
+    assert!(matches!(
+        BorderlessResizeFrame::resolve_resize_press(
+            true,
+            false,
+            true,
+            bounds,
+            Some(Point::new(600.0, 2.0)),
+        ),
+        Some(window::Direction::North)
+    ));
+
+    // Below 5px resize bezel inside header drag spacer starts drag cleanly.
+    assert!(TitleBarDragZone::allows_drag_at(
+        true,
+        false,
+        5.0,
+        drag_bounds,
+        Some(Point::new(600.0, 20.0)),
+    ));
+
+    // Top tab header reserves >= 72px drag spacer even in Compact 720px windows and anchors context menus below one 40px header.
+    let (max_tabs_w, reserved_drag) = AppState::top_header_tab_budget(720.0, false, true, true);
+    assert!(reserved_drag >= 72.0);
+    assert!(max_tabs_w >= 60.0);
+    assert!(
+        (AppState::tab_context_menu_anchor_y(TabBarPosition::Top, 800.0) - (TAB_BAR_HEIGHT + 1.0))
+            .abs()
+            < f32::EPSILON
+    );
 }

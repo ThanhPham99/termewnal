@@ -28,8 +28,8 @@ pub const FONT_SUBHEAD: f32 = 14.0;
 pub const FONT_BODY: f32 = 13.0;
 pub const FONT_META: f32 = 11.5;
 
-/// Tabby standard tab strip height (`--tabs-height: 38px`).
-pub const TAB_BAR_HEIGHT: f32 = 38.0;
+/// Tabby standard tab strip and top header height (`40px`).
+pub const TAB_BAR_HEIGHT: f32 = 40.0;
 
 /// Primary sans-serif UI font.
 pub const fn ui_font() -> Font {
@@ -139,21 +139,19 @@ impl DividerDragState {
 /// Renders a 1px interactive divider quad with accent highlighting on hover/drag.
 pub fn draw_interactive_divider(
     renderer: &mut iced::Renderer,
-    theme: &Theme,
+    chrome: ChromePalette,
     bounds: Rectangle,
     state: &DividerDragState,
     base_alpha: f32,
 ) {
     use iced::advanced::renderer::Renderer as _;
 
-    let ext = theme.extended_palette();
     let color = if state.dragging || state.hovered {
-        ext.primary.strong.color
+        chrome.accent
+    } else if base_alpha < 1.0 && base_alpha >= 0.0 {
+        mix(chrome.chrome_bg, chrome.hairline, base_alpha)
     } else {
-        Color {
-            a: base_alpha,
-            ..ext.background.strong.color
-        }
+        chrome.hairline
     };
     renderer.fill_quad(
         Quad {
@@ -214,138 +212,104 @@ pub struct ChromePalette {
 }
 
 impl ChromePalette {
-    /// Derives Tabby's `Follow the color scheme` UI variables from `palette`.
+    /// Derives the 4-tier OKLCH `ChromePalette` and WCAG-guarded foreground/semantic tokens from `palette`.
     pub fn from_palette(palette: &ThemePalette) -> Self {
         let term_bg = rgb(palette.background);
         let fg = rgb(palette.foreground);
-        let accent = rgb(palette.ui_accent);
+        let raw_accent = rgb(palette.ui_accent);
         let is_light = palette.is_light;
 
-        let more = |c: Color, factor: f32| -> Color {
-            if is_light {
-                hsl_lighten(c, factor)
-            } else {
-                hsl_darken(c, factor)
-            }
-        };
-        let less = |c: Color, factor: f32| -> Color {
-            if is_light {
-                hsl_darken(c, factor)
-            } else {
-                hsl_lighten(c, factor)
-            }
-        };
+        let (l_base, c_base, h_base) = rgb_to_oklch(term_bg);
+        let c_surface = c_base.min(0.024);
+        let surface_at = |l: f32| oklch_to_srgb_gamut(l, c_surface, h_base, 1.0);
 
-        // Tabby `themes.service.ts`:
-        // --theme-bg-more = more(bg, 0.25)
-        // --theme-bg-more-2 = more(bg_more, 0.25)
-        // On ultra-bright light schemes (#f8f9fa), keep chrome_bg slightly tinted (#eaedf0)
-        // so the tab bar and active tab (#f8f9fa) remain cleanly distinguishable.
-        let (bg_more, chrome_bg) = if is_light && relative_luminance(term_bg) > 0.80 {
+        let (
+            bg_more,
+            chrome_bg,
+            bg_less,
+            well_bg,
+            panel_bg,
+            card_bg,
+            bg_less_2,
+            secondary,
+            secondary_hover,
+            card_hover,
+            input_bg,
+            hairline,
+            border_subtle,
+            border,
+        ) = if is_light {
+            let panel = surface_at((l_base + 0.022).min(1.0));
+            let input = surface_at((l_base + 0.012).min(1.0));
+            let well = surface_at((l_base - 0.026).max(0.0));
+            let chrome = surface_at((l_base - 0.044).max(0.0));
+            let more = surface_at((l_base - 0.060).max(0.0));
+            let card = surface_at((l_base - 0.086).max(0.0));
+            let hover = surface_at((l_base - 0.114).max(0.0));
+            let l_chrome = rgb_to_oklch(chrome).0;
+            let hair = surface_at((l_chrome - 0.085).max(0.0));
+            let sub_b = surface_at((l_chrome - 0.135).max(0.0));
+            let main_b = surface_at((l_chrome - 0.220).max(0.0));
             (
-                mix(term_bg, Color::WHITE, 0.45),
-                mix(term_bg, fg, 0.065),
+                more, chrome, well, well, panel, card, card, card, hover, hover, input, hair,
+                sub_b, main_b,
+            )
+        } else if l_base < 0.165 {
+            // Ultra-dark (#000000 / OLED) schemes preserve raw `term_bg` while stepping chrome upward cleanly.
+            let anchor = (l_base + 0.045).max(0.150);
+            let more = surface_at(anchor);
+            let chrome = surface_at(anchor + 0.016);
+            let input = surface_at((anchor - 0.025).max(0.110));
+            let well = surface_at(anchor + 0.044);
+            let panel = surface_at(anchor + 0.066);
+            let card = surface_at(anchor + 0.094);
+            let hover = surface_at(anchor + 0.122);
+            let l_panel = rgb_to_oklch(panel).0;
+            let hair = surface_at((l_panel + 0.065).min(0.95));
+            let sub_b = surface_at((l_panel + 0.110).min(0.95));
+            let main_b = surface_at((l_panel + 0.190).min(0.95));
+            (
+                more, chrome, well, well, panel, card, card, card, hover, hover, input, hair,
+                sub_b, main_b,
             )
         } else {
-            let m1 = more(term_bg, 0.25);
-            let m2 = more(m1, 0.25);
-            (m1, m2)
+            let more = surface_at((l_base - 0.050).max(0.110));
+            let chrome = surface_at((l_base - 0.034).max(0.125));
+            let input = surface_at((l_base - 0.018).max(0.105));
+            let well = surface_at((l_base + 0.028).min(0.95));
+            let panel = surface_at((l_base + 0.050).min(0.95));
+            let card = surface_at((l_base + 0.078).min(0.95));
+            let hover = surface_at((l_base + 0.106).min(0.95));
+            let l_panel = rgb_to_oklch(panel).0;
+            let hair = surface_at((l_panel + 0.075).min(0.95));
+            let sub_b = surface_at((l_panel + 0.120).min(0.95));
+            let main_b = surface_at((l_panel + 0.200).min(0.95));
+            (
+                more, chrome, well, well, panel, card, card, card, hover, hover, input, hair,
+                sub_b, main_b,
+            )
         };
 
-        let bg_less = mix(term_bg, fg, 0.04);
-        let bg_less_2 = mix(term_bg, fg, 0.08);
-
-        let secondary = if is_light {
-            less(term_bg, 0.125)
-        } else {
-            // Ensure dark themes with near-black #000/#171717 still get a clear secondary step.
-            let lifted = less(term_bg, 0.50);
-            if relative_luminance(lifted) < 0.02 {
-                mix(term_bg, fg, 0.12)
-            } else {
-                lifted
-            }
-        };
-        let secondary_hover = if is_light {
-            less(secondary, 0.10)
-        } else {
-            less(secondary, 0.22)
-        };
-
-        let panel_bg = if is_light {
-            Color::WHITE
-        } else {
-            // Tabby elevated dark dialog surface (~#212224 on #171717 Dark scheme).
-            mix(term_bg, fg, 0.055)
-        };
-        let well_bg = bg_less;
-        let card_bg = secondary;
-        let card_hover = bg_less_2;
-        let input_bg = if is_light {
-            Color::WHITE
-        } else {
-            // Sunken dark input field (#131416) inside modal/sidebar surfaces.
-            hsl_darken(term_bg, 0.16)
-        };
-
-        let border = if is_light {
-            Color {
-                a: 0.20,
-                ..Color::BLACK
-            }
-        } else {
-            Color {
-                a: 0.22,
-                ..Color::WHITE
-            }
-        };
-        let border_subtle = if is_light {
-            Color {
-                a: 0.12,
-                ..Color::BLACK
-            }
-        } else {
-            Color {
-                a: 0.12,
-                ..Color::WHITE
-            }
-        };
-        let hairline = if is_light {
-            Color {
-                a: 0.10,
-                ..Color::BLACK
-            }
-        } else {
-            Color {
-                a: 0.09,
-                ..Color::WHITE
-            }
-        };
-
-        let text_primary = ensure_contrast(fg, term_bg, 4.5);
-        let text_secondary = ensure_contrast(
-            if is_light {
-                mix(fg, term_bg, 0.22)
-            } else {
-                more(fg, 0.20)
-            },
-            chrome_bg,
-            3.5,
+        let contrast_bgs = [term_bg, chrome_bg, panel_bg];
+        let text_primary = ensure_contrast_against(fg, &contrast_bgs, 4.5);
+        let text_secondary = ensure_contrast_against(
+            mix(fg, chrome_bg, if is_light { 0.22 } else { 0.20 }),
+            &contrast_bgs,
+            4.5,
         );
-        let text_muted = ensure_contrast(
-            if is_light {
-                mix(fg, term_bg, 0.42)
-            } else {
-                more(fg, 0.42)
-            },
-            chrome_bg,
-            2.6,
+        let text_muted = ensure_contrast_against(
+            mix(fg, chrome_bg, 0.42),
+            &contrast_bgs,
+            3.1,
         );
-        let text_emphasis = if is_light {
-            hsl_darken(fg, 0.25)
-        } else {
-            hsl_lighten(fg, 0.35)
-        };
+        let text_emphasis = ensure_contrast_against(
+            oklch_shift_lightness(fg, if is_light { -0.14 } else { 0.14 }),
+            &contrast_bgs,
+            7.0,
+        );
+
+        let semantic_bgs = [chrome_bg, panel_bg, well_bg];
+        let accent = ensure_contrast_against(raw_accent, &semantic_bgs, 3.1);
         let active_tab_indicator = if is_light {
             accent
         } else {
@@ -356,15 +320,15 @@ impl ChromePalette {
             a: if is_light { 0.14 } else { 0.18 },
             ..accent
         };
-        let accent_fg = if relative_luminance(accent) > 0.44 {
-            Color::from_rgb8(0x14, 0x16, 0x1f)
-        } else {
-            Color::WHITE
-        };
+        let accent_fg = ensure_contrast_against(
+            contrast_pick(accent, Color::from_rgb8(0x0b, 0x0c, 0x10), Color::WHITE),
+            &[accent],
+            4.5,
+        );
 
-        let success = rgb(palette.ansi[2]);
-        let warning = rgb(palette.ansi[3]);
-        let danger = rgb(palette.ansi[1]);
+        let success = ensure_contrast_against(rgb(palette.ansi[2]), &semantic_bgs, 3.1);
+        let warning = ensure_contrast_against(rgb(palette.ansi[3]), &semantic_bgs, 3.1);
+        let danger = ensure_contrast_against(rgb(palette.ansi[1]), &semantic_bgs, 3.1);
         let soft_alpha = if is_light { 0.14 } else { 0.16 };
 
         Self {
@@ -412,7 +376,7 @@ pub enum PillTone {
     ActiveAccent,
 }
 
-/// Tabby flat `.btn-tab-bar` style used inside the 38px tab strip (`+`, `Profiles`, `Settings`, etc.).
+/// Tabby flat `.btn-tab-bar` style used inside the 40px top header (`+`, `Profiles`, `Settings`, etc.).
 pub fn tab_bar_button_style(
     chrome: ChromePalette,
     active: bool,
@@ -424,23 +388,9 @@ pub fn tab_bar_button_style(
         let (bg, fg) = if active && danger {
             (chrome.danger, Color::WHITE)
         } else if pressed {
-            (
-                if chrome.is_light {
-                    Color::from_rgba(0.0, 0.0, 0.0, 0.14)
-                } else {
-                    Color::from_rgba(0.0, 0.0, 0.0, 0.30)
-                },
-                chrome.text_emphasis,
-            )
+            (chrome.bg_less_2, chrome.text_emphasis)
         } else if hovered {
-            (
-                if chrome.is_light {
-                    Color::from_rgba(0.0, 0.0, 0.0, 0.08)
-                } else {
-                    chrome.bg_less
-                },
-                chrome.text_emphasis,
-            )
+            (chrome.secondary_hover, chrome.text_emphasis)
         } else if active {
             (chrome.bg_less_2, chrome.accent)
         } else {
@@ -464,7 +414,7 @@ pub fn tab_bar_close_button_style(
         let hovered = matches!(status, button::Status::Hovered);
         let pressed = matches!(status, button::Status::Pressed);
         let (bg, fg) = if pressed {
-            (hsl_darken(chrome.danger, 0.14), Color::WHITE)
+            (oklch_shift_lightness(chrome.danger, -0.08), Color::WHITE)
         } else if hovered {
             (chrome.danger, Color::WHITE)
         } else {
@@ -523,9 +473,9 @@ pub fn pill_button_style(
             ),
             PillTone::Primary => (
                 if pressed {
-                    hsl_darken(chrome.accent, 0.14)
+                    oklch_shift_lightness(chrome.accent, -0.08)
                 } else if hovered {
-                    hsl_lighten(chrome.accent, 0.08)
+                    oklch_shift_lightness(chrome.accent, 0.05)
                 } else {
                     chrome.accent
                 },
@@ -533,16 +483,13 @@ pub fn pill_button_style(
                 Color::TRANSPARENT,
             ),
             PillTone::Danger => {
-                let danger_fg = if relative_luminance(chrome.danger) > 0.45 {
-                    Color::from_rgb8(0x14, 0x16, 0x1f)
-                } else {
-                    Color::WHITE
-                };
+                let danger_fg =
+                    contrast_pick(chrome.danger, Color::from_rgb8(0x14, 0x16, 0x1f), Color::WHITE);
                 (
                     if pressed {
-                        hsl_darken(chrome.danger, 0.15)
+                        oklch_shift_lightness(chrome.danger, -0.08)
                     } else if hovered {
-                        hsl_lighten(chrome.danger, 0.08)
+                        oklch_shift_lightness(chrome.danger, 0.05)
                     } else {
                         chrome.danger
                     },
@@ -933,18 +880,11 @@ pub fn tabby_menu_style(chrome: ChromePalette) -> impl Fn(&Theme) -> menu::Style
         text_color: chrome.text_primary,
         selected_text_color: chrome.accent_fg,
         selected_background: Background::Color(chrome.accent),
-        shadow: Shadow {
-            color: Color {
-                a: if chrome.is_light { 0.16 } else { 0.42 },
-                ..Color::BLACK
-            },
-            offset: Vector::new(0.0, 6.0),
-            blur_radius: 16.0,
-        },
+        shadow: Shadow::default(),
     }
 }
 
-/// Tabby pill toggle switch matching `.form-switch` (`#5da9f6` ON track, `#3a3d42` OFF track).
+/// Tabby pill toggle switch matching `.form-switch`.
 pub fn tabby_switch<'a, Msg: Clone + 'a>(
     is_checked: bool,
     title: impl Into<String>,
@@ -957,7 +897,7 @@ pub fn tabby_switch<'a, Msg: Clone + 'a>(
     } else if chrome.is_light {
         mix(chrome.chrome_bg, chrome.border, 0.5)
     } else {
-        Color::from_rgb8(0x3a, 0x3d, 0x42)
+        chrome.bg_less_2
     };
     let knob_color = Color::WHITE;
     let knob = container(space::horizontal().width(12).height(12)).style(move |_| container::Style {
@@ -1527,7 +1467,7 @@ pub fn tabby_auth_tile_style(
             if chrome.is_light {
                 chrome.card_hover
             } else {
-                Color::from_rgb8(0x36, 0x38, 0x3d)
+                chrome.secondary
             }
         } else if hovered {
             chrome.bg_less_2
@@ -1600,11 +1540,7 @@ pub fn modal_card_style(chrome: ChromePalette, _highlight_accent: bool) -> conta
             width: 1.0,
             radius: 6.0.into(),
         },
-        shadow: Shadow {
-            color: Color::from_rgba(0.0, 0.0, 0.0, if chrome.is_light { 0.16 } else { 0.45 }),
-            offset: Vector::new(0.0, 8.0),
-            blur_radius: 24.0,
-        },
+        shadow: Shadow::default(),
         snap: true,
     }
 }
@@ -1871,86 +1807,7 @@ pub(crate) fn mix(a: Color, b: Color, t: f32) -> Color {
     }
 }
 
-fn rgb_to_hsl(c: Color) -> (f32, f32, f32) {
-    let max = c.r.max(c.g).max(c.b);
-    let min = c.r.min(c.g).min(c.b);
-    let l = (max + min) * 0.5;
-    if (max - min).abs() < 1e-6 {
-        return (0.0, 0.0, l);
-    }
-    let d = max - min;
-    let s = if l > 0.5 {
-        d / (2.0 - max - min)
-    } else {
-        d / (max + min)
-    };
-    let h = if (max - c.r).abs() < 1e-6 {
-        (c.g - c.b) / d + if c.g < c.b { 6.0 } else { 0.0 }
-    } else if (max - c.g).abs() < 1e-6 {
-        (c.b - c.r) / d + 2.0
-    } else {
-        (c.r - c.g) / d + 4.0
-    } / 6.0;
-    (h, s, l)
-}
-
-fn hue_to_rgb(p: f32, q: f32, mut t: f32) -> f32 {
-    if t < 0.0 {
-        t += 1.0;
-    }
-    if t > 1.0 {
-        t -= 1.0;
-    }
-    if t < 1.0 / 6.0 {
-        return p + (q - p) * 6.0 * t;
-    }
-    if t < 0.5 {
-        return q;
-    }
-    if t < 2.0 / 3.0 {
-        return p + (q - p) * (2.0 / 3.0 - t) * 6.0;
-    }
-    p
-}
-
-fn hsl_to_rgb(h: f32, s: f32, l: f32, a: f32) -> Color {
-    let l = l.clamp(0.0, 1.0);
-    let s = s.clamp(0.0, 1.0);
-    if s <= 1e-6 {
-        return Color { r: l, g: l, b: l, a };
-    }
-    let q = if l < 0.5 {
-        l * (1.0 + s)
-    } else {
-        l + s - l * s
-    };
-    let p = 2.0 * l - q;
-    Color {
-        r: hue_to_rgb(p, q, h + 1.0 / 3.0),
-        g: hue_to_rgb(p, q, h),
-        b: hue_to_rgb(p, q, h - 1.0 / 3.0),
-        a,
-    }
-}
-
-/// Matches JS `color.darken(ratio)` used in `Eugeny/tabby`'s `themes.service.ts`.
-fn hsl_darken(c: Color, ratio: f32) -> Color {
-    let (h, s, l) = rgb_to_hsl(c);
-    hsl_to_rgb(h, s, (l * (1.0 - ratio)).clamp(0.0, 1.0), c.a)
-}
-
-/// Matches JS `color.lighten(ratio)` used in `Eugeny/tabby`'s `themes.service.ts`.
-fn hsl_lighten(c: Color, ratio: f32) -> Color {
-    let (h, s, l) = rgb_to_hsl(c);
-    let next_l = if l < 0.01 {
-        ratio.clamp(0.0, 1.0)
-    } else {
-        (l * (1.0 + ratio)).clamp(0.0, 1.0)
-    };
-    hsl_to_rgb(h, s, next_l, c.a)
-}
-
-fn linearize_channel(c: f32) -> f32 {
+fn srgb_to_linear(c: f32) -> f32 {
     if c <= 0.04045 {
         c / 12.92
     } else {
@@ -1958,10 +1815,100 @@ fn linearize_channel(c: f32) -> f32 {
     }
 }
 
+fn linear_to_srgb(c: f32) -> f32 {
+    let c = c.clamp(0.0, 1.0);
+    if c <= 0.0031308 {
+        12.92 * c
+    } else {
+        1.055 * c.powf(1.0 / 2.4) - 0.055
+    }
+}
+
+fn rgb_to_oklab(c: Color) -> (f32, f32, f32) {
+    let r = srgb_to_linear(c.r);
+    let g = srgb_to_linear(c.g);
+    let b = srgb_to_linear(c.b);
+    let l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).cbrt();
+    let m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b).cbrt();
+    let s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b).cbrt();
+    (
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    )
+}
+
+fn oklab_to_linear_srgb(l_ok: f32, a_ok: f32, b_ok: f32) -> (f32, f32, f32) {
+    let l_ = l_ok + 0.3963377774 * a_ok + 0.2158037573 * b_ok;
+    let m_ = l_ok - 0.1055613458 * a_ok - 0.0638541728 * b_ok;
+    let s_ = l_ok - 0.0894841775 * a_ok - 1.2914855480 * b_ok;
+    let l = l_ * l_ * l_;
+    let m = m_ * m_ * m_;
+    let s = s_ * s_ * s_;
+    (
+        4.0767416621 * l - 3.3077115913 * m + 0.2309699292 * s,
+        -1.2684380046 * l + 2.6097574011 * m - 0.3413193965 * s,
+        -0.0041960863 * l - 0.7034186147 * m + 1.7076147010 * s,
+    )
+}
+
+fn rgb_to_oklch(c: Color) -> (f32, f32, f32) {
+    let (l, a, b) = rgb_to_oklab(c);
+    let chroma = (a * a + b * b).sqrt();
+    let hue = b.atan2(a);
+    (l, chroma, hue)
+}
+
+fn in_srgb_gamut(r: f32, g: f32, b: f32) -> bool {
+    const EPS: f32 = 1e-4;
+    r >= -EPS && r <= 1.0 + EPS && g >= -EPS && g <= 1.0 + EPS && b >= -EPS && b <= 1.0 + EPS
+}
+
+fn oklch_to_srgb_gamut(l: f32, chroma: f32, hue: f32, a: f32) -> Color {
+    let target_l = l.clamp(0.0, 1.0);
+    if target_l <= 1e-5 {
+        return Color { r: 0.0, g: 0.0, b: 0.0, a };
+    }
+    if target_l >= 1.0 - 1e-5 {
+        return Color { r: 1.0, g: 1.0, b: 1.0, a };
+    }
+    let cos_h = hue.cos();
+    let sin_h = hue.sin();
+    let target_c = chroma.max(0.0);
+    let (r0, g0, b0) = oklab_to_linear_srgb(target_l, target_c * cos_h, target_c * sin_h);
+    let (r, g, b) = if in_srgb_gamut(r0, g0, b0) {
+        (r0, g0, b0)
+    } else {
+        let mut lo = 0.0_f32;
+        let mut hi = target_c;
+        for _ in 0..20 {
+            let mid = (lo + hi) * 0.5;
+            let (rm, gm, bm) = oklab_to_linear_srgb(target_l, mid * cos_h, mid * sin_h);
+            if in_srgb_gamut(rm, gm, bm) {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        oklab_to_linear_srgb(target_l, lo * cos_h, lo * sin_h)
+    };
+    Color {
+        r: linear_to_srgb(r),
+        g: linear_to_srgb(g),
+        b: linear_to_srgb(b),
+        a,
+    }
+}
+
+fn oklch_shift_lightness(c: Color, delta_l: f32) -> Color {
+    let (l, chroma, hue) = rgb_to_oklch(c);
+    oklch_to_srgb_gamut((l + delta_l).clamp(0.0, 1.0), chroma, hue, c.a)
+}
+
 fn relative_luminance(c: Color) -> f32 {
-    0.2126 * linearize_channel(c.r)
-        + 0.7152 * linearize_channel(c.g)
-        + 0.0722 * linearize_channel(c.b)
+    0.2126 * srgb_to_linear(c.r)
+        + 0.7152 * srgb_to_linear(c.g)
+        + 0.0722 * srgb_to_linear(c.b)
 }
 
 fn contrast_ratio(a: Color, b: Color) -> f32 {
@@ -1971,27 +1918,79 @@ fn contrast_ratio(a: Color, b: Color) -> f32 {
     (hi + 0.05) / (lo + 0.05)
 }
 
-fn ensure_contrast(fg: Color, bg: Color, min_ratio: f32) -> Color {
-    if contrast_ratio(fg, bg) >= min_ratio {
+fn contrast_pick(bg: Color, dark_candidate: Color, light_candidate: Color) -> Color {
+    if contrast_ratio(dark_candidate, bg) >= contrast_ratio(light_candidate, bg) {
+        dark_candidate
+    } else {
+        light_candidate
+    }
+}
+
+fn min_contrast(fg: Color, bgs: &[Color]) -> f32 {
+    bgs.iter()
+        .map(|&bg| contrast_ratio(fg, bg))
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn ensure_contrast_against(fg: Color, bgs: &[Color], min_ratio: f32) -> Color {
+    if min_contrast(fg, bgs) >= min_ratio {
         return fg;
     }
-    let (h, s, l) = rgb_to_hsl(fg);
-    let mut up = l.max(0.01);
-    while up < 0.99 && contrast_ratio(hsl_to_rgb(h, s, up, fg.a), bg) < min_ratio {
-        up = (up * 1.1).min(1.0);
-        if (up - 1.0).abs() < 1e-4 {
-            break;
+    let (l0, chroma, hue) = rgb_to_oklch(fg);
+
+    // Search upward in OKLCH lightness for the closest passing candidate.
+    let mut lo = l0;
+    let mut hi = 1.0_f32;
+    for _ in 0..20 {
+        let mid = (lo + hi) * 0.5;
+        let cand = oklch_to_srgb_gamut(mid, chroma, hue, fg.a);
+        if min_contrast(cand, bgs) >= min_ratio {
+            hi = mid;
+        } else {
+            lo = mid;
         }
     }
-    let mut down = l.max(0.01);
-    while down > 0.01 && contrast_ratio(hsl_to_rgb(h, s, down, fg.a), bg) < min_ratio {
-        down *= 0.9;
+    let up_cand = oklch_to_srgb_gamut(hi, chroma, hue, fg.a);
+    let up_ok = min_contrast(up_cand, bgs) >= min_ratio;
+
+    // Search downward in OKLCH lightness for the closest passing candidate.
+    let mut lo_d = 0.0_f32;
+    let mut hi_d = l0;
+    for _ in 0..20 {
+        let mid = (lo_d + hi_d) * 0.5;
+        let cand = oklch_to_srgb_gamut(mid, chroma, hue, fg.a);
+        if min_contrast(cand, bgs) >= min_ratio {
+            lo_d = mid;
+        } else {
+            hi_d = mid;
+        }
     }
-    let c_up = hsl_to_rgb(h, s, up, fg.a);
-    let c_down = hsl_to_rgb(h, s, down, fg.a);
-    if contrast_ratio(c_up, bg) >= contrast_ratio(c_down, bg) {
-        c_up
-    } else {
-        c_down
+    let down_cand = oklch_to_srgb_gamut(lo_d, chroma, hue, fg.a);
+    let down_ok = min_contrast(down_cand, bgs) >= min_ratio;
+
+    match (up_ok, down_ok) {
+        (true, true) => {
+            if (hi - l0).abs() <= (l0 - lo_d).abs() {
+                up_cand
+            } else {
+                down_cand
+            }
+        }
+        (true, false) => up_cand,
+        (false, true) => down_cand,
+        (false, false) => {
+            let white = Color { a: fg.a, ..Color::WHITE };
+            let black = Color { a: fg.a, ..Color::BLACK };
+            let mut best = fg;
+            let mut best_ratio = min_contrast(fg, bgs);
+            for cand in [up_cand, down_cand, white, black] {
+                let r = min_contrast(cand, bgs);
+                if r > best_ratio {
+                    best = cand;
+                    best_ratio = r;
+                }
+            }
+            best
+        }
     }
 }

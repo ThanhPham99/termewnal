@@ -188,44 +188,44 @@ pub struct StatusBarSnapshot {
 }
 
 impl StatusBarSnapshot {
-    /// Formats the active `Session` segment (`kind · target/title · colsxrows`).
+    /// Formats the active `Session` segment (`Kind | target/title | colsxrows`).
     pub fn session_text(&self) -> String {
         let Some(session) = &self.active_session else {
             return "No active session".to_string();
         };
         let exit_suffix = match session.exited {
-            Some(Some(code)) => format!(" · exited({code})"),
-            Some(None) => " · exited".to_string(),
+            Some(Some(code)) => format!(" | exited({code})"),
+            Some(None) => " | exited".to_string(),
             None => String::new(),
         };
         match session.kind {
             SessionKindLabel::Local => {
                 format!(
-                    "LOCAL · {} · {}x{}{exit_suffix}",
+                    "Local | {} | {}x{}{exit_suffix}",
                     session.title, session.cols, session.rows
                 )
             }
             SessionKindLabel::Ssh => {
                 format!(
-                    "SSH · {} · {}x{}{exit_suffix}",
+                    "SSH | {} | {}x{}{exit_suffix}",
                     session.target, session.cols, session.rows
                 )
             }
             SessionKindLabel::Serial => {
                 format!(
-                    "SERIAL · {} · {}x{}{exit_suffix}",
+                    "Serial | {} | {}x{}{exit_suffix}",
                     session.target, session.cols, session.rows
                 )
             }
             SessionKindLabel::Telnet => {
                 format!(
-                    "TELNET · {} · {}x{}{exit_suffix}",
+                    "Telnet | {} | {}x{}{exit_suffix}",
                     session.target, session.cols, session.rows
                 )
             }
             SessionKindLabel::Docker => {
                 format!(
-                    "DOCKER · {} · {}x{}{exit_suffix}",
+                    "Docker | {} | {}x{}{exit_suffix}",
                     session.target, session.cols, session.rows
                 )
             }

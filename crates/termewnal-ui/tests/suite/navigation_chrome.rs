@@ -63,16 +63,22 @@ fn ctrl_b_toggles_left_sidebar_and_groups_saved_profiles_by_group_and_tag() {
     seed_profiles(&paths);
 
     let mut state = super::common::boot_test_app(paths).expect("boot AppState");
-    assert!(state.sidebar().is_open());
+    let win = iced::window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+    assert!(state.effective_sidebar_open(win));
 
     let _ = state.update(Message::ToggleSidebar);
-    assert!(state.sidebar().is_open());
+    assert!(!state.effective_sidebar_open(win));
+    assert!(!state.sidebar().is_open());
+
+    let _ = state.update(Message::ToggleSidebar);
+    assert!(state.effective_sidebar_open(win));
 
     let _ = state.update(Message::SetSidebarOpen(false));
-    assert!(state.sidebar().is_open());
+    assert!(!state.effective_sidebar_open(win));
 
     let _ = state.update(Message::SetSidebarOpen(true));
-    assert!(state.sidebar().is_open());
+    assert!(state.effective_sidebar_open(win));
 
     // Named groups sort alphabetically; ungrouped profiles appear last under UNGROUPED_LABEL.
     let groups = state
@@ -403,8 +409,16 @@ fn ctrl_k_and_ctrl_shift_p_open_command_palette_with_fuzzy_search_and_execution(
 
     let _ = state.update(Message::ToggleCommandPalette);
     let _ = state.update(Message::CommandPaletteQueryChanged("sidebar".to_string()));
-    assert!(state.command_palette_items().iter().all(|i| i.action != PaletteAction::ToggleSidebar));
-    let _ = state.update(Message::CloseCommandPalette);
+    let sidebar_item = state
+        .command_palette_items()
+        .into_iter()
+        .find(|i| i.action == PaletteAction::ToggleSidebar)
+        .expect("ToggleSidebar must appear in Command Palette");
+    assert_eq!(sidebar_item.shortcut.as_deref(), Some("Ctrl+Shift+S"));
+    let _ = state.update(Message::CommandPaletteConfirm);
+    assert!(!state.command_palette().is_open());
+    assert!(!state.sidebar().is_open());
+    let _ = state.update(Message::ToggleSidebar);
     assert!(state.sidebar().is_open());
 
     // Arrow navigation moves selection index across filtered workspace commands.
@@ -618,7 +632,7 @@ fn status_bar_reflects_active_session_and_extensible_transport_tunnel_transfer_h
     assert!(state.status_bar_snapshot().transfer_drawer_open);
 
     let _ = state.update(Message::SetSidebarOpen(false));
-    assert!(state.sidebar().is_open());
+    assert!(!state.sidebar().is_open());
     let _ = state.update(Message::StatusBarAction(StatusBarAction::ToggleTunnelsView));
     assert!(state.sidebar().is_open());
     assert!(!state.sidebar().is_section_collapsed(SidebarSection::ActiveTunnels));
@@ -770,10 +784,12 @@ fn sidebar_right_click_group_management_and_drag_drop_workflows() {
     let win = iced::window::Id::unique();
     let _ = state.update(Message::WindowOpened(win));
 
-    // Profile sidebar is always open and cannot be collapsed.
-    assert!(state.sidebar().is_open());
+    // Profile sidebar starts open on wide windows and toggles/collapses on demand.
+    assert!(state.effective_sidebar_open(win));
     let _ = state.update(Message::SetSidebarOpen(false));
-    assert!(state.sidebar().is_open());
+    assert!(!state.effective_sidebar_open(win));
+    let _ = state.update(Message::SetSidebarOpen(true));
+    assert!(state.effective_sidebar_open(win));
 
     // 1. Right-clicking sidebar empty area opens Sidebar context menu and creates a persistent empty group.
     let _ = state.update(Message::OpenSidebarContextMenu {
@@ -1082,4 +1098,166 @@ fn sidebar_requires_double_click_to_connect_saved_profiles_and_system_ssh() {
     let slot = state.ssh_session(ssh_sid).expect("system ssh slot");
     assert_eq!(slot.target().host, "10.90.0.5");
     assert_eq!(slot.target().username, "dbops");
+}
+
+#[test]
+fn per_window_sidebar_lifecycle_compact_quake_and_settings_isolation() {
+    use iced::{Size, window};
+    use termewnal_ui::IpcCommand;
+    use termewnal_ui::keybinding_bridge::{
+        KeybindingStepOutcome, iced_key_to_chord, resolve_keybinding_message,
+    };
+
+    let temp = TempDir::new().expect("create temp XDG root");
+    let paths = ConfigPaths::from_root(temp.path());
+    let mut state = super::common::boot_test_app(paths).expect("boot AppState");
+
+    let win_a = window::Id::unique();
+    let win_b = window::Id::unique();
+    let win_c = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win_a));
+    let _ = state.update(Message::WindowOpened(win_b));
+    let _ = state.update(Message::WindowOpened(win_c));
+
+    // All three wide desktop windows start with effective sidebar open.
+    assert!(state.effective_sidebar_open(win_a));
+    assert!(state.effective_sidebar_open(win_b));
+    assert!(state.effective_sidebar_open(win_c));
+
+    // Toggling sidebar in win_a collapses ONLY win_a and updates active status snapshot.
+    let _ = state.update(Message::WindowFocused(win_a));
+    assert!(state.status_bar_snapshot().sidebar_open);
+    let _ = state.update(Message::InWindow {
+        window_id: win_a,
+        inner: Box::new(Message::ToggleSidebar),
+    });
+    assert!(!state.effective_sidebar_open(win_a));
+    assert!(state.effective_sidebar_open(win_b));
+    assert!(state.effective_sidebar_open(win_c));
+    assert!(!state.status_bar_snapshot().sidebar_open);
+
+    // Focusing win_b restores status bar snapshot sidebar_open=true; SetSidebarOpen(false) stays scoped.
+    let _ = state.update(Message::WindowFocused(win_b));
+    assert!(state.status_bar_snapshot().sidebar_open);
+    let _ = state.update(Message::InWindow {
+        window_id: win_b,
+        inner: Box::new(Message::SetSidebarOpen(false)),
+    });
+    assert!(!state.effective_sidebar_open(win_b));
+    assert!(!state.effective_sidebar_open(win_a));
+    assert!(state.effective_sidebar_open(win_c));
+
+    // Compact (<860px) auto-collapses win_c when un-overridden, and wide restores it without mutating config.
+    let _ = state.update(Message::WindowResized(win_c, Size::new(820.0, 640.0)));
+    assert!(!state.effective_sidebar_open(win_c));
+    assert!(state.config().terminal.show_profile_sidebar);
+    drop(state.view(win_c));
+    let _ = state.update(Message::WindowResized(win_c, Size::new(1180.0, 760.0)));
+    assert!(state.effective_sidebar_open(win_c));
+
+    // Quake window starts collapsed regardless of desktop state or width >= 860px.
+    let _ = state.update(Message::IpcCommand(IpcCommand::ToggleQuake));
+    let quake_win = state.quake().window_id().expect("quake window opened");
+    let _ = state.update(Message::WindowOpened(quake_win));
+    let _ = state.update(Message::WindowResized(quake_win, Size::new(1280.0, 420.0)));
+    assert!(!state.effective_sidebar_open(quake_win));
+    assert!(state.effective_sidebar_open(win_c));
+    drop(state.view(quake_win));
+
+    // Ctrl+Shift+S dispatches ToggleSidebar via KeybindingResolver + shortcut_for_key_event,
+    // while Ctrl+B stays unbound and Ctrl+Shift+B keeps ToggleBroadcastInput.
+    let ctrl_b = iced_key_to_chord(&Key::Character("b".into()), None, Modifiers::CTRL)
+        .expect("Ctrl+B chord");
+    assert!(matches!(
+        resolve_keybinding_message(state.keybinding_resolver(), &[], &ctrl_b, None, None),
+        KeybindingStepOutcome::NoMatch
+    ));
+    let ctrl_shift_s = iced_key_to_chord(
+        &Key::Character("s".into()),
+        None,
+        Modifiers::CTRL | Modifiers::SHIFT,
+    )
+    .expect("Ctrl+Shift+S chord");
+    assert!(matches!(
+        resolve_keybinding_message(
+            state.keybinding_resolver(),
+            &[],
+            &ctrl_shift_s,
+            None,
+            None,
+        ),
+        KeybindingStepOutcome::Matched(Some(Message::ToggleSidebar))
+    ));
+    let ctrl_shift_b = iced_key_to_chord(
+        &Key::Character("b".into()),
+        None,
+        Modifiers::CTRL | Modifiers::SHIFT,
+    )
+    .expect("Ctrl+Shift+B chord");
+    assert!(matches!(
+        resolve_keybinding_message(
+            state.keybinding_resolver(),
+            &[],
+            &ctrl_shift_b,
+            None,
+            None,
+        ),
+        KeybindingStepOutcome::Matched(Some(Message::ToggleBroadcastInput))
+    ));
+    assert!(matches!(
+        shortcut_for_key_event(
+            &Key::Character("s".into()),
+            Modifiers::CTRL | Modifiers::SHIFT,
+            None,
+        ),
+        Some(Message::ToggleSidebar)
+    ));
+
+    // Command Palette exposes and executes ToggleSidebar for the active window.
+    let _ = state.update(Message::WindowFocused(win_c));
+    let _ = state.update(Message::ToggleCommandPalette);
+    let _ = state.update(Message::CommandPaletteQueryChanged("sidebar".to_string()));
+    assert!(
+        state
+            .command_palette_items()
+            .iter()
+            .any(|i| i.action == PaletteAction::ToggleSidebar
+                && i.shortcut.as_deref() == Some("Ctrl+Shift+S"))
+    );
+    let _ = state.update(Message::CommandPaletteConfirm);
+    assert!(!state.effective_sidebar_open(win_c));
+
+    // Settings honors show_profile_sidebar=false and resets non-Quake overrides on Save while preserving Quake collapsed.
+    let _ = state.update(Message::OpenSettingsModal);
+    let _ = state.update(Message::SettingsShowProfileSidebarToggled(false));
+    assert!(!state.settings_ui().draft().terminal.show_profile_sidebar);
+    let _ = state.update(Message::SettingsSave);
+    assert!(!state.config().terminal.show_profile_sidebar);
+    assert!(!state.effective_sidebar_open(win_a));
+    assert!(!state.effective_sidebar_open(win_b));
+    assert!(!state.effective_sidebar_open(win_c));
+    assert!(!state.effective_sidebar_open(quake_win));
+
+    let _ = state.update(Message::OpenSettingsModal);
+    let _ = state.update(Message::SettingsShowProfileSidebarToggled(true));
+    assert!(state.settings_ui().draft().terminal.show_profile_sidebar);
+    let _ = state.update(Message::SettingsSave);
+    assert!(state.effective_sidebar_open(win_a));
+    assert!(state.effective_sidebar_open(win_b));
+    assert!(state.effective_sidebar_open(win_c));
+    assert!(!state.effective_sidebar_open(quake_win));
+
+    // Empty workspace Start Page renders cleanly across viewports after closing all tabs,
+    // and StatusBarAction::ToggleTunnelsView re-opens the active window's collapsed sidebar.
+    let _ = state.update(Message::WindowFocused(win_a));
+    let _ = state.update(Message::SetSidebarOpen(false));
+    assert!(!state.effective_sidebar_open(win_a));
+    let _ = state.update(Message::StatusBarAction(StatusBarAction::ToggleTunnelsView));
+    assert!(state.effective_sidebar_open(win_a));
+    let _ = state.update(Message::StatusBarAction(StatusBarAction::ToggleSidebar));
+    assert!(!state.effective_sidebar_open(win_a));
+    while let Some(tid) = state.active_tab_id() {
+        let _ = state.update(Message::CloseTab(tid));
+    }
+    drop(state.view(win_a));
 }

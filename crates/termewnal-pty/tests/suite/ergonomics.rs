@@ -470,3 +470,88 @@ fn link_detection_mouse_encoding_and_highlight_rules_work() {
     assert!(err_cell.bold);
     assert!(grid[6].is_none());
 }
+
+#[test]
+fn multiline_visual_selection_clamps_trailing_spaces_while_preserving_single_line_and_block() {
+    let buffer = TerminalBuffer::new_with_full_options(20, 5, 50, CursorShape::Block, false, None);
+    buffer.feed_bytes(b"hi   \r\n\r\nabc\r\n\xe4\xb8\xadx");
+
+    // SelectionType::Lines clamps non-empty rows to (last_non_space + 1) and empty rows to col 0.
+    buffer.start_selection(1, 0, Side::Left, SelectionType::Lines);
+    buffer.update_selection(2, 2, Side::Right);
+    let snap = buffer.snapshot();
+    // Row 0 ("hi   "): cols 0, 1 ('h','i') + col 2 (newline) highlighted; col 3+ not highlighted.
+    assert!(snap.is_cell_visually_selected(0, 0));
+    assert!(snap.is_cell_visually_selected(1, 0));
+    assert!(snap.is_cell_visually_selected(2, 0));
+    assert!(!snap.is_cell_visually_selected(3, 0));
+    assert!(snap.is_cell_selected(5, 0));
+    // Row 1 (blank): exactly col 0 highlighted.
+    assert!(snap.is_cell_visually_selected(0, 1));
+    assert!(!snap.is_cell_visually_selected(1, 1));
+    // Row 2 ("abc"): cols 0..=3 highlighted; col 4 not highlighted.
+    assert!(snap.is_cell_visually_selected(3, 2));
+    assert!(!snap.is_cell_visually_selected(4, 2));
+
+    // Multi-line Simple also clamps trailing padding, including wide chars + newline cell on row 3.
+    buffer.start_selection(0, 0, Side::Left, SelectionType::Simple);
+    buffer.update_selection(15, 3, Side::Right);
+    let snap_multi = buffer.snapshot();
+    assert!(snap_multi.is_cell_visually_selected(2, 0));
+    assert!(!snap_multi.is_cell_visually_selected(3, 0));
+    // Row 3 has wide char at cols 0..=1, 'x' at col 2, newline at col 3 -> col 4 not highlighted.
+    assert!(snap_multi.is_cell_visually_selected(3, 3));
+    assert!(!snap_multi.is_cell_visually_selected(4, 3));
+
+    // Single-line Simple preserves exact dragged trailing spaces.
+    buffer.start_selection(0, 0, Side::Left, SelectionType::Simple);
+    buffer.update_selection(6, 0, Side::Right);
+    let snap_single = buffer.snapshot();
+    assert!(snap_single.is_cell_visually_selected(6, 0));
+
+    // Rectangular Block selection preserves exact column rectangle across rows.
+    buffer.start_selection(5, 0, Side::Left, SelectionType::Block);
+    buffer.update_selection(8, 2, Side::Right);
+    let snap_block = buffer.snapshot();
+    assert!(snap_block.is_cell_visually_selected(5, 1));
+    assert!(snap_block.is_cell_visually_selected(8, 1));
+    assert!(!snap_block.is_cell_visually_selected(4, 1));
+}
+
+#[test]
+fn extend_or_start_selection_and_word_separators_work_across_option_updates() {
+    // Configure '-' as NOT a word separator so "foo-bar" selects as one semantic word.
+    let buffer =
+        TerminalBuffer::new_with_full_options(40, 4, 50, CursorShape::Block, false, Some(" "));
+    buffer.feed_bytes(b"alpha-beta gamma-delta");
+
+    buffer.start_selection(2, 0, Side::Left, SelectionType::Semantic);
+    assert_eq!(buffer.selection_text().as_deref(), Some("alpha-beta"));
+
+    // Standard apply_options must preserve custom word_separators instead of resetting them.
+    buffer.apply_options(80, CursorShape::Beam);
+    buffer.start_selection(2, 0, Side::Left, SelectionType::Semantic);
+    assert_eq!(buffer.selection_text().as_deref(), Some("alpha-beta"));
+
+    // Updating word_separators via apply_options_full splits at '-' immediately.
+    buffer.apply_options_full(80, CursorShape::Beam, false, Some(" -"));
+    buffer.start_selection(2, 0, Side::Left, SelectionType::Semantic);
+    assert_eq!(buffer.selection_text().as_deref(), Some("alpha"));
+
+    // Shift+Click when no selection exists starts a fresh Simple selection at anchor, then drag updates it.
+    buffer.clear_selection();
+    buffer.extend_or_start_selection(6, 0, Side::Left);
+    assert_eq!(buffer.finish_selection(), None);
+    buffer.extend_or_start_selection(6, 0, Side::Left);
+    buffer.update_selection(9, 0, Side::Right);
+    assert_eq!(buffer.selection_text().as_deref(), Some("beta"));
+
+    // Shift+Click extending backward after right-to-left drag keeps the farther right anchor.
+    buffer.start_selection(15, 0, Side::Right, SelectionType::Simple);
+    buffer.update_selection(11, 0, Side::Left);
+    assert_eq!(buffer.selection_text().as_deref(), Some("gamma"));
+    buffer.extend_or_start_selection(6, 0, Side::Left);
+    assert_eq!(buffer.selection_text().as_deref(), Some("beta gamma"));
+    buffer.extend_or_start_selection(21, 0, Side::Right);
+    assert_eq!(buffer.selection_text().as_deref(), Some("beta gamma-delta"));
+}

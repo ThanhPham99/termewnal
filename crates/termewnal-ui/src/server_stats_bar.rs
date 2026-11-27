@@ -238,7 +238,7 @@ pub fn render_server_stats_bar<'a>(
     let rx_bps = stats.and_then(|s| s.net_rx_bytes_per_sec);
     let tx_bps = stats.and_then(|s| s.net_tx_bytes_per_sec);
 
-    let disk_blue = Color::from_rgb8(0x34, 0x98, 0xdb);
+    let disk_blue = chrome.accent;
 
     let left_metrics = row![
         meter_block(StatGlyph::Cpu, "CPU", cpu_pct, chrome.success, chrome),

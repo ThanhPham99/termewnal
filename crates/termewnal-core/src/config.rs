@@ -386,7 +386,7 @@ pub struct TerminalConfig {
     /// Position of the workspace tab bar (`top`, `bottom`, `left`, `right`).
     #[serde(default)]
     pub tab_bar_position: TabBarPosition,
-    /// Always show the profile tree sidebar on startup (non-collapsible).
+    /// Show the profile tree Left Sidebar by default in non-Quake desktop windows (`>= 860 px` wide).
     #[serde(default = "default_true")]
     pub show_profile_sidebar: bool,
     /// Persisted width in logical pixels of the Left Sidebar (`[180, 480]`).
@@ -401,6 +401,15 @@ pub struct TerminalConfig {
     /// Optional local destination directory override for SFTP downloads (`None` uses OS Downloads).
     #[serde(default)]
     pub sftp_download_dir: Option<PathBuf>,
+    /// Default word wrap preference for the SFTP+ Remote File Editor (`false` = horizontal scroll).
+    #[serde(default)]
+    pub sftp_editor_word_wrap: bool,
+    /// Default expanded modal preference for the SFTP+ Remote File Editor (`false` = 760x460).
+    #[serde(default)]
+    pub sftp_editor_expanded: bool,
+    /// Default indentation mode for the SFTP+ Remote File Editor (`spaces4`, `spaces2`, `tab`).
+    #[serde(default)]
+    pub sftp_editor_indent_mode: EditorIndentMode,
     /// Show the optional bottom status bar (hidden by default to match Tabby's edge-to-edge UI).
     #[serde(default)]
     pub show_status_bar: bool,
@@ -478,6 +487,9 @@ impl Default for TerminalConfig {
             sftp_panel_width: DEFAULT_SFTP_PANEL_WIDTH,
             auto_open_sftp: true,
             sftp_download_dir: None,
+            sftp_editor_word_wrap: false,
+            sftp_editor_expanded: false,
+            sftp_editor_indent_mode: EditorIndentMode::default(),
             show_status_bar: false,
             show_server_stats: true,
             hide_tab_index: false,
@@ -573,6 +585,57 @@ impl Default for TransferConfig {
             default_conflict_policy: TransferConflictPolicy::Ask,
             follow_symlinks: false,
             part_threshold_bytes: DEFAULT_PART_THRESHOLD_BYTES,
+        }
+    }
+}
+
+/// Default indentation style for the SFTP+ Remote File Editor (`config.toml`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EditorIndentMode {
+    /// Insert and unindent 4 spaces per Tab level.
+    #[default]
+    Spaces4,
+    /// Insert and unindent 2 spaces per Tab level.
+    Spaces2,
+    /// Insert and unindent literal `\t` characters.
+    Tab,
+}
+
+impl EditorIndentMode {
+    /// Short status-bar label shown in the Remote File Editor.
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Spaces4 => "Spaces: 4",
+            Self::Spaces2 => "Spaces: 2",
+            Self::Tab => "Tab (\\t)",
+        }
+    }
+
+    /// Cycles to the next indentation mode on status-bar click.
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Spaces4 => Self::Spaces2,
+            Self::Spaces2 => Self::Tab,
+            Self::Tab => Self::Spaces4,
+        }
+    }
+
+    /// String inserted for one indentation level.
+    pub const fn indent_str(self) -> &'static str {
+        match self {
+            Self::Spaces4 => "    ",
+            Self::Spaces2 => "  ",
+            Self::Tab => "\t",
+        }
+    }
+
+    /// Number of columns per indent stop.
+    pub const fn width(self) -> usize {
+        match self {
+            Self::Spaces4 => 4,
+            Self::Spaces2 => 2,
+            Self::Tab => 4,
         }
     }
 }

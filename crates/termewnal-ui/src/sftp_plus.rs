@@ -11,7 +11,7 @@ use iced::advanced::widget::{Operation, Tree, tree};
 use iced::advanced::{Clipboard, Shell, Widget};
 use iced::widget::{
     Id, button, column, container, mouse_area, opaque, row, scrollable, space, stack, text,
-    text_editor, text_input,
+    text_input,
 };
 use iced::{
     Alignment, Background, Border, Color, Element, Event, Length, Padding, Point, Rectangle, Size,
@@ -22,6 +22,10 @@ use termewnal_ssh::{RemoteDirEntry, RemoteEntryKind, SftpTransportMode, Transfer
 
 use crate::app::{Message, SessionId};
 use crate::app_picker::{InstalledApp, filter_installed_apps};
+use crate::remote_editor::{
+    RemoteEditor, RemoteEditorState, UnsavedConfirmAction, remote_editor_find_id,
+    remote_editor_goto_id, remote_editor_replace_id,
+};
 use crate::sftp_drawer::{
     SftpConnectionState, SftpDrawerState, format_bytes, render_transfer_queue_section,
 };
@@ -305,8 +309,9 @@ pub enum SftpModalState {
         loading: bool,
         saving: bool,
         dirty: bool,
+        close_after_save: bool,
         error: Option<String>,
-        content: text_editor::Content<iced::Renderer>,
+        content: RemoteEditorState,
     },
     OpenWith {
         entry: FileBrowserEntry,
@@ -1092,11 +1097,11 @@ pub fn render_sftp_panel<'a>(
                 SftpGlyph::File
             };
             let icon_color = if entry.is_dir {
-                Color::from_rgb8(0xD7, 0x9A, 0x2B)
+                chrome.warning
             } else if entry.is_symlink {
                 chrome.accent
             } else {
-                Color::from_rgb8(0x7A, 0xA2, 0xE3)
+                chrome.text_secondary
             };
 
             let name_color = if is_cut {
@@ -1718,6 +1723,15 @@ pub fn render_sftp_context_menu_overlay<'a>(
     Some(opaque(stack![scrim, positioned]).into())
 }
 
+/// Returns the backdrop dismiss message for `FileViewer`, protecting unsaved edits.
+pub fn file_viewer_backdrop_dismiss(
+    session_id: Option<SessionId>,
+    editable: bool,
+    dirty: bool,
+) -> Option<Message> {
+    (!editable || !dirty).then_some(Message::SftpModalRequestClose(session_id))
+}
+
 /// Renders active SFTP Panel dialog modals (New Folder/File, Rename, Edit Permissions, Properties, View/Edit).
 pub fn render_sftp_plus_modal<'a>(
     state: &'a SftpDrawerState,
@@ -1726,6 +1740,7 @@ pub fn render_sftp_plus_modal<'a>(
     palette: &ThemePalette,
 ) -> Option<Element<'a, Message, Theme, iced::Renderer>> {
     let chrome = ChromePalette::from_palette(palette);
+    let sid = state.bound_session_id();
     match &state.plus.modal {
         SftpModalState::None => None,
         SftpModalState::CreateEntry {
@@ -1762,7 +1777,7 @@ pub fn render_sftp_plus_modal<'a>(
                 button(text("Cancel").size(FONT_BODY).font(ui_font_medium()))
                     .padding([6, 14])
                     .style(pill_button_style(chrome, PillTone::Subtle))
-                    .on_press(Message::SftpDismissModal),
+                    .on_press(Message::SftpDismissModal(sid)),
                 button(text("Create").size(FONT_BODY).font(ui_font_medium()))
                     .padding([6, 16])
                     .style(pill_button_style(chrome, PillTone::Primary))
@@ -1770,14 +1785,15 @@ pub fn render_sftp_plus_modal<'a>(
             ]
             .spacing(8);
 
-            let card = build_modal_shell(
+            let card = build_modal_shell_for_session(
                 title,
                 body.into(),
                 footer.into(),
                 modal_width(440.0, window_width),
                 chrome,
+                sid,
             );
-            Some(modal_overlay(card, Some(Message::SftpDismissModal), 90.0))
+            Some(modal_overlay(card, Some(Message::SftpDismissModal(sid)), 90.0))
         }
         SftpModalState::Rename {
             old_path,
@@ -1806,7 +1822,7 @@ pub fn render_sftp_plus_modal<'a>(
                 button(text("Cancel").size(FONT_BODY).font(ui_font_medium()))
                     .padding([6, 14])
                     .style(pill_button_style(chrome, PillTone::Subtle))
-                    .on_press(Message::SftpDismissModal),
+                    .on_press(Message::SftpDismissModal(sid)),
                 button(text("Rename").size(FONT_BODY).font(ui_font_medium()))
                     .padding([6, 16])
                     .style(pill_button_style(chrome, PillTone::Primary))
@@ -1814,14 +1830,15 @@ pub fn render_sftp_plus_modal<'a>(
             ]
             .spacing(8);
 
-            let card = build_modal_shell(
+            let card = build_modal_shell_for_session(
                 "Rename",
                 body.into(),
                 footer.into(),
                 modal_width(440.0, window_width),
                 chrome,
+                sid,
             );
-            Some(modal_overlay(card, Some(Message::SftpDismissModal), 90.0))
+            Some(modal_overlay(card, Some(Message::SftpDismissModal(sid)), 90.0))
         }
         SftpModalState::EditPermissions {
             target_paths,
@@ -1923,7 +1940,7 @@ pub fn render_sftp_plus_modal<'a>(
                 button(text("Cancel").size(FONT_BODY).font(ui_font_medium()))
                     .padding([6, 14])
                     .style(pill_button_style(chrome, PillTone::Subtle))
-                    .on_press(Message::SftpDismissModal),
+                    .on_press(Message::SftpDismissModal(sid)),
                 button(text("Apply Permissions").size(FONT_BODY).font(ui_font_medium()))
                     .padding([6, 16])
                     .style(pill_button_style(chrome, PillTone::Primary))
@@ -1931,14 +1948,15 @@ pub fn render_sftp_plus_modal<'a>(
             ]
             .spacing(8);
 
-            let card = build_modal_shell(
+            let card = build_modal_shell_for_session(
                 "Edit Permissions",
                 body.into(),
                 footer.into(),
                 modal_width(460.0, window_width),
                 chrome,
+                sid,
             );
-            Some(modal_overlay(card, Some(Message::SftpDismissModal), 80.0))
+            Some(modal_overlay(card, Some(Message::SftpDismissModal(sid)), 80.0))
         }
         SftpModalState::Properties {
             entry,
@@ -2013,17 +2031,18 @@ pub fn render_sftp_plus_modal<'a>(
                 button(text("Close").size(FONT_BODY).font(ui_font_medium()))
                     .padding([6, 16])
                     .style(pill_button_style(chrome, PillTone::Primary))
-                    .on_press(Message::SftpDismissModal),
+                    .on_press(Message::SftpDismissModal(sid)),
             ];
 
-            let card = build_modal_shell(
+            let card = build_modal_shell_for_session(
                 "Properties",
                 well.into(),
                 footer.into(),
                 modal_width(480.0, window_width),
                 chrome,
+                sid,
             );
-            Some(modal_overlay(card, Some(Message::SftpDismissModal), 80.0))
+            Some(modal_overlay(card, Some(Message::SftpDismissModal(sid)), 80.0))
         }
         SftpModalState::FileViewer {
             path,
@@ -2032,6 +2051,7 @@ pub fn render_sftp_plus_modal<'a>(
             loading,
             saving,
             dirty,
+            close_after_save: _,
             error,
             content,
         } => {
@@ -2041,34 +2061,396 @@ pub fn render_sftp_plus_modal<'a>(
             } else {
                 format!("{file_name} ({mode_badge})")
             };
-            let editor_h = modal_body_height(460.0, window_height, 220.0);
+            let modal_w = if content.expanded {
+                (window_width * 0.92).max(320.0)
+            } else {
+                modal_width(760.0, window_width)
+            };
+            let extra_bars_h = (if content.find_open { 42.0 } else { 0.0 })
+                + (if *editable && content.find_open && content.replace_open {
+                    40.0
+                } else {
+                    0.0
+                })
+                + (if content.goto_open { 40.0 } else { 0.0 })
+                + (if content.pending_confirm.is_some() {
+                    44.0
+                } else {
+                    0.0
+                });
+            let editor_h = if content.expanded {
+                (window_height - 230.0 - extra_bars_h).max(220.0)
+            } else {
+                (modal_body_height(460.0, window_height, 250.0) - extra_bars_h).max(180.0)
+            };
 
-            let mut body = column![
-                row![
-                    text(format!("Remote · {path}"))
-                        .size(FONT_META)
-                        .font(mono_font())
-                        .color(chrome.text_secondary)
-                        .width(Length::Fill),
-                    badge_pill(
-                        mode_badge,
-                        if *editable {
-                            chrome.accent_fg
-                        } else {
-                            chrome.text_secondary
-                        },
-                        if *editable {
-                            chrome.accent
-                        } else {
-                            chrome.well_bg
-                        },
-                        chrome.border_subtle,
-                    ),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
+            let mut header_row = row![
+                text(format!("Remote: {path}"))
+                    .size(FONT_META)
+                    .font(mono_font())
+                    .color(chrome.text_secondary)
+                    .width(Length::Fill),
+                badge_pill(
+                    mode_badge,
+                    if *editable {
+                        chrome.accent_fg
+                    } else {
+                        chrome.text_secondary
+                    },
+                    if *editable {
+                        chrome.accent
+                    } else {
+                        chrome.well_bg
+                    },
+                    chrome.border_subtle,
+                ),
             ]
-            .spacing(8);
+            .spacing(8)
+            .align_y(Alignment::Center);
+
+            if !*editable && !*loading {
+                header_row = header_row.push(
+                    button(text("Switch to Edit").size(FONT_META).font(ui_font_medium()))
+                        .padding([3, 8])
+                        .style(pill_button_style(chrome, PillTone::Subtle))
+                        .on_press(Message::SftpModalSwitchToEdit),
+                );
+            }
+            let mut reload_btn = button(text("Reload").size(FONT_META).font(ui_font_medium()))
+                .padding([3, 8])
+                .style(pill_button_style(chrome, PillTone::Subtle));
+            if !*loading && !*saving {
+                reload_btn = reload_btn.on_press(Message::SftpModalReloadFile);
+            }
+            header_row = header_row.push(reload_btn);
+            header_row = header_row.push(
+                button(
+                    text(if content.expanded {
+                        "Restore"
+                    } else {
+                        "Expand"
+                    })
+                    .size(FONT_META)
+                    .font(ui_font_medium()),
+                )
+                .padding([3, 8])
+                .style(pill_button_style(
+                    chrome,
+                    if content.expanded {
+                        PillTone::ActiveAccent
+                    } else {
+                        PillTone::Subtle
+                    },
+                ))
+                .on_press(Message::SftpModalToggleExpand),
+            );
+
+            // Compact editor action toolbar
+            let mut toolbar = row![
+                button(text("Find (Ctrl+F)").size(FONT_META).font(ui_font_medium()))
+                    .padding([3, 8])
+                    .style(pill_button_style(
+                        chrome,
+                        if content.find_open {
+                            PillTone::ActiveAccent
+                        } else {
+                            PillTone::Subtle
+                        },
+                    ))
+                    .on_press(Message::SftpModalToggleFind(false)),
+            ]
+            .spacing(6)
+            .align_y(Alignment::Center);
+
+            if *editable {
+                toolbar = toolbar.push(
+                    button(text("Replace (Ctrl+H)").size(FONT_META).font(ui_font_medium()))
+                        .padding([3, 8])
+                        .style(pill_button_style(
+                            chrome,
+                            if content.find_open && content.replace_open {
+                                PillTone::ActiveAccent
+                            } else {
+                                PillTone::Subtle
+                            },
+                        ))
+                        .on_press(Message::SftpModalToggleFind(true)),
+                );
+            }
+
+            toolbar = toolbar.push(
+                button(text("Line (Ctrl+G)").size(FONT_META).font(ui_font_medium()))
+                    .padding([3, 8])
+                    .style(pill_button_style(
+                        chrome,
+                        if content.goto_open {
+                            PillTone::ActiveAccent
+                        } else {
+                            PillTone::Subtle
+                        },
+                    ))
+                    .on_press(Message::SftpModalToggleGoToLine),
+            );
+
+            if *editable {
+                let mut undo_btn = button(text("Undo").size(FONT_META).font(ui_font_medium()))
+                    .padding([3, 8])
+                    .style(pill_button_style(chrome, PillTone::Ghost));
+                if content.can_undo() {
+                    undo_btn = undo_btn.on_press(Message::SftpModalEditorEvent(
+                        crate::remote_editor::RemoteEditorEvent::Undo,
+                    ));
+                }
+                let mut redo_btn = button(text("Redo").size(FONT_META).font(ui_font_medium()))
+                    .padding([3, 8])
+                    .style(pill_button_style(chrome, PillTone::Ghost));
+                if content.can_redo() {
+                    redo_btn = redo_btn.on_press(Message::SftpModalEditorEvent(
+                        crate::remote_editor::RemoteEditorEvent::Redo,
+                    ));
+                }
+                toolbar = toolbar.push(undo_btn).push(redo_btn);
+            }
+
+            toolbar = toolbar.push(space::horizontal()).push(
+                button(text("Wrap").size(FONT_META).font(ui_font_medium()))
+                    .padding([3, 8])
+                    .style(pill_button_style(
+                        chrome,
+                        if content.word_wrap {
+                            PillTone::ActiveAccent
+                        } else {
+                            PillTone::Subtle
+                        },
+                    ))
+                    .on_press(Message::SftpModalToggleWordWrap),
+            );
+
+            let mut body = column![header_row, toolbar].spacing(6);
+
+            // Inline Go to Line bar
+            if content.goto_open {
+                let mut goto_row = row![
+                    text("Go to line:")
+                        .size(FONT_META)
+                        .font(ui_font_medium())
+                        .color(chrome.text_secondary),
+                    text_input("line or line:col (e.g. 42 or 42:8)", &content.goto_input)
+                        .id(remote_editor_goto_id())
+                        .size(FONT_META)
+                        .padding([4, 8])
+                        .width(Length::Fixed(240.0))
+                        .style(styled_input_style(chrome))
+                        .on_input(Message::SftpModalGoToLineInputChanged)
+                        .on_submit(Message::SftpModalGoToLineSubmit),
+                    button(text("Go").size(FONT_META).font(ui_font_medium()))
+                        .padding([4, 10])
+                        .style(pill_button_style(chrome, PillTone::Primary))
+                        .on_press(Message::SftpModalGoToLineSubmit),
+                    button(text("×").size(FONT_BODY))
+                        .padding([2, 7])
+                        .style(pill_button_style(chrome, PillTone::Ghost))
+                        .on_press(Message::SftpModalToggleGoToLine),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
+                if let Some(err) = &content.goto_error {
+                    goto_row = goto_row.push(text(err.clone()).size(FONT_META).color(chrome.danger));
+                }
+                body = body.push(
+                    container(goto_row)
+                        .padding([5, 8])
+                        .width(Length::Fill)
+                        .style(move |_| inset_well_style(chrome)),
+                );
+            }
+
+            // Inline Find / Replace bar
+            if content.find_open {
+                let counter_label = content.find_status_label();
+                let mut find_row = row![
+                    text_input("Find...", &content.find_query)
+                        .id(remote_editor_find_id())
+                        .size(FONT_META)
+                        .padding([4, 8])
+                        .width(Length::Fill)
+                        .style(styled_input_style(chrome))
+                        .on_input(Message::SftpModalFindQueryChanged)
+                        .on_submit(Message::SftpModalFindNext),
+                    button(text("Aa").size(FONT_META).font(mono_font()))
+                        .padding([4, 7])
+                        .style(pill_button_style(
+                            chrome,
+                            if content.search_options.case_sensitive {
+                                PillTone::ActiveAccent
+                            } else {
+                                PillTone::Subtle
+                            },
+                        ))
+                        .on_press(Message::SftpModalToggleSearchCase),
+                    button(text("ab").size(FONT_META).font(mono_font()))
+                        .padding([4, 7])
+                        .style(pill_button_style(
+                            chrome,
+                            if content.search_options.whole_word {
+                                PillTone::ActiveAccent
+                            } else {
+                                PillTone::Subtle
+                            },
+                        ))
+                        .on_press(Message::SftpModalToggleSearchWholeWord),
+                    button(text(".*").size(FONT_META).font(mono_font()))
+                        .padding([4, 7])
+                        .style(pill_button_style(
+                            chrome,
+                            if content.search_options.regex {
+                                PillTone::ActiveAccent
+                            } else {
+                                PillTone::Subtle
+                            },
+                        ))
+                        .on_press(Message::SftpModalToggleSearchRegex),
+                    text(counter_label).size(FONT_META).color(
+                        if content.search_error.is_some() {
+                            chrome.danger
+                        } else {
+                            chrome.text_muted
+                        }
+                    ),
+                    button(text("▲").size(11.0))
+                        .padding([4, 7])
+                        .style(pill_button_style(chrome, PillTone::Ghost))
+                        .on_press(Message::SftpModalFindPrev),
+                    button(text("▼").size(11.0))
+                        .padding([4, 7])
+                        .style(pill_button_style(chrome, PillTone::Ghost))
+                        .on_press(Message::SftpModalFindNext),
+                ]
+                .spacing(4)
+                .align_y(Alignment::Center);
+
+                if *editable {
+                    find_row = find_row.push(
+                        button(
+                            text(if content.replace_open { "▾" } else { "▸" })
+                                .size(FONT_META),
+                        )
+                        .padding([4, 7])
+                        .style(pill_button_style(chrome, PillTone::Ghost))
+                        .on_press(Message::SftpModalToggleFind(true)),
+                    );
+                }
+                find_row = find_row.push(
+                    button(text("×").size(FONT_BODY))
+                        .padding([2, 7])
+                        .style(pill_button_style(chrome, PillTone::Ghost))
+                        .on_press(Message::SftpModalCloseFind),
+                );
+
+                let mut search_col = column![find_row].spacing(5);
+                if *editable && content.replace_open {
+                    let has_matches = !content.matches.is_empty();
+                    let mut replace_one_btn =
+                        button(text("Replace").size(FONT_META).font(ui_font_medium()))
+                            .padding([4, 9])
+                            .style(pill_button_style(chrome, PillTone::Subtle));
+                    let mut replace_all_btn =
+                        button(text("Replace All").size(FONT_META).font(ui_font_medium()))
+                            .padding([4, 9])
+                            .style(pill_button_style(chrome, PillTone::Subtle));
+                    if has_matches {
+                        replace_one_btn =
+                            replace_one_btn.on_press(Message::SftpModalReplaceOne);
+                        replace_all_btn =
+                            replace_all_btn.on_press(Message::SftpModalReplaceAll);
+                    }
+                    let replace_row = row![
+                        text_input("Replace with...", &content.replace_text)
+                            .id(remote_editor_replace_id())
+                            .size(FONT_META)
+                            .padding([4, 8])
+                            .width(Length::Fill)
+                            .style(styled_input_style(chrome))
+                            .on_input(Message::SftpModalReplaceTextChanged)
+                            .on_submit(Message::SftpModalReplaceOne),
+                        replace_one_btn,
+                        replace_all_btn,
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center);
+                    search_col = search_col.push(replace_row);
+                }
+
+                if let Some(err) = &content.search_error {
+                    search_col = search_col.push(text(err.clone()).size(FONT_META).color(chrome.danger));
+                } else if let Some(msg) = &content.replace_feedback {
+                    search_col = search_col
+                        .push(text(msg.clone()).size(FONT_META).color(chrome.success));
+                }
+
+                body = body.push(
+                    container(search_col)
+                        .padding([6, 8])
+                        .width(Length::Fill)
+                        .style(move |_| inset_well_style(chrome)),
+                );
+            }
+
+            // Unsaved changes confirmation banner
+            if let Some(confirm) = content.pending_confirm {
+                let confirm_row = match confirm {
+                    UnsavedConfirmAction::CloseModal => row![
+                        text(format!("Save unsaved changes to {file_name}?"))
+                            .size(FONT_META)
+                            .font(ui_font_medium())
+                            .color(chrome.warning)
+                            .width(Length::Fill),
+                        button(text("Save & Close").size(FONT_META).font(ui_font_medium()))
+                            .padding([4, 10])
+                            .style(pill_button_style(chrome, PillTone::Primary))
+                            .on_press(Message::SftpModalConfirmUnsaved { save_first: true }),
+                        button(text("Discard").size(FONT_META).font(ui_font_medium()))
+                            .padding([4, 10])
+                            .style(pill_button_style(chrome, PillTone::Danger))
+                            .on_press(Message::SftpModalConfirmUnsaved { save_first: false }),
+                        button(text("Cancel").size(FONT_META).font(ui_font_medium()))
+                            .padding([4, 10])
+                            .style(pill_button_style(chrome, PillTone::Subtle))
+                            .on_press(Message::SftpModalCancelUnsaved),
+                    ],
+                    UnsavedConfirmAction::ReloadFromRemote => row![
+                        text(format!("Reload {file_name} and discard unsaved changes?"))
+                            .size(FONT_META)
+                            .font(ui_font_medium())
+                            .color(chrome.warning)
+                            .width(Length::Fill),
+                        button(text("Reload & Discard").size(FONT_META).font(ui_font_medium()))
+                            .padding([4, 10])
+                            .style(pill_button_style(chrome, PillTone::Danger))
+                            .on_press(Message::SftpModalConfirmUnsaved { save_first: false }),
+                        button(text("Cancel").size(FONT_META).font(ui_font_medium()))
+                            .padding([4, 10])
+                            .style(pill_button_style(chrome, PillTone::Subtle))
+                            .on_press(Message::SftpModalCancelUnsaved),
+                    ],
+                }
+                .spacing(6)
+                .align_y(Alignment::Center);
+                body = body.push(
+                    container(confirm_row)
+                        .padding([6, 10])
+                        .width(Length::Fill)
+                        .style(move |_| container::Style {
+                            background: Some(chrome.warning_soft.into()),
+                            border: Border {
+                                color: chrome.warning,
+                                width: 1.0,
+                                radius: 6.0.into(),
+                            },
+                            ..Default::default()
+                        }),
+                );
+            }
 
             if *loading {
                 body = body.push(
@@ -2084,24 +2466,71 @@ pub fn render_sftp_plus_modal<'a>(
                     .style(move |_| inset_well_style(chrome)),
                 );
             } else {
-                let editor = text_editor(content)
-                    .height(Length::Fixed(editor_h))
-                    .font(mono_font())
-                    .size(FONT_BODY)
-                    .padding(10)
-                    .style(move |_, _| text_editor::Style {
-                        background: chrome.well_bg.into(),
-                        border: Border {
-                            color: chrome.border_subtle,
-                            width: 1.0,
-                            radius: 6.0.into(),
-                        },
-                        placeholder: chrome.text_muted,
-                        value: chrome.text_primary,
-                        selection: chrome.accent_soft,
-                    })
-                    .on_action(Message::SftpModalEditorAction);
+                let editor = RemoteEditor::new(
+                    content,
+                    *editable,
+                    chrome,
+                    mono_font(),
+                    FONT_BODY,
+                    Length::Fixed(editor_h),
+                    Message::SftpModalEditorEvent,
+                );
                 body = body.push(editor);
+
+                let (ln, col) = content.cursor_line_col_1based();
+                let line_count = content.line_count();
+                let byte_len = content.byte_len();
+                let mut status_row = row![
+                    text(format!(
+                        "Ln {ln}, Col {col} | {line_count} lines | {} | UTF-8",
+                        format_bytes(byte_len as u64)
+                    ))
+                    .size(FONT_META)
+                    .font(mono_font())
+                    .color(chrome.text_muted)
+                    .width(Length::Fill),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center);
+
+                if *editable {
+                    status_row = status_row
+                        .push(
+                            button(text(content.line_ending.label()).size(FONT_META).font(mono_font()))
+                                .padding([2, 6])
+                                .style(pill_button_style(chrome, PillTone::Ghost))
+                                .on_press(Message::SftpModalToggleLineEnding),
+                        )
+                        .push(
+                            button(
+                                text(content.indent_mode.label())
+                                    .size(FONT_META)
+                                    .font(mono_font()),
+                            )
+                            .padding([2, 6])
+                            .style(pill_button_style(chrome, PillTone::Ghost))
+                            .on_press(Message::SftpModalCycleIndentMode),
+                        );
+                } else {
+                    status_row = status_row.push(
+                        text(content.line_ending.label())
+                            .size(FONT_META)
+                            .font(mono_font())
+                            .color(chrome.text_muted),
+                    );
+                }
+
+                let state_badge = if !*editable {
+                    text("Read-only").size(FONT_META).color(chrome.text_muted)
+                } else if *dirty {
+                    text("Unsaved").size(FONT_META).color(chrome.warning)
+                } else if let Some(note) = &content.saved_status_note {
+                    text(note.clone()).size(FONT_META).color(chrome.success)
+                } else {
+                    text("Saved").size(FONT_META).color(chrome.text_muted)
+                };
+                status_row = status_row.push(state_badge);
+                body = body.push(status_row);
             }
 
             if let Some(err) = error {
@@ -2113,10 +2542,10 @@ pub fn render_sftp_plus_modal<'a>(
                 button(text("Close").size(FONT_BODY).font(ui_font_medium()))
                     .padding([6, 14])
                     .style(pill_button_style(chrome, PillTone::Subtle))
-                    .on_press(Message::SftpDismissModal),
+                    .on_press(Message::SftpModalRequestClose(sid)),
             );
             if *editable {
-                let save_label = if *saving { "Saving..." } else { "Save" };
+                let save_label = if *saving { "Saving..." } else { "Save (Ctrl+S)" };
                 let mut save_btn = button(text(save_label).size(FONT_BODY).font(ui_font_medium()))
                     .padding([6, 16])
                     .style(pill_button_style(chrome, PillTone::Primary));
@@ -2126,14 +2555,17 @@ pub fn render_sftp_plus_modal<'a>(
                 footer = footer.push(save_btn);
             }
 
-            let card = build_modal_shell(
+            let card = build_modal_shell_with_close(
                 &title,
                 body.into(),
                 footer.into(),
-                modal_width(760.0, window_width),
+                modal_w,
                 chrome,
+                Message::SftpModalRequestClose(sid),
             );
-            Some(modal_overlay(card, Some(Message::SftpDismissModal), 44.0))
+            let backdrop_dismiss = file_viewer_backdrop_dismiss(sid, *editable, *dirty);
+            let top_pad = if content.expanded { 18.0 } else { 44.0 };
+            Some(modal_overlay(card, backdrop_dismiss, top_pad))
         }
         SftpModalState::OpenWith {
             entry,
@@ -2144,7 +2576,7 @@ pub fn render_sftp_plus_modal<'a>(
             error,
             ..
         } => {
-            let kind_badge = if entry.is_dir { "FOLDER" } else { "FILE" };
+            let kind_badge = if entry.is_dir { "Folder" } else { "File" };
             let title = format!("Open \"{}\" with...", entry.name);
             let list_h = modal_body_height(320.0, window_height, 270.0);
             let filtered = filter_installed_apps(apps, search_query);
@@ -2367,30 +2799,50 @@ pub fn render_sftp_plus_modal<'a>(
                 button(text("Cancel").size(FONT_BODY).font(ui_font_medium()))
                     .padding([6, 14])
                     .style(pill_button_style(chrome, PillTone::Subtle))
-                    .on_press(Message::SftpDismissModal),
+                    .on_press(Message::SftpDismissModal(sid)),
                 open_btn,
             ]
             .spacing(8)
             .align_y(Alignment::Center);
 
-            let card = build_modal_shell(
+            let card = build_modal_shell_for_session(
                 &title,
                 body.into(),
                 footer.into(),
                 modal_width(540.0, window_width),
                 chrome,
+                sid,
             );
-            Some(modal_overlay(card, Some(Message::SftpDismissModal), 64.0))
+            Some(modal_overlay(card, Some(Message::SftpDismissModal(sid)), 64.0))
         }
     }
 }
 
-fn build_modal_shell<'a>(
+fn build_modal_shell_for_session<'a>(
     title: &str,
     body: Element<'a, Message, Theme, iced::Renderer>,
     footer: Element<'a, Message, Theme, iced::Renderer>,
     width: f32,
     chrome: ChromePalette,
+    session_id: Option<SessionId>,
+) -> Element<'a, Message, Theme, iced::Renderer> {
+    build_modal_shell_with_close(
+        title,
+        body,
+        footer,
+        width,
+        chrome,
+        Message::SftpDismissModal(session_id),
+    )
+}
+
+fn build_modal_shell_with_close<'a>(
+    title: &str,
+    body: Element<'a, Message, Theme, iced::Renderer>,
+    footer: Element<'a, Message, Theme, iced::Renderer>,
+    width: f32,
+    chrome: ChromePalette,
+    on_close: Message,
 ) -> Element<'a, Message, Theme, iced::Renderer> {
     let header = row![
         text(title.to_string())
@@ -2401,7 +2853,7 @@ fn build_modal_shell<'a>(
         button(text("×").size(15.0).color(chrome.text_secondary))
             .padding([2, 7])
             .style(tab_bar_button_style(chrome, false, false))
-            .on_press(Message::SftpDismissModal),
+            .on_press(on_close),
     ]
     .align_y(Alignment::Center);
 
@@ -2933,18 +3385,10 @@ impl Widget<Message, Theme, iced::Renderer> for SftpRowInteract<'_> {
                 if self.chrome.is_light {
                     self.chrome.accent_soft
                 } else {
-                    Color {
-                        r: 0.45,
-                        g: 0.49,
-                        b: 0.56,
-                        a: 0.50,
-                    }
+                    self.chrome.secondary
                 }
             } else {
-                Color {
-                    a: 0.06,
-                    ..self.chrome.text_primary
-                }
+                self.chrome.card_bg
             };
             renderer.fill_quad(
                 Quad {

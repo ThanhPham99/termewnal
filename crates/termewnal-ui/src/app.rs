@@ -22,7 +22,8 @@ use notify_debouncer_mini::{DebouncedEventBatch, new_debouncer_opt};
 use termewnal_core::{
     AppConfig, BellBehavior, BuiltinTheme, CURRENT_SCHEMA_VERSION, ConfigFileKind, ConfigPaths,
     ConfigSyncService, ConfigWatchEvent, ConfigWatcher, CursorStyle, DEFAULT_SIDEBAR_WIDTH,
-    DockerRuntime, KeyAction, KeyChord, KeybindingResolver, LayoutSplitAxis, LayoutSplitNode,
+    DockerRuntime, EditorIndentMode, KeyAction, KeyChord, KeybindingResolver, LayoutSplitAxis,
+    LayoutSplitNode,
     LoginScriptStep, MAX_SIDEBAR_WIDTH, MIN_SIDEBAR_WIDTH, NewlineMode, OpenSshHost, Profile,
     ProfileTarget, ProfilesConfig, QuickCommand, QuickCommandsConfig, RightClickAction,
     SecretStore, SerialInputMode, SerialOutputMode, SessionDescriptor, SftpState, SshAuthMethod,
@@ -93,6 +94,10 @@ use crate::quake_and_tray::{
     QuakeController, SystemTrayAdapter, TrayAction, TrayStateSnapshot,
     default_global_hotkey_registrar, default_system_tray, quake_window_settings,
 };
+use crate::remote_editor::{
+    RemoteEditorEvent, RemoteEditorState, UnsavedConfirmAction, remote_editor_find_id,
+    remote_editor_goto_id, remote_editor_id, remote_editor_replace_id,
+};
 use crate::server_stats_bar::render_server_stats_bar;
 use crate::settings_ui::{SettingsTab, SettingsUiState, ThemeOverrideField};
 use crate::sftp_drawer::{
@@ -109,7 +114,9 @@ use crate::sidebar::{
     SidebarState, SystemSshProfile, UNGROUPED_LABEL, profile_target_summary,
     render_sidebar_full_with_width,
 };
-use crate::split_view::{CapturedEventGate, PaneFrame, ShortcutInterceptor, SplitView};
+use crate::split_view::{
+    CapturedEventGate, PaneFrame, RemoteEditorShortcut, ShortcutInterceptor, SplitView,
+};
 use crate::ssh_ui::{SshTargetSpec, SshUiEvent, SshUiState, connect_ssh_task};
 use crate::status_bar::{
     RecoveryNoticeKind, SessionKindLabel, SessionStatusHook, StatusBarAction, StatusBarSnapshot,
@@ -140,8 +147,8 @@ use crate::v2_modals::{
     ZmodemSendUiState,
 };
 use crate::window_chrome::{
-    BorderlessResizeFrame, WindowControlGlyph, WindowControlIcon, main_window_settings,
-    render_top_system_title_bar,
+    BorderlessResizeFrame, TitleBarDragZone, WindowControlGlyph, WindowControlIcon,
+    main_window_settings, render_top_system_title_bar,
 };
 use crate::workspace::{
     ClosePaneOutcome, CycleDirection, FocusDirection, PaneId, SplitAxis, SplitId, SplitNode,
@@ -332,6 +339,7 @@ pub struct SshSessionSlot {
     reconnected_at: Option<Instant>,
     server_stats: Option<ServerStatsSnapshot>,
     server_stats_unsupported: bool,
+    mitm_blocked: bool,
 }
 
 impl std::fmt::Debug for SshSessionSlot {
@@ -369,6 +377,11 @@ impl SshSessionSlot {
     /// Returns the current SSH `TransportStatus`.
     pub fn transport_status(&self) -> &TransportStatus {
         &self.transport_status
+    }
+
+    /// Returns `true` when SSH reconnection has been permanently blocked for this slot due to a MITM key mismatch.
+    pub fn is_mitm_blocked(&self) -> bool {
+        self.mitm_blocked
     }
 
     /// Returns the descriptive status message shown inside this slot.
@@ -844,6 +857,15 @@ impl SessionEntry {
         }
     }
 
+    fn snapshot(&self) -> &Arc<TerminalSnapshot> {
+        match self {
+            Self::Local(s) => &s.snapshot,
+            Self::Ssh(s) => &s.snapshot,
+            Self::Serial(s) => &s.snapshot,
+            Self::Telnet(s) => &s.snapshot,
+        }
+    }
+
     fn refresh_snapshot(&mut self) {
         match self {
             Self::Local(s) => s.snapshot = Arc::new(s.pty.snapshot()),
@@ -926,18 +948,33 @@ pub enum Message {
         side: Side,
         selection_type: SelectionType,
     },
+    SelectionExtend {
+        session_id: SessionId,
+        col: usize,
+        row: usize,
+        side: Side,
+    },
     SelectionUpdate {
         session_id: SessionId,
         col: usize,
         row: usize,
         side: Side,
     },
+    SelectionDragScroll {
+        session_id: SessionId,
+        col: usize,
+        row: usize,
+        side: Side,
+        delta_lines: i32,
+    },
+    SelectionAutoScrollTick,
     SelectionFinish {
         session_id: SessionId,
     },
     CopySelection {
         session_id: SessionId,
     },
+    ClearExpiredCopyFeedback,
     PasteFromClipboard {
         session_id: SessionId,
     },
@@ -1173,7 +1210,7 @@ pub enum Message {
     },
     SftpDismissContextMenu,
     SftpContextAction(SftpContextActionKind),
-    SftpDismissModal,
+    SftpDismissModal(Option<SessionId>),
     SftpModalNameChanged(String),
     SftpModalConfirmCreateOrRename,
     SftpModalOctalChanged(String),
@@ -1182,8 +1219,34 @@ pub enum Message {
         enabled: bool,
     },
     SftpModalConfirmPermissions,
-    SftpModalEditorAction(iced::widget::text_editor::Action),
+    SftpModalEditorEvent(RemoteEditorEvent),
+    SftpModalShortcut(RemoteEditorShortcut),
+    SftpModalRequestClose(Option<SessionId>),
+    SftpModalConfirmUnsaved {
+        save_first: bool,
+    },
+    SftpModalCancelUnsaved,
     SftpModalSaveFile,
+    SftpModalReloadFile,
+    SftpModalSwitchToEdit,
+    SftpModalToggleWordWrap,
+    SftpModalToggleExpand,
+    SftpModalCycleIndentMode,
+    SftpModalToggleLineEnding,
+    SftpModalToggleFind(bool),
+    SftpModalCloseFind,
+    SftpModalFindQueryChanged(String),
+    SftpModalReplaceTextChanged(String),
+    SftpModalToggleSearchCase,
+    SftpModalToggleSearchWholeWord,
+    SftpModalToggleSearchRegex,
+    SftpModalFindNext,
+    SftpModalFindPrev,
+    SftpModalReplaceOne,
+    SftpModalReplaceAll,
+    SftpModalToggleGoToLine,
+    SftpModalGoToLineInputChanged(String),
+    SftpModalGoToLineSubmit,
     SftpRemoteFileReadResult {
         session_id: SessionId,
         request_path: String,
@@ -1584,11 +1647,33 @@ pub enum Message {
 
 static NEXT_SFTP_SUB_ID: AtomicU64 = AtomicU64::new(1);
 
+const COPY_FEEDBACK_TTL: Duration = Duration::from_millis(1200);
+
+#[derive(Debug, Clone)]
+struct SelectionDragScrollState {
+    session_id: SessionId,
+    col: usize,
+    row: usize,
+    side: Side,
+    delta_lines: i32,
+}
+
 struct WindowState {
     workspace: Workspace,
     width: u32,
     height: u32,
     maximized: bool,
+    sidebar_override: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct WindowChromeMetrics {
+    win_w: f32,
+    win_h: f32,
+    sidebar_open: bool,
+    sidebar_w: f32,
+    workspace_w: f32,
+    workspace_h: f32,
 }
 
 /// Top-level Elm application state for Termewnal.
@@ -1642,6 +1727,8 @@ pub struct AppState {
     search: SearchBarState,
     pending_paste: Option<PendingPaste>,
     last_copied: Option<String>,
+    selection_drag_scroll: Option<SelectionDragScrollState>,
+    copied_feedback: Option<(SessionId, Instant)>,
     url_opener: UrlOpener,
     file_opener: FileOpener,
     app_opener: AppOpener,
@@ -1681,6 +1768,7 @@ pub struct AppState {
     hotkey_guard: Option<Box<dyn HotkeyRegistrationGuard>>,
     hotkey_tx: Option<mpsc::UnboundedSender<()>>,
     hotkey_rx: Option<Arc<Mutex<Option<mpsc::UnboundedReceiver<()>>>>>,
+    in_flight_os_dialogs: usize,
 }
 
 impl AppState {
@@ -1857,7 +1945,8 @@ impl AppState {
                 SftpState::default()
             }
         };
-        let sidebar = SidebarState::new();
+        let mut sidebar = SidebarState::new();
+        sidebar.set_open(config.terminal.show_profile_sidebar);
         let mut state = Self {
             paths,
             config,
@@ -1908,6 +1997,8 @@ impl AppState {
             search: SearchBarState::default(),
             pending_paste: None,
             last_copied: None,
+            selection_drag_scroll: None,
+            copied_feedback: None,
             url_opener: Arc::new(open_url_with_system),
             file_opener: Arc::new(open_local_file_with_system),
             app_opener: Arc::new(open_local_path_with_app),
@@ -1949,6 +2040,7 @@ impl AppState {
             hotkey_guard: None,
             hotkey_tx: None,
             hotkey_rx: None,
+            in_flight_os_dialogs: 0,
         };
 
         let restored = match load_layout(&state.paths) {
@@ -2125,6 +2217,7 @@ impl AppState {
             width: self.config.window.width,
             height: self.config.window.height,
             maximized: false,
+            sidebar_override: None,
         });
         Ok(())
     }
@@ -2162,6 +2255,7 @@ impl AppState {
                 width: win_layout.width.max(200),
                 height: win_layout.height.max(150),
                 maximized: false,
+                sidebar_override: None,
             });
             restored_any = true;
         }
@@ -2469,6 +2563,7 @@ impl AppState {
             cursor_shape: cursor_style_to_shape(self.config.terminal.cursor_style),
             cursor_blink: self.config.terminal.cursor_blink,
             working_dir: working_dir.clone(),
+            word_separators: Some(self.config.terminal.word_separators.clone()),
         };
 
         let pty = Arc::new(
@@ -2536,11 +2631,13 @@ impl AppState {
         };
         let cols = spec.connect_config.cols.max(1);
         let rows = spec.connect_config.rows.max(1);
-        let buffer = Arc::new(TerminalBuffer::new_with_cursor_shape(
+        let buffer = Arc::new(TerminalBuffer::new_with_full_options(
             cols,
             rows,
             spec.connect_config.scrollback_lines,
             cursor_style_to_shape(self.config.terminal.cursor_style),
+            self.config.terminal.cursor_blink,
+            Some(self.config.terminal.word_separators.as_str()),
         ));
         let snapshot = Arc::new(buffer.snapshot());
         let status = TransportStatus::Disconnected;
@@ -2567,6 +2664,7 @@ impl AppState {
             reconnected_at: None,
             server_stats: None,
             server_stats_unsupported: false,
+            mitm_blocked: false,
         };
         self.sessions.insert(id, SessionEntry::Ssh(slot));
         let drawer = self.build_session_sftp_drawer(id);
@@ -2592,11 +2690,13 @@ impl AppState {
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or(fallback_title);
-        let buffer = Arc::new(TerminalBuffer::new_with_cursor_shape(
+        let buffer = Arc::new(TerminalBuffer::new_with_full_options(
             80,
             24,
             self.config.terminal.scrollback_lines,
             cursor_style_to_shape(self.config.terminal.cursor_style),
+            self.config.terminal.cursor_blink,
+            Some(self.config.terminal.word_separators.as_str()),
         ));
         let opener = Arc::clone(&self.serial_opener);
         let (active, status) = if connect_now && tokio::runtime::Handle::try_current().is_ok() {
@@ -2676,11 +2776,13 @@ impl AppState {
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or(fallback_title);
-        let buffer = Arc::new(TerminalBuffer::new_with_cursor_shape(
+        let buffer = Arc::new(TerminalBuffer::new_with_full_options(
             config.cols.max(1),
             config.rows.max(1),
             self.config.terminal.scrollback_lines,
             cursor_style_to_shape(self.config.terminal.cursor_style),
+            self.config.terminal.cursor_blink,
+            Some(self.config.terminal.word_separators.as_str()),
         ));
         let (active, status) = if connect_now && tokio::runtime::Handle::try_current().is_ok() {
             let sess = TelnetSession::connect_on_buffer(config.clone(), Arc::clone(&buffer));
@@ -2734,7 +2836,19 @@ impl AppState {
         }
     }
 
+    fn is_session_mitm_blocked(&self, session_id: SessionId) -> bool {
+        self.ssh_ui.mitm_alert(session_id).is_some()
+            || self
+                .sessions
+                .get(&session_id)
+                .and_then(SessionEntry::as_ssh)
+                .is_some_and(|slot| slot.mitm_blocked)
+    }
+
     fn start_ssh_connect(&mut self, session_id: SessionId) -> Task<Message> {
+        if self.is_session_mitm_blocked(session_id) {
+            return Task::none();
+        }
         self.ssh_ui.clear_session_prompts(session_id);
         let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id) else {
             return Task::none();
@@ -2776,7 +2890,7 @@ impl AppState {
     }
 
     fn reconnect_ssh_session(&mut self, session_id: SessionId) -> Task<Message> {
-        if self.ssh_ui.mitm_alert(session_id).is_some() {
+        if self.is_session_mitm_blocked(session_id) {
             return Task::none();
         }
         if let Some(SessionEntry::Ssh(slot)) = self.sessions.get_mut(&session_id)
@@ -2843,7 +2957,7 @@ impl AppState {
 
         let mut tasks = Vec::new();
         for sid in ssh_ids {
-            if self.ssh_ui.mitm_alert(sid).is_some() {
+            if self.is_session_mitm_blocked(sid) {
                 continue;
             }
             let action_needed = match self.sessions.get_mut(&sid) {
@@ -2902,6 +3016,7 @@ impl AppState {
             }
         };
         if opened {
+            self.reconcile_all_windows_sftp_geometry();
             self.sync_status_bar_drawer_open();
         }
         opened
@@ -3391,12 +3506,13 @@ impl AppState {
         }
     }
 
-    fn handle_status_bar_action(&mut self, action: StatusBarAction) -> Task<Message> {
+    fn handle_status_bar_action(
+        &mut self,
+        window_scope: Option<window::Id>,
+        action: StatusBarAction,
+    ) -> Task<Message> {
         match action {
-            StatusBarAction::ToggleSidebar => {
-                self.sidebar.toggle();
-                Task::none()
-            }
+            StatusBarAction::ToggleSidebar => self.update_in_window(window_scope, Message::ToggleSidebar),
             StatusBarAction::OpenCommandPalette => self.update(Message::OpenCommandPalette),
             StatusBarAction::OpenSettings => self.update(Message::OpenSettingsModal),
             StatusBarAction::ProbeAll => self.probe_and_reconnect_all(),
@@ -3408,10 +3524,9 @@ impl AppState {
                 Task::none()
             }
             StatusBarAction::ToggleTunnelsView => {
-                self.sidebar.set_open(true);
                 self.sidebar
                     .set_section_collapsed(SidebarSection::ActiveTunnels, false);
-                Task::none()
+                self.update_in_window(window_scope, Message::SetSidebarOpen(true))
             }
             StatusBarAction::ReconnectTunnels => self.reconnect_all_tunnels(),
             StatusBarAction::ToggleTransferDrawer => self.toggle_sftp_drawer(),
@@ -3626,6 +3741,19 @@ impl AppState {
     }
 
     fn remove_session(&mut self, session_id: SessionId) {
+        if self
+            .selection_drag_scroll
+            .as_ref()
+            .is_some_and(|drag| drag.session_id == session_id)
+        {
+            self.selection_drag_scroll = None;
+        }
+        if self
+            .copied_feedback
+            .is_some_and(|(sid, _)| sid == session_id)
+        {
+            self.copied_feedback = None;
+        }
         self.ssh_ui.clear_session_prompts(session_id);
         self.visual_bell_generation.remove(&session_id);
         self.visual_bell_active.remove(&session_id);
@@ -3678,6 +3806,8 @@ impl AppState {
                     .is_some();
                 if !inserted {
                     self.remove_session(session_id);
+                } else {
+                    self.reconcile_all_windows_sftp_geometry();
                 }
             }
             Err(err) => {
@@ -3702,6 +3832,7 @@ impl AppState {
                 | ClosePaneOutcome::ClosedTab { session_id } => session_id,
             };
             self.remove_session(sid);
+            self.reconcile_all_windows_sftp_geometry();
         }
     }
 
@@ -4185,10 +4316,12 @@ impl AppState {
                 width,
                 height,
                 maximized: false,
+                sidebar_override: None,
             },
         );
         self.active_window = Some(win_id);
         self.lifecycle = DaemonLifecycle::Active;
+        self.sync_active_sidebar_mirror();
         open_task.map(Message::WindowOpened)
     }
 
@@ -4364,10 +4497,12 @@ impl AppState {
                             width: self.config.window.width,
                             height: self.config.window.height,
                             maximized: false,
+                            sidebar_override: None,
                         }
                     };
                     self.window_workspaces.insert(id, win_state);
                 }
+                self.sync_active_sidebar_mirror();
                 self.sync_tray_state();
                 if Some(id) == self.quake.window_id() {
                     window::monitor_size(id).map(move |sz| Message::QuakeMonitorSize(id, sz))
@@ -4378,6 +4513,7 @@ impl AppState {
             Message::WindowFocused(id) => {
                 if self.windows.contains(&id) {
                     self.active_window = Some(id);
+                    self.sync_active_sidebar_mirror();
                     if Some(id) != self.quake.window_id() && self.tray_hidden {
                         self.tray_hidden = false;
                         self.lifecycle = DaemonLifecycle::Active;
@@ -4388,9 +4524,11 @@ impl AppState {
                 Task::none()
             }
             Message::WindowUnfocused(id) => {
+                self.selection_drag_scroll = None;
                 self.drag_drop.cancel();
                 self.drag_drop.clear_external_file_hover();
                 if self.config.quake.hide_on_blur
+                    && self.in_flight_os_dialogs == 0
                     && self.quake.window_id() == Some(id)
                     && self.quake.is_visible()
                 {
@@ -4420,6 +4558,8 @@ impl AppState {
                     win_state.width = size.width.max(100.0).round() as u32;
                     win_state.height = size.height.max(100.0).round() as u32;
                 }
+                self.sync_active_sidebar_mirror();
+                self.reconcile_sftp_geometry_for_window(id);
                 Task::none()
             }
             Message::WindowDragStart(id) => window::drag(id),
@@ -4505,6 +4645,7 @@ impl AppState {
                 if self.active_window == Some(id) {
                     self.active_window = self.windows.iter().next_back().copied();
                 }
+                self.sync_active_sidebar_mirror();
                 if matches!(self.close_guard, CloseGuardState::Confirming { window_id, .. } if window_id == id)
                 {
                     self.close_guard = CloseGuardState::Idle;
@@ -4638,7 +4779,7 @@ impl AppState {
                     && let Some(SessionEntry::Ssh(slot)) = self.sessions.get(&session_id)
                     && slot.active.is_none()
                     && slot.transport_status == TransportStatus::Disconnected
-                    && self.ssh_ui.mitm_alert(session_id).is_none()
+                    && !self.is_session_mitm_blocked(session_id)
                 {
                     return self.reconnect_ssh_session(session_id);
                 }
@@ -4787,6 +4928,9 @@ impl AppState {
                 Task::none()
             }
             Message::OpenSearch => {
+                if self.is_remote_editor_modal_open() {
+                    return self.remote_editor_open_find(false);
+                }
                 let active_buf = self
                     .active_session_id()
                     .and_then(|id| self.sessions.get(&id))
@@ -4811,11 +4955,17 @@ impl AppState {
                 Task::none()
             }
             Message::SearchNext => {
+                if self.is_remote_editor_modal_open() {
+                    return self.remote_editor_find_step(true);
+                }
                 let target = self.search.step_next();
                 self.focus_search_match(target);
                 Task::none()
             }
             Message::SearchPrev => {
+                if self.is_remote_editor_modal_open() {
+                    return self.remote_editor_find_step(false);
+                }
                 let target = self.search.step_prev();
                 self.focus_search_match(target);
                 Task::none()
@@ -4835,11 +4985,8 @@ impl AppState {
                     drawer.plus.context_menu.close();
                     return Task::none();
                 }
-                if let Some(sid) = self.sftp_session_for_modal()
-                    && let Some(drawer) = self.sftp_drawers.get_mut(&sid)
-                {
-                    drawer.plus.modal = SftpModalState::None;
-                    return Task::none();
+                if let Some(sid) = self.sftp_session_for_modal() {
+                    return self.handle_sftp_modal_escape(sid);
                 }
                 if self.settings_ui.is_open() {
                     self.close_settings_canceling_preview();
@@ -4935,10 +5082,38 @@ impl AppState {
                 side,
                 selection_type,
             } => {
+                if self
+                    .selection_drag_scroll
+                    .as_ref()
+                    .is_some_and(|drag| drag.session_id == session_id)
+                {
+                    self.selection_drag_scroll = None;
+                }
                 if let Some(entry) = self.sessions.get_mut(&session_id)
                     && let Some(buf) = entry.buffer().cloned()
                 {
                     buf.start_selection(col, row, side, selection_type);
+                    entry.refresh_snapshot();
+                }
+                Task::none()
+            }
+            Message::SelectionExtend {
+                session_id,
+                col,
+                row,
+                side,
+            } => {
+                if self
+                    .selection_drag_scroll
+                    .as_ref()
+                    .is_some_and(|drag| drag.session_id == session_id)
+                {
+                    self.selection_drag_scroll = None;
+                }
+                if let Some(entry) = self.sessions.get_mut(&session_id)
+                    && let Some(buf) = entry.buffer().cloned()
+                {
+                    buf.extend_or_start_selection(col, row, side);
                     entry.refresh_snapshot();
                 }
                 Task::none()
@@ -4957,7 +5132,51 @@ impl AppState {
                 }
                 Task::none()
             }
+            Message::SelectionDragScroll {
+                session_id,
+                col,
+                row,
+                side,
+                delta_lines,
+            } => {
+                if delta_lines == 0 {
+                    if self
+                        .selection_drag_scroll
+                        .as_ref()
+                        .is_some_and(|drag| drag.session_id == session_id)
+                    {
+                        self.selection_drag_scroll = None;
+                    }
+                } else {
+                    self.selection_drag_scroll = Some(SelectionDragScrollState {
+                        session_id,
+                        col,
+                        row,
+                        side,
+                        delta_lines,
+                    });
+                }
+                Task::none()
+            }
+            Message::SelectionAutoScrollTick => {
+                if let Some(drag) = self.selection_drag_scroll.clone()
+                    && let Some(entry) = self.sessions.get_mut(&drag.session_id)
+                    && let Some(buf) = entry.buffer().cloned()
+                {
+                    buf.scroll_display(Scroll::Delta(drag.delta_lines));
+                    buf.update_selection(drag.col, drag.row, drag.side);
+                    entry.refresh_snapshot();
+                }
+                Task::none()
+            }
             Message::SelectionFinish { session_id } => {
+                if self
+                    .selection_drag_scroll
+                    .as_ref()
+                    .is_some_and(|drag| drag.session_id == session_id)
+                {
+                    self.selection_drag_scroll = None;
+                }
                 let copied = if let Some(entry) = self.sessions.get_mut(&session_id)
                     && let Some(buf) = entry.buffer().cloned()
                 {
@@ -4973,7 +5192,7 @@ impl AppState {
                 };
 
                 if let Some(text) = copied {
-                    self.copy_text_to_clipboard(text)
+                    self.copy_session_text_to_clipboard(session_id, text)
                 } else {
                     Task::none()
                 }
@@ -4985,10 +5204,18 @@ impl AppState {
                     .and_then(SessionEntry::buffer)
                     .and_then(|buf| buf.selection_text());
                 if let Some(text) = copied {
-                    self.copy_text_to_clipboard(text)
+                    self.copy_session_text_to_clipboard(session_id, text)
                 } else {
                     Task::none()
                 }
+            }
+            Message::ClearExpiredCopyFeedback => {
+                if let Some((_, ts)) = self.copied_feedback
+                    && Instant::now().saturating_duration_since(ts) >= COPY_FEEDBACK_TTL
+                {
+                    self.copied_feedback = None;
+                }
+                Task::none()
             }
             Message::PasteFromClipboard { session_id } => clipboard::read().map(move |opt| {
                 let text = opt.or_else(read_clipboard_via_arboard).unwrap_or_default();
@@ -5255,6 +5482,7 @@ impl AppState {
                 {
                     ws.resize_split(tab_id, split_id, ratio);
                 }
+                self.reconcile_all_windows_sftp_geometry();
                 Task::none()
             }
             Message::FocusPane(pane_id) => {
@@ -5308,6 +5536,7 @@ impl AppState {
                 {
                     ws.toggle_zoom(tab_id);
                 }
+                self.reconcile_all_windows_sftp_geometry();
                 Task::none()
             }
             Message::ToggleBroadcastInput => {
@@ -5422,11 +5651,38 @@ impl AppState {
                 Task::none()
             }
             Message::ToggleSidebar => {
-                self.sidebar.toggle();
+                if let Some(wid) = self.target_window_id(window_scope) {
+                    let next = !self.effective_sidebar_open(wid);
+                    if let Some(win_state) = self.window_workspaces.get_mut(&wid) {
+                        win_state.sidebar_override = Some(next);
+                    }
+                    self.sync_active_sidebar_mirror();
+                    self.reconcile_sftp_geometry_for_window(wid);
+                } else if let Some(pending) = self.pending_windows.front_mut() {
+                    let cur = pending.sidebar_override.unwrap_or_else(|| {
+                        ViewportTier::from_width(pending.width as f32) != ViewportTier::Compact
+                            && self.config.terminal.show_profile_sidebar
+                    });
+                    pending.sidebar_override = Some(!cur);
+                    self.sidebar.set_open(!cur);
+                } else {
+                    self.sidebar.toggle();
+                }
                 Task::none()
             }
             Message::SetSidebarOpen(open) => {
-                self.sidebar.set_open(open);
+                if let Some(wid) = self.target_window_id(window_scope) {
+                    if let Some(win_state) = self.window_workspaces.get_mut(&wid) {
+                        win_state.sidebar_override = Some(open);
+                    }
+                    self.sync_active_sidebar_mirror();
+                    self.reconcile_sftp_geometry_for_window(wid);
+                } else if let Some(pending) = self.pending_windows.front_mut() {
+                    pending.sidebar_override = Some(open);
+                    self.sidebar.set_open(open);
+                } else {
+                    self.sidebar.set_open(open);
+                }
                 Task::none()
             }
             Message::ResizeSidebar(width) => {
@@ -5586,7 +5842,9 @@ impl AppState {
                 self.status_bar.set_transfers(summary);
                 Task::none()
             }
-            Message::StatusBarAction(action) => self.handle_status_bar_action(action),
+            Message::StatusBarAction(action) => {
+                self.handle_status_bar_action(window_scope, action)
+            }
             Message::OpenTabbyImportModal => {
                 self.command_palette.close();
                 self.tabby_import.open();
@@ -5682,14 +5940,38 @@ impl AppState {
             | Message::SftpOpenWithStopWatch { .. }
             | Message::SftpDismissContextMenu
             | Message::SftpContextAction(_)
-            | Message::SftpDismissModal
+            | Message::SftpDismissModal(_)
             | Message::SftpModalNameChanged(_)
             | Message::SftpModalConfirmCreateOrRename
             | Message::SftpModalOctalChanged(_)
             | Message::SftpModalPermBitToggled { .. }
             | Message::SftpModalConfirmPermissions
-            | Message::SftpModalEditorAction(_)
+            | Message::SftpModalEditorEvent(_)
+            | Message::SftpModalShortcut(_)
+            | Message::SftpModalRequestClose(_)
+            | Message::SftpModalConfirmUnsaved { .. }
+            | Message::SftpModalCancelUnsaved
             | Message::SftpModalSaveFile
+            | Message::SftpModalReloadFile
+            | Message::SftpModalSwitchToEdit
+            | Message::SftpModalToggleWordWrap
+            | Message::SftpModalToggleExpand
+            | Message::SftpModalCycleIndentMode
+            | Message::SftpModalToggleLineEnding
+            | Message::SftpModalToggleFind(_)
+            | Message::SftpModalCloseFind
+            | Message::SftpModalFindQueryChanged(_)
+            | Message::SftpModalReplaceTextChanged(_)
+            | Message::SftpModalToggleSearchCase
+            | Message::SftpModalToggleSearchWholeWord
+            | Message::SftpModalToggleSearchRegex
+            | Message::SftpModalFindNext
+            | Message::SftpModalFindPrev
+            | Message::SftpModalReplaceOne
+            | Message::SftpModalReplaceAll
+            | Message::SftpModalToggleGoToLine
+            | Message::SftpModalGoToLineInputChanged(_)
+            | Message::SftpModalGoToLineSubmit
             | Message::SftpRemoteFileReadResult { .. }
             | Message::SftpRemoteFileSaveResult { .. }) => self.handle_sftp_plus_message(msg),
             Message::SftpSessionFileDropped { session_id, path } => {
@@ -6484,8 +6766,8 @@ impl AppState {
                             self.mutate_profiles_and_save(|cfg| cfg.add_group(&clean))
                         };
                         if changed {
-                            self.sidebar.set_open(true);
                             self.sidebar.set_group_collapsed(&clean, false);
+                            let _ = self.update_in_window(window_scope, Message::SetSidebarOpen(true));
                         }
                     }
                 }
@@ -6759,8 +7041,8 @@ impl AppState {
             }
             Message::SettingsShowProfileSidebarToggled(enabled) => {
                 self.settings_ui.set_show_profile_sidebar(enabled);
-                self.sidebar.set_open(enabled);
                 self.apply_live_settings_preview();
+                self.reset_non_quake_sidebar_overrides();
                 Task::none()
             }
             Message::SettingsShowStatusBarToggled(enabled) => {
@@ -6843,6 +7125,7 @@ impl AppState {
                 Task::none()
             }
             Message::SettingsBrowseSftpDownloadDir => {
+                self.begin_os_dialog();
                 let initial = self.sftp_download_dir.clone();
                 Task::perform(
                     async move {
@@ -6857,6 +7140,7 @@ impl AppState {
                 )
             }
             Message::SettingsSftpDownloadDirPicked(opt) => {
+                self.end_os_dialog();
                 if let Some(path) = opt {
                     self.sftp_download_dir_overridden = false;
                     self.settings_ui
@@ -7642,11 +7926,13 @@ impl AppState {
                 width: geom.width.round() as u32,
                 height: geom.height.round() as u32,
                 maximized: false,
+                sidebar_override: Some(false),
             },
         );
         self.quake.set_open(win_id);
         self.active_window = Some(win_id);
         self.lifecycle = DaemonLifecycle::Active;
+        self.sync_active_sidebar_mirror();
         self.sync_tray_state();
         Task::batch([
             open_task.map(Message::WindowOpened),
@@ -8301,11 +8587,11 @@ impl AppState {
         if let Some(original) = self.settings_origin_config.take() {
             let prev_sidebar = self.config.terminal.show_profile_sidebar;
             self.config = original;
-            if self.config.terminal.show_profile_sidebar != prev_sidebar {
-                self.sidebar.set_open(self.config.terminal.show_profile_sidebar);
-            }
             self.rebuild_runtime_config_caches();
             self.sync_ui_from_terminal_config();
+            if self.config.terminal.show_profile_sidebar != prev_sidebar {
+                self.reset_non_quake_sidebar_overrides();
+            }
             self.sync_terminal_options_to_sessions();
             self.transfer_queue
                 .set_transfer_config(self.config.transfer.clone());
@@ -8336,11 +8622,23 @@ impl AppState {
             && (!next_cfg.sync.encrypt_bundle
                 || !self.settings_ui.sync_passphrase_draft().trim().is_empty());
         let prev_tray_enabled = self.config.tray.enabled;
+        let prev_sidebar = self.config.terminal.show_profile_sidebar;
+        let origin_sidebar = self
+            .settings_origin_config
+            .as_ref()
+            .map(|c| c.terminal.show_profile_sidebar);
         self.config = next_cfg;
         self.settings_origin_config = None;
         self.sftp_download_dir_overridden = false;
         self.rebuild_runtime_config_caches();
         self.sync_ui_from_terminal_config();
+        if origin_sidebar != Some(self.config.terminal.show_profile_sidebar)
+            || prev_sidebar != self.config.terminal.show_profile_sidebar
+        {
+            self.reset_non_quake_sidebar_overrides();
+        } else {
+            self.sync_active_sidebar_mirror();
+        }
         self.sync_terminal_options_to_sessions();
         self.transfer_queue
             .set_transfer_config(self.config.transfer.clone());
@@ -8603,9 +8901,10 @@ impl AppState {
                 let is_reconnected = slot.reconnected_at.is_some();
                 let profile_id = slot.target.profile_id.clone();
                 let supervisor_handle = slot.supervisor.clone();
+                let geometry_eligible = self.is_session_sftp_dock_eligible(session_id);
                 let auto_opened = if self.config.terminal.auto_open_sftp {
                     self.ensure_session_sftp_drawer(session_id)
-                        .auto_open_if_allowed()
+                        .auto_open_for_geometry(geometry_eligible)
                 } else {
                     false
                 };
@@ -8750,10 +9049,16 @@ impl AppState {
             SshUiEvent::AuthPrompt {
                 prompt, responder, ..
             } => {
+                let should_focus = self.active_session_id() == Some(session_id);
                 self.ssh_ui.push_auth_prompt(session_id, prompt, responder);
-                Task::none()
+                if should_focus {
+                    operation::focus(crate::ssh_ui::auth_prompt_input_id(session_id, 0))
+                } else {
+                    Task::none()
+                }
             }
             SshUiEvent::MitmBlocked { alert, .. } => {
+                slot.mitm_blocked = true;
                 self.sftp_manager.clear_primary_transport(&slot.sftp_key());
                 slot.active = None;
                 slot.supervisor = None;
@@ -8818,10 +9123,12 @@ impl AppState {
     fn sync_terminal_options_to_sessions(&mut self) {
         let shape = cursor_style_to_shape(self.config.terminal.cursor_style);
         let scrollback = self.config.terminal.scrollback_lines;
+        let cursor_blink = self.config.terminal.cursor_blink;
+        let word_separators = self.config.terminal.word_separators.clone();
         let app_cfg = self.config.clone();
         for entry in self.sessions.values_mut() {
             if let Some(buf) = entry.buffer() {
-                buf.apply_options(scrollback, shape);
+                buf.apply_options_full(scrollback, shape, cursor_blink, Some(&word_separators));
                 entry.refresh_snapshot();
             }
             if let SessionEntry::Ssh(slot) = entry
@@ -8854,12 +9161,31 @@ impl AppState {
         }
     }
 
+    fn copy_session_text_to_clipboard(
+        &mut self,
+        session_id: SessionId,
+        text: String,
+    ) -> Task<Message> {
+        self.copied_feedback = Some((session_id, Instant::now()));
+        self.copy_text_to_clipboard(text)
+    }
+
     fn copy_text_to_clipboard(&mut self, text: String) -> Task<Message> {
         self.last_copied = Some(text.clone());
         Task::batch([
             clipboard::write(text.clone()),
             clipboard::write_primary(text),
         ])
+    }
+
+    fn clear_selection_if_active(&mut self, session_id: SessionId) {
+        if let Some(entry) = self.sessions.get_mut(&session_id)
+            && entry.snapshot().selection.is_some()
+            && let Some(buf) = entry.buffer().cloned()
+        {
+            buf.clear_selection();
+            entry.refresh_snapshot();
+        }
     }
 
     fn dispatch_paste_to_session(&mut self, session_id: SessionId, text: &str) {
@@ -8871,6 +9197,7 @@ impl AppState {
             return;
         };
         let bytes = format_paste_bytes(text, buf.is_bracketed_paste());
+        self.clear_selection_if_active(session_id);
         self.write_bytes_to_session(session_id, &bytes);
     }
 
@@ -8908,6 +9235,7 @@ impl AppState {
                     continue;
                 }
             }
+            self.clear_selection_if_active(target_id);
             self.write_bytes_to_session(target_id, bytes);
         }
     }
@@ -9005,30 +9333,15 @@ impl AppState {
         let chrome = ChromePalette::from_palette(&palette);
         let ws = self.window_workspaces.get(&window_id).map(|w| &w.workspace);
         let is_quake = Some(window_id) == self.quake.window_id();
-        let (win_w, win_h, maximized) = self
+        let maximized = self
             .window_workspaces
             .get(&window_id)
-            .map(|w| (w.width as f32, w.height as f32, w.maximized))
-            .unwrap_or((
-                self.config.window.width as f32,
-                self.config.window.height as f32,
-                false,
-            ));
+            .is_some_and(|w| w.maximized);
 
         let mut content_col = column![].width(Length::Fill).height(Length::Fill);
 
         if let Some(banner_text) = ws.and_then(Self::broadcast_banner_for_workspace) {
             content_col = content_col.push(render_broadcast_banner(banner_text, chrome));
-        }
-
-        if let Some(mitm) = self.ssh_ui.view_mitm_alerts(&palette) {
-            content_col = content_col.push(mitm);
-        }
-        if let Some(tofu) = self.ssh_ui.view_tofu_modal(&palette) {
-            content_col = content_col.push(tofu);
-        }
-        if let Some(auth_prompt) = self.ssh_ui.view_auth_prompt(&palette) {
-            content_col = content_col.push(auth_prompt);
         }
 
         if let Some(toasts) = self.reload_ui.view_reload_toasts(&palette) {
@@ -9040,77 +9353,104 @@ impl AppState {
 
         let tab_pos = self.config.terminal.tab_bar_position;
         let vertical_tabs = matches!(tab_pos, TabBarPosition::Left | TabBarPosition::Right);
-        let sidebar_w = clamp_sidebar_width(self.sidebar_width, win_w);
-        let vertical_rail_w = if vertical_tabs {
-            if ViewportTier::from_width(win_w) == ViewportTier::Compact {
-                148.0
-            } else {
-                192.0
-            }
+        let unified_top_header = tab_pos == TabBarPosition::Top;
+        let WindowChromeMetrics {
+            win_w,
+            win_h,
+            sidebar_open,
+            sidebar_w,
+            workspace_w,
+            workspace_h,
+        } = self.window_chrome_dimensions(window_id);
+        let strip_w = if unified_top_header {
+            win_w
         } else {
-            0.0
+            (win_w - sidebar_w).max(200.0)
         };
-        let workspace_w = (win_w - sidebar_w - vertical_rail_w).max(200.0);
-        let strip_w = (win_w - sidebar_w).max(200.0);
 
+        let window_modal_open = self.has_modal_open_in_window(window_id);
         let body = match ws.and_then(|w| w.active_tab()) {
-            Some(tab) => self.render_tab_body(tab, workspace_w),
+            Some(tab) => {
+                self.render_tab_body(tab, &palette, workspace_w, workspace_h, window_modal_open)
+            }
             None => self.render_empty_workspace(&palette, workspace_w, win_h),
         };
         content_col = content_col.push(body);
 
-        let tab_strip = self.render_tab_strip(ws, &palette, vertical_tabs, win_w, strip_w, sidebar_w);
-
-        let top_system_bar = render_top_system_title_bar(
+        let tab_strip = self.render_tab_strip(
             window_id,
-            self.title(window_id),
-            self.render_system_bar_controls(window_id, is_quake, maximized, chrome),
-            TAB_BAR_HEIGHT,
-            chrome,
+            ws,
+            &palette,
+            vertical_tabs,
+            win_w,
+            win_h,
+            strip_w,
+            sidebar_w,
+            is_quake,
+            maximized,
         );
-        let docked_workspace: Element<'_, Message, Theme, iced::Renderer> = match tab_pos {
-            TabBarPosition::Top => column![tab_strip, content_col]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-            TabBarPosition::Bottom => column![content_col, tab_strip]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-            TabBarPosition::Left => row![tab_strip, content_col]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-            TabBarPosition::Right => row![content_col, tab_strip]
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
+
+        let (top_header, docked_workspace): (
+            Element<'_, Message, Theme, iced::Renderer>,
+            Element<'_, Message, Theme, iced::Renderer>,
+        ) = if unified_top_header {
+            (tab_strip, content_col.into())
+        } else {
+            let sys_bar = render_top_system_title_bar(
+                window_id,
+                self.title(window_id),
+                self.render_header_sidebar_toggle(sidebar_open, chrome),
+                self.render_system_bar_controls(window_id, is_quake, maximized, chrome),
+                TAB_BAR_HEIGHT,
+                chrome,
+                !is_quake && !maximized,
+            );
+            let docked = match tab_pos {
+                TabBarPosition::Bottom => column![content_col, tab_strip]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+                TabBarPosition::Left => row![tab_strip, content_col]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+                TabBarPosition::Right => row![content_col, tab_strip]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+                TabBarPosition::Top => unreachable!(),
+            };
+            (sys_bar, docked)
         };
 
         let gated_workspace: Element<'_, Message, Theme, iced::Renderer> =
             CapturedEventGate::new(docked_workspace);
-        let sidebar_sessions = self.sidebar_sessions(ws);
+        let workspace_row: Element<'_, Message, Theme, iced::Renderer> = if sidebar_open {
+            let sidebar_sessions = self.sidebar_sessions(ws);
+            SidebarDock::new(
+                self.sidebar_width,
+                chrome,
+                render_sidebar_full_with_width(
+                    &self.sidebar,
+                    &self.profiles.profiles,
+                    &self.profiles.groups,
+                    &sidebar_sessions,
+                    Some(&self.drag_drop),
+                    !self.has_modal_open_in_window(window_id),
+                    &palette,
+                    sidebar_w,
+                ),
+                gated_workspace,
+            )
+        } else {
+            gated_workspace
+        };
 
-        let workspace_row: Element<'_, Message, Theme, iced::Renderer> = SidebarDock::new(
-            self.sidebar_width,
-            render_sidebar_full_with_width(
-                &self.sidebar,
-                &self.profiles.profiles,
-                &self.profiles.groups,
-                &sidebar_sessions,
-                Some(&self.drag_drop),
-                !self.has_modal_open(),
-                &palette,
-                sidebar_w,
-            ),
-            gated_workspace,
-        );
-
-        let mut base_col = column![top_system_bar, hairline_h(chrome), workspace_row]
+        let mut base_col = column![top_header, hairline_h(chrome), workspace_row]
             .width(Length::Fill)
             .height(Length::Fill);
         if self.config.terminal.show_status_bar {
-            let status_snapshot = self.status_bar_snapshot_for_workspace(ws);
+            let status_snapshot = self.status_bar_snapshot_for_workspace(Some(window_id), ws);
             base_col = base_col.push(render_status_bar_responsive(&status_snapshot, &palette, win_w));
         }
 
@@ -9248,12 +9588,23 @@ impl AppState {
         let active_session = ws
             .and_then(|w| w.active_tab())
             .and_then(|t| t.focused_session_id());
-        let intercepted = ShortcutInterceptor::with_keybindings(
+        let remote_editor_topmost = self.is_remote_editor_modal_open()
+            && !self.command_palette.is_open()
+            && !self.settings_ui.is_open()
+            && !self.profile_editor.is_open()
+            && !self.tunnel_ui.create_form().open
+            && self.tunnel_ui.pending_public_bind_warning().is_none()
+            && !self.quick_commands_ui.open
+            && !self.workspaces_ui.open
+            && !self.protocol_launcher.open
+            && self.zmodem_send_ui.session_id.is_none();
+        let intercepted = ShortcutInterceptor::with_keybindings_and_modal(
             layers.into(),
             active_tab,
             active_session,
             self.command_palette.is_open(),
             self.settings_ui.capturing_action().is_some(),
+            remote_editor_topmost,
             Arc::clone(&self.keybinding_resolver),
             self.pending_key_chords.clone(),
         );
@@ -9278,14 +9629,69 @@ impl AppState {
         )
     }
 
+    /// Computes `(max_tabs_width, min_drag_spacer_width)` for the unified `40px` `Top` header.
+    pub fn top_header_tab_budget(
+        window_width: f32,
+        is_quake: bool,
+        show_zoomed: bool,
+        show_broadcast: bool,
+    ) -> (f32, f32) {
+        const SIDEBAR_TOGGLE_W: f32 = 40.0;
+        const NEW_TAB_W: f32 = 40.0;
+        const SETTINGS_W: f32 = 44.0;
+        const CAPTION_BTNS_W: f32 = 134.0;
+        const MIN_DRAG_SPACER_PX: f32 = 72.0;
+
+        let right_toolbar_w = if show_zoomed { 72.0 } else { 0.0 }
+            + if show_broadcast { 84.0 } else { 0.0 };
+        let sys_controls_w = SETTINGS_W + if is_quake { 0.0 } else { CAPTION_BTNS_W };
+        let reserved =
+            SIDEBAR_TOGGLE_W + NEW_TAB_W + right_toolbar_w + sys_controls_w + MIN_DRAG_SPACER_PX;
+        ((window_width - reserved).max(60.0), MIN_DRAG_SPACER_PX)
+    }
+
+    /// Computes vertical anchor offset for tab context menus matching active `TabBarPosition`.
+    pub fn tab_context_menu_anchor_y(tab_pos: TabBarPosition, window_height: f32) -> f32 {
+        match tab_pos {
+            TabBarPosition::Top => TAB_BAR_HEIGHT + 1.0,
+            TabBarPosition::Bottom => (window_height - TAB_BAR_HEIGHT - 180.0).max(40.0),
+            TabBarPosition::Left | TabBarPosition::Right => TAB_BAR_HEIGHT + 1.0 + 40.0,
+        }
+    }
+
+    fn render_header_sidebar_toggle(
+        &self,
+        sidebar_open: bool,
+        chrome: ChromePalette,
+    ) -> Element<'_, Message, Theme, iced::Renderer> {
+        button(
+            container(text("☰").size(15.0).font(ui_font()))
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .padding(0)
+        .width(Length::Fixed(40.0))
+        .height(Length::Fixed(TAB_BAR_HEIGHT))
+        .style(tab_bar_button_style(chrome, sidebar_open, false))
+        .on_press(Message::ToggleSidebar)
+        .into()
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn render_tab_strip(
         &self,
+        window_id: window::Id,
         ws: Option<&Workspace>,
         palette: &ThemePalette,
         vertical: bool,
         window_width: f32,
+        window_height: f32,
         strip_width: f32,
         sidebar_w: f32,
+        is_quake: bool,
+        maximized: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
         let chrome = ChromePalette::from_palette(palette);
         let tier = ViewportTier::from_width(window_width);
@@ -9293,7 +9699,7 @@ impl AppState {
         let hide_index = self.config.terminal.hide_tab_index;
         let flex_tabs = self.config.terminal.flex_tabs;
         let tab_pos = self.config.terminal.tab_bar_position;
-        let is_bottom = tab_pos == TabBarPosition::Bottom;
+        let _is_bottom = tab_pos == TabBarPosition::Bottom;
 
         let mut tab_elements: Vec<Element<'_, Message, Theme, iced::Renderer>> = Vec::new();
         if let Some(ws) = ws {
@@ -9375,16 +9781,15 @@ impl AppState {
                         (sidebar_w + 140.0).min((window_width - 120.0).max(40.0))
                     }
                 } else {
-                    (sidebar_w + idx as f32 * tab_w + (tab_w - 60.0))
+                    let tabs_origin_x = if tab_pos == TabBarPosition::Top {
+                        40.0
+                    } else {
+                        sidebar_w
+                    };
+                    (tabs_origin_x + idx as f32 * tab_w + (tab_w - 60.0))
                         .min((window_width - 120.0).max(40.0))
                 };
-                let menu_y = if is_bottom {
-                    280.0
-                } else if vertical {
-                    TAB_BAR_HEIGHT + 1.0 + 40.0
-                } else {
-                    TAB_BAR_HEIGHT * 2.0 + 1.0
-                };
+                let menu_y = Self::tab_context_menu_anchor_y(tab_pos, window_height);
                 inner_row = inner_row.push(
                     button(text("⋯").size(13.0).font(ui_font()))
                         .padding([2, 5])
@@ -9517,7 +9922,7 @@ impl AppState {
                         tab_id: tab.id,
                         label: label.clone(),
                     },
-                    !self.has_modal_open(),
+                    !self.has_modal_open_in_window(window_id),
                     is_dragging_this,
                     chip,
                 );
@@ -9632,7 +10037,12 @@ impl AppState {
 
         let right_reserve = if show_zoomed { 72.0 } else { 0.0 }
             + if show_broadcast { 84.0 } else { 0.0 };
-        let max_tabs_w = (strip_width - 38.0 - right_reserve - 4.0).max(60.0);
+        let is_top_header = tab_pos == TabBarPosition::Top;
+        let max_tabs_w = if is_top_header {
+            Self::top_header_tab_budget(window_width, is_quake, show_zoomed, show_broadcast).0
+        } else {
+            (strip_width - TAB_BAR_HEIGHT - right_reserve - 4.0).max(60.0)
+        };
 
         let tabs_scroll = container(DropTargetZone::new(
             DropZoneKind::TabStripBar {
@@ -9653,15 +10063,29 @@ impl AppState {
         let left_toolbar = row![new_tab_btn]
             .spacing(0)
             .align_y(Alignment::Center);
-        let middle_spacer: Element<'_, Message, Theme, iced::Renderer> =
-            space::horizontal().width(Length::Fill).into();
-
-        let tab_bar_row = row![
-            tabs_scroll,
-            left_toolbar,
-            middle_spacer,
-            right_toolbar,
-        ]
+        let tab_bar_row = if is_top_header {
+            let drag_spacer = TitleBarDragZone::with_resize_guard(
+                window_id,
+                true,
+                if !is_quake && !maximized { 5.0 } else { 0.0 },
+                space::horizontal()
+                    .width(Length::Fill)
+                    .height(Length::Fixed(TAB_BAR_HEIGHT))
+                    .into(),
+            );
+            row![
+                self.render_header_sidebar_toggle(sidebar_w > 0.0, chrome),
+                tabs_scroll,
+                left_toolbar,
+                drag_spacer,
+                right_toolbar,
+                self.render_system_bar_controls(window_id, is_quake, maximized, chrome),
+            ]
+        } else {
+            let middle_spacer: Element<'_, Message, Theme, iced::Renderer> =
+                space::horizontal().width(Length::Fill).into();
+            row![tabs_scroll, left_toolbar, middle_spacer, right_toolbar]
+        }
         .spacing(0)
         .height(Length::Fixed(TAB_BAR_HEIGHT))
         .align_y(Alignment::Center);
@@ -9755,8 +10179,12 @@ impl AppState {
     fn render_tab_body(
         &self,
         tab: &WorkspaceTab,
+        palette: &ThemePalette,
         avail_width: f32,
+        avail_height: f32,
+        window_modal_open: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
+        let chrome = ChromePalette::from_palette(palette);
         if let Some(zoomed_pane) = tab.zoomed_pane
             && let Some(session_id) = tab.root.session_for_pane(zoomed_pane)
         {
@@ -9767,6 +10195,8 @@ impl AppState {
                 tab.broadcast_input,
                 false,
                 avail_width,
+                avail_height,
+                window_modal_open,
             );
         }
 
@@ -9776,17 +10206,24 @@ impl AppState {
             tab.focused_pane,
             tab.broadcast_input,
             show_border,
+            chrome,
             avail_width,
+            avail_height,
+            window_modal_open,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_split_node(
         &self,
         node: &SplitNode,
         focused_pane: PaneId,
         broadcast: bool,
         show_border: bool,
+        chrome: ChromePalette,
         avail_width: f32,
+        avail_height: f32,
+        window_modal_open: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
         match node {
             SplitNode::Leaf {
@@ -9799,6 +10236,8 @@ impl AppState {
                 broadcast,
                 show_border,
                 avail_width,
+                avail_height,
+                window_modal_open,
             ),
             SplitNode::Split {
                 split_id,
@@ -9807,24 +10246,54 @@ impl AppState {
                 first,
                 second,
             } => {
-                let (w1, w2) = match axis {
+                let (w1, h1) = crate::workspace::split_first_size(
+                    avail_width,
+                    avail_height,
+                    *axis,
+                    *ratio,
+                    crate::workspace::SPLIT_DIVIDER_THICKNESS,
+                );
+                let (w2, h2) = match axis {
                     SplitAxis::Vertical => (
-                        (avail_width * *ratio).max(120.0),
-                        (avail_width * (1.0 - *ratio)).max(120.0),
+                        (avail_width - w1 - crate::workspace::SPLIT_DIVIDER_THICKNESS).max(1.0),
+                        avail_height.max(1.0),
                     ),
-                    SplitAxis::Horizontal => (avail_width, avail_width),
+                    SplitAxis::Horizontal => (
+                        avail_width.max(1.0),
+                        (avail_height - h1 - crate::workspace::SPLIT_DIVIDER_THICKNESS).max(1.0),
+                    ),
                 };
                 SplitView::new(
                     *split_id,
                     *axis,
                     *ratio,
-                    self.render_split_node(first, focused_pane, broadcast, show_border, w1),
-                    self.render_split_node(second, focused_pane, broadcast, show_border, w2),
+                    chrome,
+                    self.render_split_node(
+                        first,
+                        focused_pane,
+                        broadcast,
+                        show_border,
+                        chrome,
+                        w1,
+                        h1,
+                        window_modal_open,
+                    ),
+                    self.render_split_node(
+                        second,
+                        focused_pane,
+                        broadcast,
+                        show_border,
+                        chrome,
+                        w2,
+                        h2,
+                        window_modal_open,
+                    ),
                 )
             }
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn render_pane(
         &self,
         pane_id: PaneId,
@@ -9833,14 +10302,20 @@ impl AppState {
         broadcast: bool,
         show_border: bool,
         pane_avail_w: f32,
+        _pane_avail_h: f32,
+        window_modal_open: bool,
     ) -> Element<'_, Message, Theme, iced::Renderer> {
-        let modal_open = self.has_modal_open();
+        let session_prompt_open = self.ssh_ui.session_has_blocking_prompt(session_id);
+        let modal_open = window_modal_open;
         let sftp_panel_focused = self
             .sftp_drawers
             .get(&session_id)
             .is_some_and(|d| d.is_open() && d.is_panel_focused());
-        let terminal_focused = focused && !modal_open && !sftp_panel_focused;
-        let ime_enabled = !modal_open && !(self.search.open && self.search.input_focused);
+        let terminal_focused =
+            focused && !modal_open && !session_prompt_open && !sftp_panel_focused;
+        let ime_enabled = !modal_open
+            && !session_prompt_open
+            && !(self.search.open && self.search.input_focused);
         let options = TerminalViewOptions::from_config_with_runtime(
             &self.config.terminal,
             ime_enabled,
@@ -9859,28 +10334,36 @@ impl AppState {
             (Arc::from([]), None)
         };
 
+        let pane_palette = ThemePalette::for_name_with_overrides(
+            &self.config.terminal.theme,
+            &self.config.terminal.theme_overrides,
+        );
         let content = match self.sessions.get(&session_id) {
-            Some(SessionEntry::Local(session)) => TerminalViewport::with_focus(
-                session.id,
-                Arc::clone(&session.snapshot),
-                options,
-                matches,
-                active_match,
-                terminal_focused,
-            ),
-            Some(SessionEntry::Ssh(slot)) => {
+            Some(SessionEntry::Local(session)) => {
                 let viewport = TerminalViewport::with_focus(
-                    slot.id,
-                    Arc::clone(&slot.snapshot),
+                    session.id,
+                    Arc::clone(&session.snapshot),
                     options,
                     matches,
                     active_match,
                     terminal_focused,
                 );
-                let palette = ThemePalette::for_name_with_overrides(
-                    &self.config.terminal.theme,
-                    &self.config.terminal.theme_overrides,
+                self.wrap_viewport_copy_feedback(session.id, viewport, &pane_palette)
+            }
+            Some(SessionEntry::Ssh(slot)) => {
+                let viewport = self.wrap_viewport_copy_feedback(
+                    slot.id,
+                    TerminalViewport::with_focus(
+                        slot.id,
+                        Arc::clone(&slot.snapshot),
+                        options,
+                        matches,
+                        active_match,
+                        terminal_focused,
+                    ),
+                    &pane_palette,
                 );
+                let palette = pane_palette;
                 let (bar, term_body): (
                     Element<'_, Message, Theme, iced::Renderer>,
                     Element<'_, Message, Theme, iced::Renderer>,
@@ -9889,7 +10372,7 @@ impl AppState {
                         slot.id,
                         &slot.target.host,
                         slot.target.port,
-                        self.ssh_ui.mitm_alert(slot.id).is_some(),
+                        self.is_session_mitm_blocked(slot.id),
                         slot.last_error.as_deref(),
                         &palette,
                     );
@@ -9989,9 +10472,19 @@ impl AppState {
                                 )),
                         );
                     }
+                    let sftp_count = self
+                        .sftp_drawers
+                        .get(&slot.id)
+                        .map(|d| d.queue_snapshot().active_count + d.queue_snapshot().queued_count)
+                        .unwrap_or(0);
+                    let sftp_label = if sftp_count > 0 {
+                        format!("SFTP+ ({sftp_count})")
+                    } else {
+                        "SFTP+".to_string()
+                    };
                     right_actions = right_actions
                         .push(
-                            button(text("SFTP").size(FONT_META))
+                            button(text(sftp_label).size(FONT_META))
                                 .padding([2, 8])
                                 .style(tab_bar_button_style(
                                     chrome,
@@ -10051,47 +10544,106 @@ impl AppState {
                     if let Some(drawer) = self.sftp_drawers.get(&slot.id)
                         && drawer.is_open()
                     {
-                        let panel_w = SftpDrawerDock::clamped_panel_width(
-                            drawer.width(),
-                            pane_avail_w,
-                        );
                         let has_connected_ssh = slot.active.is_some();
                         let bookmark_key = slot
                             .target
                             .profile_id
                             .as_deref()
                             .or_else(|| drawer.session_label());
-                        let panel = render_sftp_panel(
-                            slot.id,
-                            drawer,
-                            &self.sftp_state,
-                            bookmark_key,
-                            has_connected_ssh,
-                            panel_w,
-                            &palette,
-                        );
-                        SftpDrawerDock::new(slot.id, drawer.width(), term_body, panel)
+                        let chrome_drawer = ChromePalette::from_palette(&palette);
+                        if drawer.is_docked_open() {
+                            let panel_w = SftpDrawerDock::clamped_panel_width(
+                                drawer.width(),
+                                pane_avail_w,
+                            );
+                            let panel = render_sftp_panel(
+                                slot.id,
+                                drawer,
+                                &self.sftp_state,
+                                bookmark_key,
+                                has_connected_ssh,
+                                panel_w,
+                                &palette,
+                            );
+                            SftpDrawerDock::new(
+                                slot.id,
+                                drawer.width(),
+                                chrome_drawer,
+                                term_body,
+                                panel,
+                            )
+                        } else {
+                            let overlay_w = (pane_avail_w - 16.0)
+                                .clamp(220.0, 420.0)
+                                .min(pane_avail_w.max(120.0));
+                            let overlay_panel = render_sftp_panel(
+                                slot.id,
+                                drawer,
+                                &self.sftp_state,
+                                bookmark_key,
+                                has_connected_ssh,
+                                overlay_w,
+                                &palette,
+                            );
+                            let panel_box = iced::widget::opaque(
+                                container(overlay_panel)
+                                    .width(Length::Fixed(overlay_w))
+                                    .height(Length::Fill)
+                                    .style(move |_| container::Style {
+                                        background: Some(chrome_drawer.panel_bg.into()),
+                                        border: Border {
+                                            color: chrome_drawer.hairline,
+                                            width: 1.0,
+                                            radius: 0.0.into(),
+                                        },
+                                        ..container::Style::default()
+                                    }),
+                            );
+                            let overlay_aligned = container(panel_box)
+                                .width(Length::Fill)
+                                .height(Length::Fill)
+                                .padding(6)
+                                .align_x(iced::alignment::Horizontal::Right);
+                            stack![term_body, overlay_aligned]
+                                .width(Length::Fill)
+                                .height(Length::Fill)
+                                .into()
+                        }
                     } else {
                         term_body
                     };
-                column![bar, below_bar]
-                    .width(Length::Fill)
-                    .height(Length::Fill)
-                    .into()
+                let mut pane_col = column![bar].width(Length::Fill).height(Length::Fill);
+                if let Some(mitm) = self.ssh_ui.view_mitm_alert_for_session(slot.id, &palette) {
+                    pane_col = pane_col.push(mitm);
+                }
+                if let Some(tofu) =
+                    self.ssh_ui
+                        .view_tofu_modal_for_session(slot.id, pane_avail_w, &palette)
+                {
+                    pane_col = pane_col.push(tofu);
+                }
+                if let Some(auth_prompt) =
+                    self.ssh_ui
+                        .view_auth_prompt_for_session(slot.id, pane_avail_w, &palette)
+                {
+                    pane_col = pane_col.push(auth_prompt);
+                }
+                pane_col.push(below_bar).into()
             }
             Some(SessionEntry::Serial(slot)) => {
-                let viewport = TerminalViewport::with_focus(
+                let viewport = self.wrap_viewport_copy_feedback(
                     slot.id,
-                    Arc::clone(&slot.snapshot),
-                    options,
-                    matches,
-                    active_match,
-                    terminal_focused,
+                    TerminalViewport::with_focus(
+                        slot.id,
+                        Arc::clone(&slot.snapshot),
+                        options,
+                        matches,
+                        active_match,
+                        terminal_focused,
+                    ),
+                    &pane_palette,
                 );
-                let palette = ThemePalette::for_name_with_overrides(
-                    &self.config.terminal.theme,
-                    &self.config.terminal.theme_overrides,
-                );
+                let palette = pane_palette;
                 let chrome = ChromePalette::from_palette(&palette);
                 let status = slot.status();
                 let is_auto_reconnecting = slot.is_auto_reconnecting();
@@ -10246,20 +10798,21 @@ impl AppState {
                     .into()
             }
             Some(SessionEntry::Telnet(slot)) => {
-                let viewport = TerminalViewport::with_focus(
+                let viewport = self.wrap_viewport_copy_feedback(
                     slot.id,
-                    Arc::clone(&slot.snapshot),
-                    options,
-                    matches,
-                    active_match,
-                    terminal_focused,
+                    TerminalViewport::with_focus(
+                        slot.id,
+                        Arc::clone(&slot.snapshot),
+                        options,
+                        matches,
+                        active_match,
+                        terminal_focused,
+                    ),
+                    &pane_palette,
                 );
                 let status = slot.status();
                 let is_auto_reconnecting = slot.is_auto_reconnecting();
-                let palette = ThemePalette::for_name_with_overrides(
-                    &self.config.terminal.theme,
-                    &self.config.terminal.theme_overrides,
-                );
+                let palette = pane_palette;
                 let chrome = ChromePalette::from_palette(&palette);
                 let dot_color = if is_auto_reconnecting {
                     chrome.warning
@@ -10342,12 +10895,56 @@ impl AppState {
                 .into(),
         };
 
-        let pane_palette = ThemePalette::for_name_with_overrides(
-            &self.config.terminal.theme,
-            &self.config.terminal.theme_overrides,
+        let pane_chrome = ChromePalette::from_palette(&pane_palette);
+        let frame = PaneFrame::new(
+            pane_id,
+            terminal_focused,
+            broadcast,
+            show_border,
+            pane_chrome,
+            content,
         );
-        let frame = PaneFrame::new(pane_id, terminal_focused, broadcast, show_border, content);
         self.wrap_workspace_pane_drop_zone(Some(pane_id), &pane_palette, frame)
+    }
+
+    /// Returns `true` while the transient `"Copied"` badge should be shown for `session_id`.
+    pub fn is_copy_feedback_visible(&self, session_id: SessionId) -> bool {
+        self.copied_feedback.is_some_and(|(sid, ts)| {
+            sid == session_id && Instant::now().saturating_duration_since(ts) < COPY_FEEDBACK_TTL
+        })
+    }
+
+    fn wrap_viewport_copy_feedback<'a>(
+        &self,
+        session_id: SessionId,
+        viewport: Element<'a, Message, Theme, iced::Renderer>,
+        palette: &ThemePalette,
+    ) -> Element<'a, Message, Theme, iced::Renderer> {
+        if !self.is_copy_feedback_visible(session_id) {
+            return viewport;
+        }
+        let chrome = ChromePalette::from_palette(palette);
+        let pill = badge_pill(
+            "Copied",
+            chrome.success,
+            chrome.bg_more,
+            chrome.border_subtle,
+        );
+        let overlay = container(pill)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(Padding {
+                top: 0.0,
+                right: 16.0,
+                bottom: 14.0,
+                left: 0.0,
+            })
+            .align_x(iced::alignment::Horizontal::Right)
+            .align_y(iced::alignment::Vertical::Bottom);
+        stack![viewport, overlay]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
     }
 
     fn wrap_workspace_pane_drop_zone<'a>(
@@ -10427,15 +11024,72 @@ impl AppState {
         let mut list_group = column![
             action_row("Open a new terminal", Some("Ctrl+Shift+T"), Message::NewTab),
             hairline_h(chrome),
-            action_row("Quick SSH connect", None, Message::OpenQuickConnectPalette),
+            action_row("New SSH connection", None, Message::OpenQuickConnectPalette),
+            hairline_h(chrome),
+            action_row("Import ~/.ssh/config", None, Message::ReloadSystemSshConfig),
+            hairline_h(chrome),
+            action_row("Import Tabby config", None, Message::OpenTabbyImportModal),
             hairline_h(chrome),
             action_row("New profile", None, Message::OpenNewProfileModal),
             hairline_h(chrome),
             action_row("Settings", Some("Ctrl+,"), Message::OpenSettingsModal),
-            hairline_h(chrome),
-            action_row("Import Tabby config", None, Message::OpenTabbyImportModal),
         ]
         .width(Length::Fill);
+
+        let protocol_chip = |label: &'static str, dot_color: Color, msg: Message| {
+            button(
+                row![
+                    status_dot(dot_color),
+                    text(label).size(FONT_META).color(chrome.text_primary),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([5, 10])
+            .style(tab_bar_button_style(chrome, false, false))
+            .on_press(msg)
+        };
+
+        list_group = list_group.push(
+            container(
+                column![
+                    text("Protocols")
+                        .size(FONT_META)
+                        .font(ui_font_medium())
+                        .color(chrome.text_muted),
+                    row![
+                        protocol_chip("Local Shell", chrome.success, Message::NewTab),
+                        protocol_chip("SSH", chrome.accent, Message::OpenQuickConnectPalette),
+                        protocol_chip(
+                            "Serial",
+                            chrome.warning,
+                            Message::OpenProtocolLauncherModal(ProtocolLauncherTab::Serial),
+                        ),
+                        protocol_chip(
+                            "Telnet",
+                            chrome.warning,
+                            Message::OpenProtocolLauncherModal(ProtocolLauncherTab::Telnet),
+                        ),
+                        protocol_chip(
+                            "Docker",
+                            chrome.accent,
+                            Message::OpenProtocolLauncherModal(ProtocolLauncherTab::Containers),
+                        ),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center)
+                    .wrap()
+                    .vertical_spacing(4),
+                ]
+                .spacing(6),
+            )
+            .padding(Padding {
+                top: 12.0,
+                right: 14.0,
+                bottom: 4.0,
+                left: 14.0,
+            }),
+        );
 
         if !self.profiles.profiles.is_empty() {
             list_group = list_group.push(
@@ -10521,27 +11175,19 @@ impl AppState {
                 left: 16.0,
             });
 
-        let footer_bg = if chrome.is_light {
-            Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.05,
-            }
-        } else {
-            Color {
-                r: 0.0,
-                g: 0.0,
-                b: 0.0,
-                a: 0.45,
-            }
-        };
+        let footer_bg = chrome.bg_more;
 
         let footer = container(
             row![
                 row![
+                    keycap_pill("Ctrl+Shift+S", chrome),
+                    text("Sidebar").size(FONT_META).color(chrome.text_muted),
                     keycap_pill("Ctrl+K", chrome),
                     text("Commands").size(FONT_META).color(chrome.text_muted),
+                    keycap_pill("Ctrl+Shift+D", chrome),
+                    text("Split").size(FONT_META).color(chrome.text_muted),
+                    keycap_pill("Ctrl+Shift+E", chrome),
+                    text("SFTP+").size(FONT_META).color(chrome.text_muted),
                     keycap_pill("Ctrl+,", chrome),
                     text("Settings").size(FONT_META).color(chrome.text_muted),
                 ]
@@ -10803,6 +11449,13 @@ impl AppState {
         let reconnect_notice_tick = self.has_active_reconnect_notices().then(|| {
             iced::time::every(Duration::from_secs(1)).map(|_| Message::ClearExpiredReconnectNotices)
         });
+        let drag_scroll_tick = self.selection_drag_scroll.as_ref().map(|_| {
+            iced::time::every(Duration::from_millis(50)).map(|_| Message::SelectionAutoScrollTick)
+        });
+        let copy_feedback_tick = self.copied_feedback.as_ref().map(|_| {
+            iced::time::every(Duration::from_millis(150))
+                .map(|_| Message::ClearExpiredCopyFeedback)
+        });
         let transfer_recovery_tick = (self.transfer_queue.has_reconnectable_failures()
             && self.transfer_recovery_probes < 3)
             .then(|| {
@@ -10842,6 +11495,8 @@ impl AppState {
             .chain(vault_tick)
             .chain(blink_tick)
             .chain(reconnect_notice_tick)
+            .chain(drag_scroll_tick)
+            .chain(copy_feedback_tick)
             .chain(transfer_recovery_tick)
             .chain(watched_sftp_sub)
             .chain(ipc_sub)
@@ -10920,6 +11575,214 @@ impl AppState {
         &self.sidebar
     }
 
+    /// Returns whether the Left Sidebar should currently render open for `window_id`.
+    pub fn effective_sidebar_open(&self, window_id: window::Id) -> bool {
+        let Some(win_state) = self.window_workspaces.get(&window_id) else {
+            if Some(window_id) == self.quake.window_id() {
+                return false;
+            }
+            return self.config.terminal.show_profile_sidebar;
+        };
+        if let Some(pin) = win_state.sidebar_override {
+            return pin;
+        }
+        if Some(window_id) == self.quake.window_id()
+            || ViewportTier::from_width(win_state.width as f32) == ViewportTier::Compact
+        {
+            return false;
+        }
+        self.config.terminal.show_profile_sidebar
+    }
+
+    fn sync_active_sidebar_mirror(&mut self) {
+        if let Some(wid) = self.target_window_id(None) {
+            let open = self.effective_sidebar_open(wid);
+            self.sidebar.set_open(open);
+        } else if let Some(pending) = self.pending_windows.front() {
+            let open = pending.sidebar_override.unwrap_or_else(|| {
+                ViewportTier::from_width(pending.width as f32) != ViewportTier::Compact
+                    && self.config.terminal.show_profile_sidebar
+            });
+            self.sidebar.set_open(open);
+        } else {
+            self.sidebar.set_open(self.config.terminal.show_profile_sidebar);
+        }
+    }
+
+    fn reset_non_quake_sidebar_overrides(&mut self) {
+        let quake_id = self.quake.window_id();
+        for (&wid, win_state) in &mut self.window_workspaces {
+            if Some(wid) != quake_id {
+                win_state.sidebar_override = None;
+            }
+        }
+        self.sync_active_sidebar_mirror();
+        self.reconcile_all_windows_sftp_geometry();
+    }
+
+    fn window_chrome_dimensions(&self, window_id: window::Id) -> WindowChromeMetrics {
+        let (win_w, win_h, _maximized) = self
+            .window_workspaces
+            .get(&window_id)
+            .map(|w| (w.width as f32, w.height as f32, w.maximized))
+            .unwrap_or((
+                self.config.window.width as f32,
+                self.config.window.height as f32,
+                false,
+            ));
+        let tab_pos = self.config.terminal.tab_bar_position;
+        let vertical_tabs = matches!(tab_pos, TabBarPosition::Left | TabBarPosition::Right);
+        let sidebar_open = self.effective_sidebar_open(window_id);
+        let sidebar_w = if sidebar_open {
+            clamp_sidebar_width(self.sidebar_width, win_w)
+        } else {
+            0.0
+        };
+        let vertical_rail_w = if vertical_tabs {
+            if ViewportTier::from_width(win_w) == ViewportTier::Compact {
+                148.0
+            } else {
+                192.0
+            }
+        } else {
+            0.0
+        };
+        let divider_w = if sidebar_open { 1.0 } else { 0.0 } + if vertical_tabs { 1.0 } else { 0.0 };
+        let workspace_w = (win_w - sidebar_w - vertical_rail_w - divider_w).max(200.0);
+        let top_header_h = TAB_BAR_HEIGHT + 1.0;
+        let bottom_tab_bar_h = if tab_pos == TabBarPosition::Bottom {
+            TAB_BAR_HEIGHT + 1.0
+        } else {
+            0.0
+        };
+        let status_bar_h = if self.config.terminal.show_status_bar {
+            28.0
+        } else {
+            0.0
+        };
+        let ws = self.window_workspaces.get(&window_id).map(|w| &w.workspace);
+        let broadcast_h = if ws.and_then(|w| w.active_tab()).is_some_and(|t| t.broadcast_input) {
+            30.0
+        } else {
+            0.0
+        };
+        let workspace_h =
+            (win_h - top_header_h - bottom_tab_bar_h - status_bar_h - broadcast_h).max(160.0);
+        WindowChromeMetrics {
+            win_w,
+            win_h,
+            sidebar_open,
+            sidebar_w,
+            workspace_w,
+            workspace_h,
+        }
+    }
+
+    fn pane_chrome_bar_height(&self, session_id: SessionId) -> f32 {
+        match self.sessions.get(&session_id) {
+            Some(SessionEntry::Ssh(slot)) => {
+                let stats_h = if self.config.terminal.show_server_stats
+                    && !slot.server_stats_unsupported
+                    && slot.transport_status != TransportStatus::Disconnected
+                {
+                    26.0
+                } else {
+                    0.0
+                };
+                30.0 + stats_h
+            }
+            Some(SessionEntry::Serial(_) | SessionEntry::Telnet(_)) => 30.0,
+            _ => 0.0,
+        }
+    }
+
+    fn session_pane_available_size(&self, session_id: SessionId) -> Option<(window::Id, f32, f32)> {
+        for (&wid, win_state) in &self.window_workspaces {
+            let WindowChromeMetrics {
+                workspace_w,
+                workspace_h,
+                ..
+            } = self.window_chrome_dimensions(wid);
+            for tab in win_state.workspace.tabs() {
+                if let Some((pane_id, _)) = tab
+                    .root
+                    .pane_ids()
+                    .into_iter()
+                    .find_map(|pid| {
+                        tab.root
+                            .session_for_pane(pid)
+                            .filter(|&sid| sid == session_id)
+                            .map(|sid| (pid, sid))
+                    })
+                {
+                    let (raw_w, raw_h) = if tab.zoomed_pane == Some(pane_id) {
+                        (workspace_w, workspace_h)
+                    } else {
+                        let bounds = tab.root.collect_pane_bounds(workspace_w, workspace_h);
+                        bounds.get(&pane_id).copied().unwrap_or((workspace_w, workspace_h))
+                    };
+                    let bars_h = self.pane_chrome_bar_height(session_id);
+                    return Some((wid, raw_w, (raw_h - bars_h).max(120.0)));
+                }
+            }
+        }
+        None
+    }
+
+    fn is_session_sftp_dock_eligible(&self, session_id: SessionId) -> bool {
+        if let Some((wid, w, h)) = self.session_pane_available_size(session_id) {
+            return Some(wid) != self.quake.window_id() && w >= 680.0 && h >= 360.0;
+        }
+        false
+    }
+
+    fn reconcile_sftp_geometry_for_window(&mut self, window_id: window::Id) {
+        let Some(win_state) = self.window_workspaces.get(&window_id) else {
+            return;
+        };
+        let is_quake = Some(window_id) == self.quake.window_id();
+        let WindowChromeMetrics {
+            workspace_w,
+            workspace_h,
+            ..
+        } = self.window_chrome_dimensions(window_id);
+        let mut updates: Vec<(SessionId, bool)> = Vec::new();
+        for tab in win_state.workspace.tabs() {
+            let bounds = tab.root.collect_pane_bounds(workspace_w, workspace_h);
+            for (pane_id, (pw, ph)) in bounds {
+                if let Some(sid) = tab.root.session_for_pane(pane_id)
+                    && self
+                        .sessions
+                        .get(&sid)
+                        .and_then(SessionEntry::as_ssh)
+                        .is_some()
+                {
+                    let (raw_w, raw_h) = if tab.zoomed_pane == Some(pane_id) {
+                        (workspace_w, workspace_h)
+                    } else {
+                        (pw, ph)
+                    };
+                    let avail_h = (raw_h - self.pane_chrome_bar_height(sid)).max(120.0);
+                    let eligible = !is_quake && raw_w >= 680.0 && avail_h >= 360.0;
+                    updates.push((sid, eligible));
+                }
+            }
+        }
+        for (sid, eligible) in updates {
+            if let Some(drawer) = self.sftp_drawers.get_mut(&sid) {
+                drawer.reconcile_geometry(eligible);
+            }
+        }
+        self.sync_status_bar_drawer_open();
+    }
+
+    fn reconcile_all_windows_sftp_geometry(&mut self) {
+        let ids: Vec<window::Id> = self.window_workspaces.keys().copied().collect();
+        for wid in ids {
+            self.reconcile_sftp_geometry_for_window(wid);
+        }
+    }
+
     /// Returns the Command Palette modal state.
     pub fn command_palette(&self) -> &CommandPaletteState {
         &self.command_palette
@@ -10940,8 +11803,7 @@ impl AppState {
         &self.profile_editor
     }
 
-    /// Returns `true` when any overlay modal blocks background terminal focus or IME.
-    pub fn has_modal_open(&self) -> bool {
+    fn has_app_level_modal_open(&self) -> bool {
         self.command_palette.is_open()
             || self.tabby_import.is_open()
             || self.settings_ui.is_open()
@@ -10950,13 +11812,7 @@ impl AppState {
             || self.tunnel_ui.pending_public_bind_warning().is_some()
             || self.active_conflict_drawer().is_some()
             || self.pending_paste.is_some()
-            || self.ssh_ui.active_host_key_prompt().is_some()
-            || self.ssh_ui.active_auth_prompt().is_some()
             || self.context_menu.is_open()
-            || self
-                .sftp_drawers
-                .values()
-                .any(|d| d.plus.modal.is_open() || d.plus.context_menu.open)
             || self.quick_commands_ui.open
             || self.workspaces_ui.open
             || self.protocol_launcher.open
@@ -10964,9 +11820,48 @@ impl AppState {
             || !matches!(self.close_guard, CloseGuardState::Idle)
     }
 
+    /// Returns `true` when an overlay modal blocks terminal focus/IME in `window_id`.
+    /// Per-pane SSH TOFU/auth prompts block only their own pane and do not lock sibling windows.
+    pub fn has_modal_open_in_window(&self, window_id: window::Id) -> bool {
+        if self.has_app_level_modal_open() {
+            return true;
+        }
+        let Some(win_state) = self.window_workspaces.get(&window_id) else {
+            return false;
+        };
+        self.tab_sftp_session_matching(&win_state.workspace, |d| {
+            d.plus.modal.is_open() || d.plus.context_menu.open
+        })
+        .is_some()
+    }
+
+    /// Returns the number of currently active native OS file/folder picker dialogs.
+    pub fn in_flight_os_dialogs(&self) -> usize {
+        self.in_flight_os_dialogs
+    }
+
+    fn begin_os_dialog(&mut self) {
+        self.in_flight_os_dialogs = self.in_flight_os_dialogs.saturating_add(1);
+    }
+
+    fn end_os_dialog(&mut self) {
+        self.in_flight_os_dialogs = self.in_flight_os_dialogs.saturating_sub(1);
+    }
+
+    /// Returns `true` when any overlay modal blocks background terminal focus or IME.
+    pub fn has_modal_open(&self) -> bool {
+        self.has_app_level_modal_open()
+            || self.ssh_ui.active_host_key_prompt().is_some()
+            || self.ssh_ui.active_auth_prompt().is_some()
+            || self
+                .sftp_drawers
+                .values()
+                .any(|d| d.plus.modal.is_open() || d.plus.context_menu.open)
+    }
+
     /// Computes an inspectable [`StatusBarSnapshot`] from the active `Session`, `Tunnel`, and `Transfer` state.
     pub fn status_bar_snapshot(&self) -> StatusBarSnapshot {
-        self.status_bar_snapshot_for_workspace(self.primary_workspace())
+        self.status_bar_snapshot_for_workspace(self.target_window_id(None), self.primary_workspace())
     }
 
     fn protocol_status_to_transport(status: ProtocolStatus) -> TransportStatus {
@@ -10981,7 +11876,11 @@ impl AppState {
         }
     }
 
-    fn status_bar_snapshot_for_workspace(&self, ws: Option<&Workspace>) -> StatusBarSnapshot {
+    fn status_bar_snapshot_for_workspace(
+        &self,
+        window_scope: Option<window::Id>,
+        ws: Option<&Workspace>,
+    ) -> StatusBarSnapshot {
         let active_tab = ws.and_then(|w| w.active_tab());
         let zoomed = active_tab.is_some_and(|tab| tab.zoomed_pane.is_some());
         let broadcast = active_tab.is_some_and(|tab| tab.broadcast_input);
@@ -11094,7 +11993,10 @@ impl AppState {
             active_session,
             tunnels: self.status_bar.tunnels().clone(),
             transfers: self.status_bar.transfers().clone(),
-            sidebar_open: self.sidebar.is_open(),
+            sidebar_open: window_scope.map_or_else(
+                || self.sidebar.is_open(),
+                |wid| self.effective_sidebar_open(wid),
+            ),
             transfer_drawer_open: self.status_bar.transfers().drawer_open,
             vault_unlocked: self.can_lock_vault(),
             connection_notice,
@@ -11126,21 +12028,21 @@ impl AppState {
                         let target_label = match entry {
                             SessionEntry::Local(s) => {
                                 if let Some(exec) = &s.docker_exec {
-                                    format!("Docker · {}", exec.container)
+                                    format!("Docker: {}", exec.container)
                                 } else {
-                                    format!("Local · {}", s.pty.shell().display_name)
+                                    format!("Local: {}", s.pty.shell().display_name)
                                 }
                             }
                             SessionEntry::Ssh(slot) => {
                                 format!(
-                                    "SSH · {} ({})",
+                                    "SSH: {} ({})",
                                     slot.target.display_addr(),
                                     slot.transport_status.label()
                                 )
                             }
                             SessionEntry::Serial(slot) => {
                                 format!(
-                                    "Serial · {} @ {} ({})",
+                                    "Serial: {} @ {} ({})",
                                     slot.config.port,
                                     slot.config.baud_rate,
                                     slot.status().label()
@@ -11148,7 +12050,7 @@ impl AppState {
                             }
                             SessionEntry::Telnet(slot) => {
                                 format!(
-                                    "Telnet · {}:{} ({})",
+                                    "Telnet: {}:{} ({})",
                                     slot.config.host,
                                     slot.config.port,
                                     slot.status().label()
@@ -11885,7 +12787,9 @@ impl AppState {
         let clamped = width.clamp(MIN_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH);
         self.sftp_drawer_width = clamped;
         self.sftp_fallback_drawer.set_width(clamped);
-        for drawer in self.sftp_drawers.values_mut() {
+        if let Some(active_sid) = self.active_ssh_session_id()
+            && let Some(drawer) = self.sftp_drawers.get_mut(&active_sid)
+        {
             drawer.set_width(clamped);
         }
     }
@@ -11920,13 +12824,50 @@ impl AppState {
         }
     }
 
+    fn persist_sftp_editor_prefs(
+        &mut self,
+        word_wrap: bool,
+        expanded: bool,
+        indent_mode: EditorIndentMode,
+    ) {
+        self.config.terminal.sftp_editor_word_wrap = word_wrap;
+        self.config.terminal.sftp_editor_expanded = expanded;
+        self.config.terminal.sftp_editor_indent_mode = indent_mode;
+        if self.settings_ui.is_open() {
+            if let Some(orig) = &mut self.settings_origin_config {
+                orig.terminal.sftp_editor_word_wrap = word_wrap;
+                orig.terminal.sftp_editor_expanded = expanded;
+                orig.terminal.sftp_editor_indent_mode = indent_mode;
+            }
+            self.settings_ui.sync_from_config(&self.config);
+        }
+        if let Err(err) = save_config(&self.paths, &self.config) {
+            warn!(error = %err, "failed to save SFTP editor preferences to config.toml");
+        }
+    }
+
+    fn is_remote_editor_modal_open(&self) -> bool {
+        self.sftp_session_for_modal().is_some_and(|sid| {
+            self.sftp_drawers
+                .get(&sid)
+                .is_some_and(|d| matches!(d.plus.modal, SftpModalState::FileViewer { .. }))
+        })
+    }
+
     fn sync_ui_from_terminal_config(&mut self) {
         self.sidebar_width = self
             .config
             .terminal
             .sidebar_width
             .clamp(MIN_SIDEBAR_WIDTH, MAX_SIDEBAR_WIDTH);
-        self.set_sftp_drawer_width(self.config.terminal.sftp_panel_width);
+        let default_sftp_w = self
+            .config
+            .terminal
+            .sftp_panel_width
+            .clamp(MIN_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH);
+        self.sftp_drawer_width = default_sftp_w;
+        self.sftp_fallback_drawer.set_width(default_sftp_w);
+        self.reconcile_all_windows_sftp_geometry();
         if !self.sftp_download_dir_overridden {
             let dir = self
                 .config
@@ -11986,58 +12927,42 @@ impl AppState {
         })
     }
 
-    fn sftp_session_for_context_menu(&self) -> Option<SessionId> {
-        if let Some(sid) = self.active_ssh_session_id()
-            && self
-                .sftp_drawers
-                .get(&sid)
-                .is_some_and(|d| d.plus.context_menu.open)
+    fn tab_sftp_session_matching(
+        &self,
+        ws: &Workspace,
+        pred: impl Fn(&SftpDrawerState) -> bool,
+    ) -> Option<SessionId> {
+        if let Some(sid) = Self::active_ssh_session_in(&self.sessions, Some(ws))
+            && self.sftp_drawers.get(&sid).is_some_and(&pred)
         {
             return Some(sid);
         }
-        self.sftp_drawers
-            .iter()
-            .find_map(|(&sid, d)| d.plus.context_menu.open.then_some(sid))
+        ws.active_tab()?
+            .root
+            .session_ids()
+            .into_iter()
+            .find(|sid| self.sftp_drawers.get(sid).is_some_and(&pred))
+    }
+
+    fn sftp_session_matching(&self, pred: impl Fn(&SftpDrawerState) -> bool) -> Option<SessionId> {
+        self.tab_sftp_session_matching(self.workspace(), pred)
+    }
+
+    fn sftp_session_for_context_menu(&self) -> Option<SessionId> {
+        self.sftp_session_matching(|d| d.plus.context_menu.open)
     }
 
     fn sftp_session_for_modal(&self) -> Option<SessionId> {
-        if let Some(sid) = self.active_ssh_session_id()
-            && self
-                .sftp_drawers
-                .get(&sid)
-                .is_some_and(|d| d.plus.modal.is_open())
-        {
-            return Some(sid);
-        }
-        self.sftp_drawers
-            .iter()
-            .find_map(|(&sid, d)| d.plus.modal.is_open().then_some(sid))
+        self.sftp_session_matching(|d| d.plus.modal.is_open())
     }
 
     fn sftp_modal_drawer(&self, ws: Option<&Workspace>) -> Option<&SftpDrawerState> {
-        if let Some(sid) = Self::active_ssh_session_in(&self.sessions, ws)
-            && let Some(drawer) = self.sftp_drawers.get(&sid)
-            && drawer.plus.modal.is_open()
-        {
-            return Some(drawer);
-        }
-        self.sftp_drawers
-            .values()
-            .find(|d| d.plus.modal.is_open())
+        let sid = self.tab_sftp_session_matching(ws?, |d| d.plus.modal.is_open())?;
+        self.sftp_drawers.get(&sid)
     }
 
     fn sftp_context_menu_drawer(&self, ws: Option<&Workspace>) -> Option<(&SftpDrawerState, bool)> {
-        let sid = Self::active_ssh_session_in(&self.sessions, ws)
-            .filter(|sid| {
-                self.sftp_drawers
-                    .get(sid)
-                    .is_some_and(|d| d.plus.context_menu.open)
-            })
-            .or_else(|| {
-                self.sftp_drawers
-                    .iter()
-                    .find_map(|(&sid, d)| d.plus.context_menu.open.then_some(sid))
-            })?;
+        let sid = self.tab_sftp_session_matching(ws?, |d| d.plus.context_menu.open)?;
         let drawer = self.sftp_drawers.get(&sid)?;
         let connected = self
             .sessions
@@ -12105,8 +13030,9 @@ impl AppState {
         {
             return Task::none();
         }
+        let geometry_eligible = self.is_session_sftp_dock_eligible(sid);
         let drawer = self.ensure_session_sftp_drawer(sid);
-        drawer.set_open(open);
+        drawer.set_open_with_eligibility(open, geometry_eligible);
         self.sync_status_bar_drawer_open();
         if open {
             let path = self
@@ -12208,7 +13134,8 @@ impl AppState {
         task
     }
 
-    fn upload_files_dialog_task(&self, session_id: SessionId) -> Task<Message> {
+    fn upload_files_dialog_task(&mut self, session_id: SessionId) -> Task<Message> {
+        self.begin_os_dialog();
         Task::perform(
             async move {
                 rfd::AsyncFileDialog::new()
@@ -12224,7 +13151,8 @@ impl AppState {
         )
     }
 
-    fn upload_folder_dialog_task(&self, session_id: SessionId) -> Task<Message> {
+    fn upload_folder_dialog_task(&mut self, session_id: SessionId) -> Task<Message> {
+        self.begin_os_dialog();
         Task::perform(
             async move {
                 rfd::AsyncFileDialog::new()
@@ -12257,7 +13185,16 @@ impl AppState {
                 let Some(drawer) = self.sftp_drawers.get(&session_id) else {
                     return Task::none();
                 };
-                if !drawer.is_open() || !drawer.is_panel_focused() || self.has_modal_open() {
+                let session_modal_blocked = self
+                    .window_workspaces
+                    .iter()
+                    .find_map(|(&wid, w)| w.workspace.contains_session(session_id).then_some(wid))
+                    .map_or_else(
+                        || self.has_modal_open(),
+                        |wid| self.has_modal_open_in_window(wid),
+                    )
+                    || self.ssh_ui.session_has_blocking_prompt(session_id);
+                if !drawer.is_open() || !drawer.is_panel_focused() || session_modal_blocked {
                     return Task::none();
                 }
                 self.execute_sftp_action(session_id, action)
@@ -12475,6 +13412,7 @@ impl AppState {
                 self.upload_folder_dialog_task(session_id)
             }
             Message::SftpSessionUploadPicked { session_id, paths } => {
+                self.end_os_dialog();
                 if paths.is_empty()
                     || self
                         .sessions
@@ -12498,6 +13436,7 @@ impl AppState {
                 entries,
                 dest_dir,
             } => {
+                self.end_os_dialog();
                 let Some(dest_dir) = dest_dir else {
                     return Task::none();
                 };
@@ -12522,6 +13461,7 @@ impl AppState {
                 entry,
                 app_path,
             } => {
+                self.end_os_dialog();
                 let Some(app_path) = app_path else {
                     return Task::none();
                 };
@@ -12672,6 +13612,7 @@ impl AppState {
                     return Task::none();
                 };
                 let title = format!("Select Application for \"{}\"", entry.name);
+                self.begin_os_dialog();
                 Task::perform(
                     async move {
                         let mut dialog = rfd::AsyncFileDialog::new().set_title(&title);
@@ -12793,8 +13734,10 @@ impl AppState {
                 };
                 self.execute_sftp_action(session_id, action)
             }
-            Message::SftpDismissModal => {
-                for drawer in self.sftp_drawers.values_mut() {
+            Message::SftpDismissModal(target) => {
+                if let Some(sid) = target.or_else(|| self.sftp_session_for_modal())
+                    && let Some(drawer) = self.sftp_drawers.get_mut(&sid)
+                {
                     drawer.plus.modal = SftpModalState::None;
                 }
                 Task::none()
@@ -12995,7 +13938,345 @@ impl AppState {
                     move |result| Message::SftpMutationResult { session_id, result },
                 )
             }
-            Message::SftpModalEditorAction(action) => {
+            Message::SftpModalEditorEvent(event) => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                match event {
+                    RemoteEditorEvent::Action(action) => {
+                        if let SftpModalState::FileViewer {
+                            editable,
+                            dirty,
+                            content,
+                            ..
+                        } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                        {
+                            content.perform(action, *editable);
+                            *dirty = content.is_dirty();
+                        }
+                        Task::none()
+                    }
+                    RemoteEditorEvent::OpenFind => self.remote_editor_open_find(false),
+                    RemoteEditorEvent::OpenReplace => self.remote_editor_open_find(true),
+                    RemoteEditorEvent::OpenGoToLine => self.remote_editor_open_goto_line(),
+                    RemoteEditorEvent::Save => self.save_sftp_modal_file(session_id, false),
+                    RemoteEditorEvent::Undo => self.remote_editor_undo(session_id),
+                    RemoteEditorEvent::Redo => self.remote_editor_redo(session_id),
+                    RemoteEditorEvent::FindNext => self.remote_editor_find_step(true),
+                    RemoteEditorEvent::FindPrev => self.remote_editor_find_step(false),
+                    RemoteEditorEvent::Indent => {
+                        if let SftpModalState::FileViewer {
+                            editable,
+                            dirty,
+                            content,
+                            ..
+                        } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                        {
+                            content.indent(*editable);
+                            *dirty = content.is_dirty();
+                        }
+                        Task::none()
+                    }
+                    RemoteEditorEvent::Unindent => {
+                        if let SftpModalState::FileViewer {
+                            editable,
+                            dirty,
+                            content,
+                            ..
+                        } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                        {
+                            content.unindent(*editable);
+                            *dirty = content.is_dirty();
+                        }
+                        Task::none()
+                    }
+                    RemoteEditorEvent::Escape => self.handle_sftp_modal_escape(session_id),
+                    RemoteEditorEvent::ScrollHorizontal(x) => {
+                        if let SftpModalState::FileViewer { content, .. } =
+                            &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                        {
+                            content.set_scroll_x(x);
+                        }
+                        Task::none()
+                    }
+                    RemoteEditorEvent::JumpToLine(line_idx) => {
+                        if let SftpModalState::FileViewer { content, .. } =
+                            &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                        {
+                            content.jump_to_line_start(line_idx);
+                        }
+                        Task::none()
+                    }
+                }
+            }
+            Message::SftpModalShortcut(shortcut) => match shortcut {
+                RemoteEditorShortcut::Find => self.remote_editor_open_find(false),
+                RemoteEditorShortcut::Replace => self.remote_editor_open_find(true),
+                RemoteEditorShortcut::GoToLine => self.remote_editor_open_goto_line(),
+                RemoteEditorShortcut::Save => {
+                    let Some(session_id) = self.sftp_session_for_modal() else {
+                        return Task::none();
+                    };
+                    self.save_sftp_modal_file(session_id, false)
+                }
+                RemoteEditorShortcut::FindNext => self.remote_editor_find_step(true),
+                RemoteEditorShortcut::FindPrev => self.remote_editor_find_step(false),
+            },
+            Message::SftpModalRequestClose(target) => {
+                let Some(session_id) = target.or_else(|| self.sftp_session_for_modal()) else {
+                    return Task::none();
+                };
+                self.request_close_sftp_modal(session_id)
+            }
+            Message::SftpModalConfirmUnsaved { save_first } => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let pending = match &mut self.ensure_session_sftp_drawer(session_id).plus.modal {
+                    SftpModalState::FileViewer { content, .. } => content.pending_confirm.take(),
+                    _ => return Task::none(),
+                };
+                match pending {
+                    Some(UnsavedConfirmAction::CloseModal) | None => {
+                        if save_first {
+                            self.save_sftp_modal_file(session_id, true)
+                        } else {
+                            self.ensure_session_sftp_drawer(session_id).plus.modal =
+                                SftpModalState::None;
+                            Task::none()
+                        }
+                    }
+                    Some(UnsavedConfirmAction::ReloadFromRemote) => {
+                        self.reload_sftp_modal_file(session_id)
+                    }
+                }
+            }
+            Message::SftpModalCancelUnsaved => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    content.pending_confirm = None;
+                }
+                operation::focus(remote_editor_id())
+            }
+            Message::SftpModalSaveFile => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                self.save_sftp_modal_file(session_id, false)
+            }
+            Message::SftpModalReloadFile => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let ask_confirm = matches!(
+                    &self.ensure_session_sftp_drawer(session_id).plus.modal,
+                    SftpModalState::FileViewer {
+                        editable: true,
+                        dirty: true,
+                        ..
+                    }
+                );
+                if ask_confirm {
+                    if let SftpModalState::FileViewer { content, .. } =
+                        &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                    {
+                        content.pending_confirm = Some(UnsavedConfirmAction::ReloadFromRemote);
+                    }
+                    return Task::none();
+                }
+                self.reload_sftp_modal_file(session_id)
+            }
+            Message::SftpModalSwitchToEdit => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                if let SftpModalState::FileViewer {
+                    editable, loading, ..
+                } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                    && !*loading
+                {
+                    *editable = true;
+                    return operation::focus(remote_editor_id());
+                }
+                Task::none()
+            }
+            Message::SftpModalToggleWordWrap => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let prefs = if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    content.word_wrap = !content.word_wrap;
+                    Some((content.word_wrap, content.expanded, content.indent_mode))
+                } else {
+                    None
+                };
+                if let Some((wrap, exp, indent)) = prefs {
+                    self.persist_sftp_editor_prefs(wrap, exp, indent);
+                }
+                operation::focus(remote_editor_id())
+            }
+            Message::SftpModalToggleExpand => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let prefs = if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    content.expanded = !content.expanded;
+                    Some((content.word_wrap, content.expanded, content.indent_mode))
+                } else {
+                    None
+                };
+                if let Some((wrap, exp, indent)) = prefs {
+                    self.persist_sftp_editor_prefs(wrap, exp, indent);
+                }
+                Task::none()
+            }
+            Message::SftpModalCycleIndentMode => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let prefs = if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    let indent = content.cycle_indent_mode();
+                    Some((content.word_wrap, content.expanded, indent))
+                } else {
+                    None
+                };
+                if let Some((wrap, exp, indent)) = prefs {
+                    self.persist_sftp_editor_prefs(wrap, exp, indent);
+                }
+                operation::focus(remote_editor_id())
+            }
+            Message::SftpModalToggleLineEnding => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                if let SftpModalState::FileViewer {
+                    editable,
+                    dirty,
+                    content,
+                    ..
+                } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                    && *editable
+                {
+                    content.toggle_line_ending();
+                    *dirty = content.is_dirty();
+                }
+                operation::focus(remote_editor_id())
+            }
+            Message::SftpModalToggleFind(with_replace) => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let (currently_open, currently_replace, editable) = match &self
+                    .ensure_session_sftp_drawer(session_id)
+                    .plus
+                    .modal
+                {
+                    SftpModalState::FileViewer {
+                        editable, content, ..
+                    } => (content.find_open, content.replace_open, *editable),
+                    _ => return Task::none(),
+                };
+                if with_replace && !editable {
+                    return Task::none();
+                }
+                if currently_open && (!with_replace || currently_replace) && !with_replace {
+                    if let SftpModalState::FileViewer { content, .. } =
+                        &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                    {
+                        content.close_find();
+                    }
+                    return operation::focus(remote_editor_id());
+                }
+                if currently_open && with_replace && currently_replace {
+                    if let SftpModalState::FileViewer { content, .. } =
+                        &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                    {
+                        content.replace_open = false;
+                    }
+                    return focus_and_select_input(remote_editor_find_id());
+                }
+                self.remote_editor_open_find(with_replace)
+            }
+            Message::SftpModalCloseFind => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    content.close_find();
+                }
+                operation::focus(remote_editor_id())
+            }
+            Message::SftpModalFindQueryChanged(query) => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    content.set_find_query(query);
+                }
+                Task::none()
+            }
+            Message::SftpModalReplaceTextChanged(val) => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    content.replace_text = val;
+                    content.replace_feedback = None;
+                }
+                Task::none()
+            }
+            Message::SftpModalToggleSearchCase => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    content.toggle_case_sensitive();
+                }
+                Task::none()
+            }
+            Message::SftpModalToggleSearchWholeWord => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    content.toggle_whole_word();
+                }
+                Task::none()
+            }
+            Message::SftpModalToggleSearchRegex => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    content.toggle_regex();
+                }
+                Task::none()
+            }
+            Message::SftpModalFindNext => self.remote_editor_find_step(true),
+            Message::SftpModalFindPrev => self.remote_editor_find_step(false),
+            Message::SftpModalReplaceOne => {
                 let Some(session_id) = self.sftp_session_for_modal() else {
                     return Task::none();
                 };
@@ -13006,68 +14287,77 @@ impl AppState {
                     ..
                 } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
                 {
-                    let is_edit = matches!(action, iced::widget::text_editor::Action::Edit(_));
-                    if !*editable && is_edit {
-                        return Task::none();
-                    }
-                    content.perform(action);
-                    if is_edit {
-                        *dirty = true;
-                    }
+                    content.replace_current(*editable);
+                    *dirty = content.is_dirty();
                 }
                 Task::none()
             }
-            Message::SftpModalSaveFile => {
+            Message::SftpModalReplaceAll => {
                 let Some(session_id) = self.sftp_session_for_modal() else {
                     return Task::none();
                 };
-                let (path, text_to_save, editable, loading, saving) = match &self
-                    .ensure_session_sftp_drawer(session_id)
-                    .plus
-                    .modal
+                if let SftpModalState::FileViewer {
+                    editable,
+                    dirty,
+                    content,
+                    ..
+                } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
                 {
-                    SftpModalState::FileViewer {
-                        path,
-                        content,
-                        editable,
-                        loading,
-                        saving,
-                        ..
-                    } => (path.clone(), content.text(), *editable, *loading, *saving),
+                    content.replace_all(*editable);
+                    *dirty = content.is_dirty();
+                }
+                Task::none()
+            }
+            Message::SftpModalToggleGoToLine => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let is_open = match &mut self.ensure_session_sftp_drawer(session_id).plus.modal {
+                    SftpModalState::FileViewer { content, .. } => {
+                        if content.goto_open {
+                            content.close_goto_line();
+                            false
+                        } else {
+                            content.open_goto_line();
+                            true
+                        }
+                    }
                     _ => return Task::none(),
                 };
-                if !editable || loading || saving {
-                    return Task::none();
+                if is_open {
+                    focus_and_select_input(remote_editor_goto_id())
+                } else {
+                    operation::focus(remote_editor_id())
                 }
-                let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
-                    if let SftpModalState::FileViewer { error, .. } =
-                        &mut self.ensure_session_sftp_drawer(session_id).plus.modal
-                    {
-                        *error = Some("SSH session is disconnected".to_string());
-                    }
+            }
+            Message::SftpModalGoToLineInputChanged(val) => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
                     return Task::none();
                 };
-                if let SftpModalState::FileViewer { saving, error, .. } =
+                if let SftpModalState::FileViewer { content, .. } =
                     &mut self.ensure_session_sftp_drawer(session_id).plus.modal
                 {
-                    *saving = true;
-                    *error = None;
+                    content.goto_input = val;
+                    content.goto_error = None;
                 }
-                let manager = self.sftp_manager.clone();
-                let save_path = path.clone();
-                Task::perform(
-                    async move {
-                        manager
-                            .write_text_file(&endpoint, &save_path, &text_to_save)
-                            .await
-                            .map_err(|e| e.to_string())
-                    },
-                    move |result| Message::SftpRemoteFileSaveResult {
-                        session_id,
-                        path,
-                        result,
-                    },
-                )
+                Task::none()
+            }
+            Message::SftpModalGoToLineSubmit => {
+                let Some(session_id) = self.sftp_session_for_modal() else {
+                    return Task::none();
+                };
+                let ok = if let SftpModalState::FileViewer { content, .. } =
+                    &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+                {
+                    content.submit_goto_line()
+                } else {
+                    false
+                };
+                if ok {
+                    operation::focus(remote_editor_id())
+                } else {
+                    operation::focus(remote_editor_goto_id())
+                }
             }
             Message::SftpRemoteFileReadResult {
                 session_id,
@@ -13093,8 +14383,8 @@ impl AppState {
                     *loading = false;
                     match result {
                         Ok(text) => {
-                            *content = iced::widget::text_editor::Content::with_text(&text);
-                            *dirty = false;
+                            content.load_remote_text(&text);
+                            *dirty = content.is_dirty();
                             *error = None;
                             recovered_ok = true;
                         }
@@ -13109,6 +14399,7 @@ impl AppState {
                 if recovered_ok {
                     drawer.mark_connected_or_recovered(Instant::now());
                     self.sync_sftp_status_notice();
+                    return operation::focus(remote_editor_id());
                 } else if let Some(err) = reconnect_err {
                     return self.trigger_sftp_auto_reconnect(session_id, err);
                 }
@@ -13123,11 +14414,14 @@ impl AppState {
                     return Task::none();
                 };
                 let mut reconnect_err: Option<String> = None;
+                let mut should_close = false;
                 if let SftpModalState::FileViewer {
                     path,
                     saving,
                     dirty,
+                    close_after_save,
                     error,
+                    content,
                     ..
                 } = &mut drawer.plus.modal
                     && *path == saved_path
@@ -13135,16 +14429,25 @@ impl AppState {
                     *saving = false;
                     match &result {
                         Ok(()) => {
-                            *dirty = false;
+                            let ts = chrono::Local::now().format("%H:%M:%S").to_string();
+                            content.finish_save_ok(Some(ts));
+                            *dirty = content.is_dirty();
                             *error = None;
+                            should_close = *close_after_save;
+                            *close_after_save = false;
                         }
                         Err(err) => {
+                            content.finish_save_err();
+                            *close_after_save = false;
                             if is_sftp_connection_error_message(err) {
                                 reconnect_err = Some(err.clone());
                             }
                             *error = Some(err.clone());
                         }
                     }
+                }
+                if should_close {
+                    drawer.plus.modal = SftpModalState::None;
                 }
                 if result.is_ok() {
                     drawer.mark_connected_or_recovered(Instant::now());
@@ -13200,6 +14503,7 @@ impl AppState {
                 if selected.is_empty() {
                     return Task::none();
                 }
+                self.begin_os_dialog();
                 let initial = self.sftp_download_dir.clone();
                 Task::perform(
                     async move {
@@ -13505,6 +14809,9 @@ impl AppState {
             return Task::none();
         };
         let req_path = entry.full_path.clone();
+        let word_wrap = self.config.terminal.sftp_editor_word_wrap;
+        let expanded = self.config.terminal.sftp_editor_expanded;
+        let indent_mode = self.config.terminal.sftp_editor_indent_mode;
         self.ensure_session_sftp_drawer(session_id).plus.modal = SftpModalState::FileViewer {
             path: entry.full_path,
             file_name: entry.name,
@@ -13512,8 +14819,281 @@ impl AppState {
             loading: true,
             saving: false,
             dirty: false,
+            close_after_save: false,
             error: None,
-            content: iced::widget::text_editor::Content::new(),
+            content: RemoteEditorState::new(word_wrap, expanded, indent_mode),
+        };
+        let manager = self.sftp_manager.clone();
+        let read_path = req_path.clone();
+        Task::perform(
+            async move {
+                manager
+                    .read_text_file(&endpoint, &read_path, 2 * 1024 * 1024)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            move |result| Message::SftpRemoteFileReadResult {
+                session_id,
+                request_path: req_path,
+                editable,
+                result,
+            },
+        )
+    }
+
+    fn handle_sftp_modal_escape(&mut self, session_id: SessionId) -> Task<Message> {
+        enum EscapeStep {
+            CancelConfirm,
+            CloseGoTo,
+            CloseFind,
+            DismissNonEditor,
+            RequestCloseEditor,
+        }
+        let step = {
+            let Some(drawer) = self.sftp_drawers.get_mut(&session_id) else {
+                return Task::none();
+            };
+            match &mut drawer.plus.modal {
+                SftpModalState::FileViewer { content, .. } => {
+                    if content.pending_confirm.take().is_some() {
+                        EscapeStep::CancelConfirm
+                    } else if content.goto_open {
+                        content.close_goto_line();
+                        EscapeStep::CloseGoTo
+                    } else if content.find_open {
+                        content.close_find();
+                        EscapeStep::CloseFind
+                    } else {
+                        EscapeStep::RequestCloseEditor
+                    }
+                }
+                _ => {
+                    drawer.plus.modal = SftpModalState::None;
+                    EscapeStep::DismissNonEditor
+                }
+            }
+        };
+        match step {
+            EscapeStep::CancelConfirm | EscapeStep::CloseGoTo | EscapeStep::CloseFind => {
+                operation::focus(remote_editor_id())
+            }
+            EscapeStep::RequestCloseEditor => self.request_close_sftp_modal(session_id),
+            EscapeStep::DismissNonEditor => Task::none(),
+        }
+    }
+
+    fn request_close_sftp_modal(&mut self, session_id: SessionId) -> Task<Message> {
+        let needs_confirm = matches!(
+            &self.ensure_session_sftp_drawer(session_id).plus.modal,
+            SftpModalState::FileViewer {
+                editable: true,
+                dirty: true,
+                ..
+            }
+        );
+        if needs_confirm {
+            if let SftpModalState::FileViewer { content, .. } =
+                &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+            {
+                content.pending_confirm = Some(UnsavedConfirmAction::CloseModal);
+            }
+            return Task::none();
+        }
+        self.ensure_session_sftp_drawer(session_id).plus.modal = SftpModalState::None;
+        Task::none()
+    }
+
+    fn remote_editor_open_find(&mut self, with_replace: bool) -> Task<Message> {
+        let Some(session_id) = self.sftp_session_for_modal() else {
+            return Task::none();
+        };
+        let target_id = if let SftpModalState::FileViewer {
+            editable,
+            loading,
+            content,
+            ..
+        } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+        {
+            if *loading || (with_replace && !*editable) {
+                return Task::none();
+            }
+            let want_replace = with_replace;
+            let had_query = !content.find_query.is_empty();
+            content.open_find(want_replace, *editable);
+            if want_replace && (had_query || !content.find_query.is_empty()) {
+                remote_editor_replace_id()
+            } else {
+                remote_editor_find_id()
+            }
+        } else {
+            return Task::none();
+        };
+        focus_and_select_input(target_id)
+    }
+
+    fn remote_editor_open_goto_line(&mut self) -> Task<Message> {
+        let Some(session_id) = self.sftp_session_for_modal() else {
+            return Task::none();
+        };
+        if let SftpModalState::FileViewer {
+            loading, content, ..
+        } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+        {
+            if *loading {
+                return Task::none();
+            }
+            content.open_goto_line();
+            return focus_and_select_input(remote_editor_goto_id());
+        }
+        Task::none()
+    }
+
+    fn remote_editor_find_step(&mut self, forward: bool) -> Task<Message> {
+        let Some(session_id) = self.sftp_session_for_modal() else {
+            return Task::none();
+        };
+        if let SftpModalState::FileViewer {
+            loading, content, ..
+        } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+        {
+            if *loading {
+                return Task::none();
+            }
+            if !content.find_open {
+                content.open_find(false, false);
+                return focus_and_select_input(remote_editor_find_id());
+            }
+            if forward {
+                content.find_next();
+            } else {
+                content.find_prev();
+            }
+        }
+        Task::none()
+    }
+
+    fn remote_editor_undo(&mut self, session_id: SessionId) -> Task<Message> {
+        if let SftpModalState::FileViewer {
+            editable,
+            dirty,
+            content,
+            ..
+        } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+            && *editable
+        {
+            content.undo();
+            *dirty = content.is_dirty();
+        }
+        Task::none()
+    }
+
+    fn remote_editor_redo(&mut self, session_id: SessionId) -> Task<Message> {
+        if let SftpModalState::FileViewer {
+            editable,
+            dirty,
+            content,
+            ..
+        } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+            && *editable
+        {
+            content.redo();
+            *dirty = content.is_dirty();
+        }
+        Task::none()
+    }
+
+    fn save_sftp_modal_file(
+        &mut self,
+        session_id: SessionId,
+        close_after: bool,
+    ) -> Task<Message> {
+        let (path, editable, loading, saving) = match &self
+            .ensure_session_sftp_drawer(session_id)
+            .plus
+            .modal
+        {
+            SftpModalState::FileViewer {
+                path,
+                editable,
+                loading,
+                saving,
+                ..
+            } => (path.clone(), *editable, *loading, *saving),
+            _ => return Task::none(),
+        };
+        if !editable || loading || saving {
+            return Task::none();
+        }
+        let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+            if let SftpModalState::FileViewer { error, .. } =
+                &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+            {
+                *error = Some("SSH session is disconnected".to_string());
+            }
+            return Task::none();
+        };
+        let text_to_save = if let SftpModalState::FileViewer {
+            saving,
+            close_after_save,
+            error,
+            content,
+            ..
+        } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+        {
+            *saving = true;
+            *close_after_save = close_after;
+            *error = None;
+            content.begin_save()
+        } else {
+            return Task::none();
+        };
+        let manager = self.sftp_manager.clone();
+        let save_path = path.clone();
+        Task::perform(
+            async move {
+                manager
+                    .write_text_file(&endpoint, &save_path, &text_to_save)
+                    .await
+                    .map_err(|e| e.to_string())
+            },
+            move |result| Message::SftpRemoteFileSaveResult {
+                session_id,
+                path,
+                result,
+            },
+        )
+    }
+
+    fn reload_sftp_modal_file(&mut self, session_id: SessionId) -> Task<Message> {
+        let Some(endpoint) = self.ssh_endpoint_for(session_id) else {
+            if let SftpModalState::FileViewer { error, .. } =
+                &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+            {
+                *error = Some("SSH session is disconnected".to_string());
+            }
+            return Task::none();
+        };
+        let (req_path, editable) = if let SftpModalState::FileViewer {
+            path,
+            editable,
+            loading,
+            saving,
+            error,
+            content,
+            ..
+        } = &mut self.ensure_session_sftp_drawer(session_id).plus.modal
+        {
+            if *loading || *saving {
+                return Task::none();
+            }
+            let cur_line = content.cursor().position.line;
+            content.restore_line_after_reload = Some(cur_line);
+            content.pending_confirm = None;
+            *loading = true;
+            *error = None;
+            (path.clone(), *editable)
+        } else {
+            return Task::none();
         };
         let manager = self.sftp_manager.clone();
         let read_path = req_path.clone();
@@ -14717,6 +16297,15 @@ impl AppState {
     }
 }
 
+fn focus_and_select_input(id: iced::widget::Id) -> Task<Message> {
+    Task::batch([
+        operation::focus(id.clone()),
+        iced::advanced::widget::operate(
+            iced::advanced::widget::operation::text_input::select_all(id),
+        ),
+    ])
+}
+
 fn disconnect_ssh_handles(
     ssh_handles: Vec<(Option<ConnectionSupervisor>, Option<Arc<SshSession>>)>,
 ) {
@@ -14788,7 +16377,7 @@ where
 fn window_shortcut_event(
     event: Event,
     status: event::Status,
-    _window_id: window::Id,
+    window_id: window::Id,
 ) -> Option<Message> {
     if status == event::Status::Captured {
         return None;
@@ -14803,27 +16392,36 @@ fn window_shortcut_event(
         return None;
     };
 
-    if modifiers.control()
-        && modifiers.shift()
-        && !modifiers.alt()
-        && matches!(key.as_ref(), Key::Character("e") | Key::Character("E"))
-    {
-        return Some(Message::ToggleSftpDrawer);
+    let scope = move |msg| Message::InWindow {
+        window_id,
+        inner: Box::new(msg),
+    };
+
+    if modifiers.control() && modifiers.shift() && !modifiers.alt() && !modifiers.logo() {
+        match key.as_ref() {
+            Key::Character("e") | Key::Character("E") => {
+                return Some(scope(Message::ToggleSftpDrawer));
+            }
+            Key::Character("s") | Key::Character("S") => {
+                return Some(scope(Message::ToggleSidebar));
+            }
+            _ => {}
+        }
     }
 
     if modifiers.control() && !modifiers.shift() && !modifiers.alt() && !modifiers.logo() {
         match key.as_ref() {
             Key::Character("c") | Key::Character("C") => {
-                return Some(Message::SftpShortcut(SftpContextActionKind::Copy));
+                return Some(scope(Message::SftpShortcut(SftpContextActionKind::Copy)));
             }
             Key::Character("x") | Key::Character("X") => {
-                return Some(Message::SftpShortcut(SftpContextActionKind::Cut));
+                return Some(scope(Message::SftpShortcut(SftpContextActionKind::Cut)));
             }
             Key::Character("v") | Key::Character("V") => {
-                return Some(Message::SftpShortcut(SftpContextActionKind::Paste));
+                return Some(scope(Message::SftpShortcut(SftpContextActionKind::Paste)));
             }
             Key::Character("a") | Key::Character("A") => {
-                return Some(Message::SftpShortcut(SftpContextActionKind::SelectAll));
+                return Some(scope(Message::SftpShortcut(SftpContextActionKind::SelectAll)));
             }
             _ => {}
         }
@@ -14847,6 +16445,7 @@ fn window_shortcut_event(
         }
         _ => None,
     }
+    .map(scope)
 }
 
 fn open_local_file_with_system(
@@ -15489,6 +17088,7 @@ pub fn shortcut_for_key_event(
             | Key::Character("_") => Some(Message::SplitFocusedPane(SplitAxis::Horizontal)),
             Key::Character("z") | Key::Character("Z") => Some(Message::TogglePaneZoom),
             Key::Character("b") | Key::Character("B") => Some(Message::ToggleBroadcastInput),
+            Key::Character("s") | Key::Character("S") => Some(Message::ToggleSidebar),
             Key::Character("e") | Key::Character("E") => Some(Message::ToggleSftpDrawer),
             Key::Character("p") | Key::Character("P") => Some(Message::ToggleCommandPalette),
             Key::Character("]") | Key::Character("}") => {

@@ -21,6 +21,7 @@ interprocess.workspace = true
 notify.workspace = true
 notify-debouncer-mini.workspace = true
 open.workspace = true
+regex.workspace = true
 rfd.workspace = true
 serde.workspace = true
 termewnal-core = { path = "../termewnal-core" }

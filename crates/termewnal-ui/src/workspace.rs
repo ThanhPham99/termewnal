@@ -12,6 +12,31 @@ pub const MAX_SPLIT_RATIO: f32 = 0.9;
 /// Default split ratio for newly created binary splits.
 pub const DEFAULT_SPLIT_RATIO: f32 = 0.5;
 
+/// Hairline thickness (in logical pixels) separating adjacent split panes.
+pub const SPLIT_DIVIDER_THICKNESS: f32 = 1.0;
+
+/// Computes `(width, height)` for the first child of a split container matching `SplitView`.
+pub fn split_first_size(
+    total_width: f32,
+    total_height: f32,
+    axis: SplitAxis,
+    ratio: f32,
+    divider_thickness: f32,
+) -> (f32, f32) {
+    match axis {
+        SplitAxis::Vertical => {
+            let available = (total_width - divider_thickness).max(2.0);
+            let first_w = (available * ratio).round().clamp(1.0, available - 1.0);
+            (first_w, total_height.max(1.0))
+        }
+        SplitAxis::Horizontal => {
+            let available = (total_height - divider_thickness).max(2.0);
+            let first_h = (available * ratio).round().clamp(1.0, available - 1.0);
+            (total_width.max(1.0), first_h)
+        }
+    }
+}
+
 /// Unique identifier for a workspace tab.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct TabId(pub u64);
@@ -110,6 +135,57 @@ impl SplitNode {
         let mut out = Vec::new();
         self.collect_session_ids(&mut out);
         out
+    }
+
+    /// Computes logical `(width, height)` allocated to every leaf `PaneId` inside `(total_width, total_height)`.
+    pub fn collect_pane_bounds(
+        &self,
+        total_width: f32,
+        total_height: f32,
+    ) -> std::collections::BTreeMap<PaneId, (f32, f32)> {
+        let mut out = std::collections::BTreeMap::new();
+        self.collect_pane_bounds_into(total_width.max(1.0), total_height.max(1.0), &mut out);
+        out
+    }
+
+    fn collect_pane_bounds_into(
+        &self,
+        total_width: f32,
+        total_height: f32,
+        out: &mut std::collections::BTreeMap<PaneId, (f32, f32)>,
+    ) {
+        match self {
+            Self::Leaf { pane_id, .. } => {
+                out.insert(*pane_id, (total_width, total_height));
+            }
+            Self::Split {
+                axis,
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                let (w1, h1) = split_first_size(
+                    total_width,
+                    total_height,
+                    *axis,
+                    *ratio,
+                    SPLIT_DIVIDER_THICKNESS,
+                );
+                let (w2, h2) = match axis {
+                    SplitAxis::Vertical => (
+                        (total_width - w1 - SPLIT_DIVIDER_THICKNESS).max(1.0),
+                        total_height.max(1.0),
+                    ),
+                    SplitAxis::Horizontal => (
+                        total_width.max(1.0),
+                        (total_height - h1 - SPLIT_DIVIDER_THICKNESS).max(1.0),
+                    ),
+                };
+                first.collect_pane_bounds_into(w1, h1, out);
+                second.collect_pane_bounds_into(w2, h2, out);
+            }
+        }
     }
 
     fn collect_session_ids(&self, out: &mut Vec<SessionId>) {

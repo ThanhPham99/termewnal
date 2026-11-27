@@ -306,8 +306,8 @@ impl SettingsUiState {
         self.saved_notice = None;
     }
 
-    pub fn set_show_profile_sidebar(&mut self, _enabled: bool) {
-        self.draft.terminal.show_profile_sidebar = true;
+    pub fn set_show_profile_sidebar(&mut self, enabled: bool) {
+        self.draft.terminal.show_profile_sidebar = enabled;
         self.saved_notice = None;
     }
 
@@ -1066,7 +1066,7 @@ impl SettingsUiState {
                 .wrapping(text::Wrapping::None)
                 .into()
         } else {
-            text("~/.config/termewnal/config.toml · Ctrl+,")
+            text("~/.config/termewnal/config.toml (Ctrl+,)")
                 .size(FONT_META)
                 .font(mono_font())
                 .color(chrome.text_muted)
@@ -1503,6 +1503,19 @@ impl SettingsUiState {
             ),
             hairline_h(chrome),
             form_line(
+                "Show Profiles sidebar by default",
+                Some("Expand the navigation sidebar automatically on desktop windows (Ctrl+Shift+S)"),
+                apple_checkbox(
+                    self.draft.terminal.show_profile_sidebar,
+                    "Show Profiles sidebar by default",
+                    Message::SettingsShowProfileSidebarToggled,
+                    chrome,
+                ),
+                compact_form,
+                chrome,
+            ),
+            hairline_h(chrome),
+            form_line(
                 "Status bar",
                 Some("Show diagnostic bottom telemetry strip"),
                 apple_checkbox(
@@ -1839,7 +1852,7 @@ impl SettingsUiState {
                         text(action.category())
                             .size(FONT_META)
                             .color(chrome.text_muted),
-                        text("·").size(FONT_META).color(chrome.text_muted),
+                        text("/").size(FONT_META).color(chrome.text_muted),
                         text(action.label())
                             .size(FONT_BODY)
                             .color(chrome.text_primary),

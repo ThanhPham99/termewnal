@@ -133,7 +133,7 @@ pub fn action_to_message(
         KeyAction::SplitHorizontal => Some(Message::SplitFocusedPane(SplitAxis::Horizontal)),
         KeyAction::TogglePaneZoom => Some(Message::TogglePaneZoom),
         KeyAction::ToggleBroadcastInput => Some(Message::ToggleBroadcastInput),
-        KeyAction::ToggleSidebar => None,
+        KeyAction::ToggleSidebar => Some(Message::ToggleSidebar),
         KeyAction::ToggleSftpDrawer => Some(Message::ToggleSftpDrawer),
         KeyAction::ToggleCommandPalette => Some(Message::ToggleCommandPalette),
         KeyAction::OpenQuickConnect => Some(Message::OpenQuickConnectPalette),

@@ -69,6 +69,7 @@ impl KeyAction {
         Self::SplitHorizontal,
         Self::TogglePaneZoom,
         Self::ToggleBroadcastInput,
+        Self::ToggleSidebar,
         Self::ToggleSftpDrawer,
         Self::ToggleCommandPalette,
         Self::OpenQuickConnect,
@@ -226,7 +227,7 @@ impl KeyAction {
             Self::SplitHorizontal => vec!["Ctrl+Shift+O", "Ctrl+Shift+Minus"],
             Self::TogglePaneZoom => vec!["Ctrl+Shift+Z"],
             Self::ToggleBroadcastInput => vec!["Ctrl+Shift+B"],
-            Self::ToggleSidebar => vec![],
+            Self::ToggleSidebar => vec!["Ctrl+Shift+S"],
             Self::ToggleSftpDrawer => vec!["Ctrl+Shift+E"],
             Self::ToggleCommandPalette => vec!["Ctrl+K", "Ctrl+Shift+P"],
             Self::OpenQuickConnect => vec!["Ctrl+Shift+G"],
@@ -410,13 +411,18 @@ impl KeybindingConfig {
         self.bindings.remove(&action);
     }
 
-    /// Builds a [`KeybindingResolver`] merging built-in defaults and overrides.
+    /// Builds a [`KeybindingResolver`] prioritizing user overrides before built-in defaults.
     pub fn resolver(&self) -> KeybindingResolver {
         let mut exact: BTreeMap<Vec<KeyChord>, KeyAction> = BTreeMap::new();
-        for &action in KeyAction::ALL {
-            for binding in self.bindings_for(action) {
-                if let Some(seq) = KeySequence::parse(&binding) {
-                    exact.entry(seq.0).or_insert(action);
+        for include_overridden in [true, false] {
+            for &action in KeyAction::ALL {
+                if self.bindings.contains_key(&action) != include_overridden {
+                    continue;
+                }
+                for binding in self.bindings_for(action) {
+                    if let Some(seq) = KeySequence::parse(&binding) {
+                        exact.entry(seq.0).or_insert(action);
+                    }
                 }
             }
         }

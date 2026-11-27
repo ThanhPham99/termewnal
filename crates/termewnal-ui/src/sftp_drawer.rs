@@ -91,11 +91,21 @@ impl SftpConnectionState {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum DockIntent {
+    #[default]
+    Auto,
+    DockedOpen,
+    ManuallyClosed,
+}
+
 /// UI state backing the per-pane, toggleable (`Ctrl+Shift+E`), resizable SFTP+ Panel.
 #[derive(Debug, Clone)]
 pub struct SftpDrawerState {
-    open: bool,
-    manually_closed: bool,
+    dock_intent: DockIntent,
+    dock_open: bool,
+    overlay_open: bool,
+    auto_suppressed: bool,
     panel_focused: bool,
     width: f32,
     bound_session_id: Option<SessionId>,
@@ -125,8 +135,10 @@ impl Default for SftpDrawerState {
         let mut plus = crate::sftp_plus::SftpPlusState::default();
         plus.remote.path_input = ".".to_string();
         Self {
-            open: false,
-            manually_closed: false,
+            dock_intent: DockIntent::Auto,
+            dock_open: false,
+            overlay_open: false,
+            auto_suppressed: false,
             panel_focused: false,
             width: DEFAULT_SFTP_DRAWER_WIDTH,
             bound_session_id: None,
@@ -187,48 +199,127 @@ impl SftpDrawerState {
         self.session_label = label;
     }
 
-    /// Returns `true` when the SFTP Panel is visible.
+    /// Returns `true` when the SFTP Panel is visible (docked or overlay).
     pub fn is_open(&self) -> bool {
-        self.open
+        self.dock_open || self.overlay_open
+    }
+
+    /// Returns `true` when the SFTP Panel is currently docked side-by-side in the pane.
+    pub fn is_docked_open(&self) -> bool {
+        self.dock_open
+    }
+
+    /// Returns `true` when the SFTP Panel is rendered as an in-pane opaque overlay.
+    pub fn is_overlay_open(&self) -> bool {
+        self.overlay_open
+    }
+
+    /// Returns `true` when docked auto-open was suppressed because pane geometry was `< 680x360` or `Quake`.
+    pub fn is_auto_suppressed(&self) -> bool {
+        self.auto_suppressed
     }
 
     /// Returns `true` when the user manually closed this session's SFTP Panel.
     pub fn is_manually_closed(&self) -> bool {
-        self.manually_closed
+        self.dock_intent == DockIntent::ManuallyClosed
     }
 
     /// Returns `true` when keyboard focus inside this Pane belongs to the SFTP Panel.
     pub fn is_panel_focused(&self) -> bool {
-        self.open && self.panel_focused
+        self.is_open() && self.panel_focused
     }
 
     /// Updates whether keyboard focus inside this Pane belongs to the SFTP Panel.
     pub fn set_panel_focused(&mut self, focused: bool) {
-        self.panel_focused = focused && self.open;
+        self.panel_focused = focused && self.is_open();
     }
 
-    /// Opens or closes the SFTP Panel from explicit user action, recording manual close state.
-    pub fn set_open(&mut self, open: bool) {
-        self.open = open;
-        self.manually_closed = !open;
-        if !open {
+    /// Opens or closes the SFTP Panel from explicit user action respecting `geometry_eligible`.
+    pub fn set_open_with_eligibility(&mut self, open: bool, geometry_eligible: bool) {
+        if open {
+            if geometry_eligible {
+                self.dock_intent = DockIntent::DockedOpen;
+                self.dock_open = true;
+                self.overlay_open = false;
+                self.auto_suppressed = false;
+            } else {
+                // Keep Auto dock intent if currently auto-suppressed so closing an overlay does not kill dock auto-restore.
+                if self.dock_intent == DockIntent::ManuallyClosed {
+                    self.dock_intent = DockIntent::DockedOpen;
+                }
+                self.dock_open = false;
+                self.overlay_open = true;
+            }
+        } else if self.overlay_open {
+            self.overlay_open = false;
+            self.dock_open = false;
             self.panel_focused = false;
+            if !(self.dock_intent == DockIntent::Auto && self.auto_suppressed) {
+                self.dock_intent = DockIntent::ManuallyClosed;
+                self.auto_suppressed = false;
+            }
+        } else {
+            self.dock_intent = DockIntent::ManuallyClosed;
+            self.dock_open = false;
+            self.overlay_open = false;
+            self.auto_suppressed = false;
+            self.panel_focused = false;
+        }
+    }
+
+    /// Opens or closes the SFTP Panel from explicit user action assuming docked geometry eligibility.
+    pub fn set_open(&mut self, open: bool) {
+        self.set_open_with_eligibility(open, true);
+    }
+
+    /// Automatically opens docked SFTP Panel on SSH connect when `geometry_eligible` holds,
+    /// or records non-destructive suppression when ineligible.
+    pub fn auto_open_for_geometry(&mut self, geometry_eligible: bool) -> bool {
+        if self.dock_intent == DockIntent::ManuallyClosed || self.is_open() {
+            return false;
+        }
+        if geometry_eligible {
+            self.dock_open = true;
+            self.overlay_open = false;
+            self.auto_suppressed = false;
+            true
+        } else {
+            self.dock_open = false;
+            self.auto_suppressed = true;
+            false
         }
     }
 
     /// Automatically opens the SFTP Panel on SSH connect unless the user closed it manually.
     /// Returns `true` when the panel transitioned from closed to open.
     pub fn auto_open_if_allowed(&mut self) -> bool {
-        if self.manually_closed || self.open {
-            return false;
+        self.auto_open_for_geometry(true)
+    }
+
+    /// Reconciles SFTP Panel docked/suppressed state against updated pane geometry eligibility.
+    /// Open in-pane overlays survive non-eligible resizes without collapsing.
+    pub fn reconcile_geometry(&mut self, geometry_eligible: bool) {
+        if self.dock_intent == DockIntent::ManuallyClosed {
+            self.dock_open = false;
+            self.auto_suppressed = false;
+            return;
         }
-        self.open = true;
-        true
+        if geometry_eligible {
+            if self.overlay_open || self.auto_suppressed {
+                self.dock_open = true;
+                self.overlay_open = false;
+                self.auto_suppressed = false;
+            }
+        } else if self.dock_open {
+            self.dock_open = false;
+            self.auto_suppressed = true;
+            self.panel_focused = false;
+        }
     }
 
     /// Toggles SFTP Panel visibility and returns the updated state.
     pub fn toggle(&mut self) -> bool {
-        let next = !self.open;
+        let next = !self.is_open();
         self.set_open(next);
         next
     }
@@ -612,6 +703,7 @@ impl SftpDrawerState {
 pub struct SftpDrawerDock<'a> {
     session_id: SessionId,
     drawer_width: f32,
+    chrome: ChromePalette,
     children: [Element<'a, Message, Theme, iced::Renderer>; 2],
 }
 
@@ -620,26 +712,29 @@ impl<'a> SftpDrawerDock<'a> {
     pub fn new(
         session_id: SessionId,
         drawer_width: f32,
+        chrome: ChromePalette,
         main: Element<'a, Message, Theme, iced::Renderer>,
         drawer: Element<'a, Message, Theme, iced::Renderer>,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
         Element::new(Self {
             session_id,
             drawer_width: drawer_width.clamp(MIN_SFTP_DRAWER_WIDTH, MAX_SFTP_DRAWER_WIDTH),
+            chrome,
             children: [main, drawer],
         })
     }
 
-    /// Computes effective SFTP Panel width clamped to `[220px, 70% pane]` while preserving terminal space.
+    /// Computes effective SFTP Panel width clamped to `[220px, 70% pane]` while never exceeding narrow bounds.
     pub fn clamped_panel_width(preferred_width: f32, total_width: f32) -> f32 {
+        let avail = (total_width - DIVIDER_THICKNESS).max(1.0);
         let min_terminal = if total_width >= 460.0 + DIVIDER_THICKNESS {
             240.0
         } else {
-            (total_width * 0.45).clamp(140.0, 240.0)
+            (total_width * 0.45).min(240.0)
         };
-        let ratio_cap = (total_width * 0.70).max(160.0);
-        let space_cap = (total_width - DIVIDER_THICKNESS - min_terminal).max(140.0);
-        let max_allowed = ratio_cap.min(space_cap).max(140.0);
+        let ratio_cap = total_width * 0.70;
+        let space_cap = (avail - min_terminal).max(1.0);
+        let max_allowed = ratio_cap.min(space_cap).clamp(1.0, avail);
         let min_allowed = MIN_SFTP_DRAWER_WIDTH.min(max_allowed);
         preferred_width.clamp(min_allowed, max_allowed)
     }
@@ -904,7 +999,7 @@ impl Widget<Message, Theme, iced::Renderer> for SftpDrawerDock<'_> {
             );
         }
 
-        draw_interactive_divider(renderer, theme, visual_rect, state, 0.35);
+        draw_interactive_divider(renderer, self.chrome, visual_rect, state, 0.35);
     }
 
     fn overlay<'b>(

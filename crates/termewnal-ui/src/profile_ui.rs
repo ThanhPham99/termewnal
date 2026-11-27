@@ -1208,9 +1208,9 @@ impl ProfileEditorState {
             ProfileKindChoice::LocalShell | ProfileKindChoice::Docker => {}
         }
 
-        // Right column: Tabby underline tabs (`GENERAL` | `PORTS` | `ADVANCED` | `LOGIN SCRIPTS`).
+        // Right column: Tabby underline tabs (`General` | `Ports` | `Advanced` | `Login scripts`).
         let mut right_tabs_row = row![tabby_underline_tab(
-            "GENERAL",
+            "General",
             self.active_tab == ProfileEditorTab::General,
             Message::ProfileFormTabSelected(ProfileEditorTab::General),
             chrome,
@@ -1221,26 +1221,26 @@ impl ProfileEditorState {
         if self.kind == ProfileKindChoice::Ssh {
             right_tabs_row = right_tabs_row
                 .push(tabby_underline_tab(
-                    "PORTS",
+                    "Ports",
                     self.active_tab == ProfileEditorTab::Ports,
                     Message::ProfileFormTabSelected(ProfileEditorTab::Ports),
                     chrome,
                 ))
                 .push(tabby_underline_tab(
-                    "ADVANCED",
+                    "Advanced",
                     self.active_tab == ProfileEditorTab::Advanced,
                     Message::ProfileFormTabSelected(ProfileEditorTab::Advanced),
                     chrome,
                 ))
                 .push(tabby_underline_tab(
-                    "LOGIN SCRIPTS",
+                    "Login scripts",
                     self.active_tab == ProfileEditorTab::LoginScripts,
                     Message::ProfileFormTabSelected(ProfileEditorTab::LoginScripts),
                     chrome,
                 ));
         } else if self.kind == ProfileKindChoice::Telnet {
             right_tabs_row = right_tabs_row.push(tabby_underline_tab(
-                "LOGIN SCRIPTS",
+                "Login scripts",
                 self.active_tab == ProfileEditorTab::LoginScripts,
                 Message::ProfileFormTabSelected(ProfileEditorTab::LoginScripts),
                 chrome,
@@ -1340,7 +1340,7 @@ impl ProfileEditorState {
                 .on_press(Message::ProfileSave),
             button(text("Cancel").size(FONT_BODY).font(ui_font_medium()))
                 .padding([7, 16])
-                .style(pill_button_style(chrome, PillTone::Danger))
+                .style(pill_button_style(chrome, PillTone::Subtle))
                 .on_press(Message::CloseProfileEditor),
         ]
         .spacing(8)
@@ -1966,7 +1966,7 @@ impl ProfileEditorState {
             };
             let opt = JumpDropdownOption {
                 token: cand.token.clone(),
-                label: format!("{} ({}) · {}", cand.token, origin_tag, cand.endpoint),
+                label: format!("{} ({}) - {}", cand.token, origin_tag, cand.endpoint),
             };
             if is_single_selected {
                 selected_option = Some(opt.clone());
@@ -2022,7 +2022,7 @@ impl ProfileEditorState {
         } else if hops.len() == 1 {
             format!("Selected: {}", hops[0])
         } else {
-            format!("{} hops selected · Add another jump host...", hops.len())
+            format!("{} hops selected — add another jump host...", hops.len())
         };
 
         let mut controls_col = column![].spacing(8).width(Length::Fill);
@@ -2233,7 +2233,7 @@ impl ProfileEditorState {
                         cand.endpoint.clone()
                     } else {
                         format!(
-                            "{} · +transitive: {}",
+                            "{} (+transitive: {})",
                             cand.endpoint,
                             cand.transitive_hops.join(" → ")
                         )

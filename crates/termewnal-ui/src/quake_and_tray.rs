@@ -479,7 +479,7 @@ impl TrayStateSnapshot {
         let win_label = if self.window_visible { "Visible" } else { "Hidden" };
         let quake_label = if self.quake_visible { "Open" } else { "Hidden" };
         format!(
-            "Window: {win_label} · Quake: {quake_label} · Tunnels: {} · Transfers: {}",
+            "Window: {win_label}, Quake: {quake_label}, Tunnels: {}, Transfers: {}",
             self.active_tunnel_count, self.active_transfer_count
         )
     }

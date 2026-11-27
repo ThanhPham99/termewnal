@@ -1018,3 +1018,146 @@ async fn ssh_connection_ui_displays_auto_reconnecting_and_reconnected_successful
     assert_eq!(done_notice.message, "Reconnected successfully");
     let _ = state.view(win);
 }
+
+#[test]
+fn mitm_blocked_persists_after_dismiss_and_prompts_scope_per_pane_and_window() {
+    use termewnal_core::ThemePalette;
+    use termewnal_ssh::HostKeyPrompt;
+    use termewnal_ui::status_bar::StatusBarAction;
+    use termewnal_ui::{MitmAlert, SshAuthPrompt};
+    use tokio::sync::oneshot;
+
+    let temp = TempDir::new().unwrap();
+    let mut state = super::common::boot_test_app(ConfigPaths::from_root(temp.path())).unwrap();
+    let win_a = window::Id::unique();
+    let win_b = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win_a));
+    let _ = state.update(Message::WindowOpened(win_b));
+
+    let profile_a = Profile::ssh(
+        "Prod A",
+        "10.10.0.1",
+        22,
+        "ops",
+        SshAuthMethod::Password {
+            vault_secret_ref: None,
+        },
+    );
+    let profile_b = Profile::ssh(
+        "Prod B",
+        "10.10.0.2",
+        22,
+        "ops",
+        SshAuthMethod::Password {
+            vault_secret_ref: None,
+        },
+    );
+    let _ = state.update(Message::InWindow {
+        window_id: win_a,
+        inner: Box::new(Message::OpenSshProfile(profile_a)),
+    });
+    let sid_a = state.active_session_id().expect("sid_a");
+    let gen_a = state.ssh_session(sid_a).unwrap().ssh_generation();
+
+    let _ = state.update(Message::InWindow {
+        window_id: win_b,
+        inner: Box::new(Message::OpenSshProfile(profile_b)),
+    });
+    let sid_b = state.active_session_id().expect("sid_b");
+    let gen_b = state.ssh_session(sid_b).unwrap().ssh_generation();
+    assert_ne!(sid_a, sid_b);
+
+    // 1. MITM detection sets persistent mitm_blocked=true that survives DismissMitmAlert
+    // and keeps all reconnect triggers blocked.
+    let alert = MitmAlert {
+        session_id: sid_a,
+        host: "10.10.0.1".to_string(),
+        port: 22,
+        line: 3,
+        key_type: "ssh-ed25519".to_string(),
+        expected_fingerprint: "SHA256:goodAAA".to_string(),
+        received_fingerprint: "SHA256:evilZZZ".to_string(),
+    };
+    let _ = state.update(Message::SshEvent {
+        session_id: sid_a,
+        event: SshUiEvent::MitmBlocked {
+            generation: gen_a,
+            alert,
+        },
+    });
+    assert!(state.ssh_session(sid_a).unwrap().is_mitm_blocked());
+    let _ = state.update(Message::DismissMitmAlert(sid_a));
+    assert!(state.ssh_ui().mitm_alert(sid_a).is_none());
+    assert!(state.ssh_session(sid_a).unwrap().is_mitm_blocked());
+
+    let gen_before_retry = state.ssh_session(sid_a).unwrap().ssh_generation();
+    let _ = state.update(Message::TerminalInput {
+        session_id: sid_a,
+        bytes: b"\r".to_vec(),
+    });
+    let _ = state.update(Message::StatusBarAction(StatusBarAction::ReconnectSession(
+        sid_a,
+    )));
+    let _ = state.update(Message::StatusBarAction(StatusBarAction::ProbeAll));
+    assert_eq!(
+        state.ssh_session(sid_a).unwrap().ssh_generation(),
+        gen_before_retry
+    );
+    assert_eq!(
+        state.ssh_session(sid_a).unwrap().transport_status(),
+        &TransportStatus::Disconnected
+    );
+
+    // 2. Host-key TOFU & Auth prompts stay isolated per SessionId and render in constrained pane widths.
+    let (tofu_tx, _tofu_rx) = oneshot::channel();
+    let _ = state.update(Message::SshEvent {
+        session_id: sid_a,
+        event: SshUiEvent::HostKeyPrompt {
+            generation: gen_a,
+            prompt: HostKeyPrompt {
+                host: "10.10.0.1".to_string(),
+                port: 22,
+                key_type: "ssh-ed25519".to_string(),
+                fingerprint_sha256: "SHA256:hostA".to_string(),
+            },
+            responder: Arc::new(Mutex::new(Some(tofu_tx))),
+        },
+    });
+    let (auth_tx, _auth_rx) = oneshot::channel();
+    let _ = state.update(Message::SshEvent {
+        session_id: sid_b,
+        event: SshUiEvent::AuthPrompt {
+            generation: gen_b,
+            prompt: SshAuthPrompt::Password {
+                username: "ops".to_string(),
+                host: "10.10.0.2".to_string(),
+            },
+            responder: Arc::new(Mutex::new(Some(auth_tx))),
+        },
+    });
+
+    assert!(state.ssh_ui().host_key_prompt_for_session(sid_a).is_some());
+    assert!(state.ssh_ui().host_key_prompt_for_session(sid_b).is_none());
+    assert!(state.ssh_ui().auth_prompt_for_session(sid_b).is_some());
+    assert!(state.ssh_ui().auth_prompt_for_session(sid_a).is_none());
+    assert!(state.ssh_ui().session_has_blocking_prompt(sid_a));
+    assert!(state.ssh_ui().session_has_blocking_prompt(sid_b));
+    assert!(!state.has_modal_open_in_window(win_a));
+    assert!(!state.has_modal_open_in_window(win_b));
+
+    let palette = ThemePalette::for_name("Tomorrow Night");
+    assert!(
+        state
+            .ssh_ui()
+            .view_tofu_modal_for_session(sid_a, 340.0, &palette)
+            .is_some()
+    );
+    assert!(
+        state
+            .ssh_ui()
+            .view_auth_prompt_for_session(sid_b, 340.0, &palette)
+            .is_some()
+    );
+    drop(state.view(win_a));
+    drop(state.view(win_b));
+}

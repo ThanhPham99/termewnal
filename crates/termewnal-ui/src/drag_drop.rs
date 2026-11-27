@@ -1106,7 +1106,6 @@ fn build_drag_badge<'a>(
                 .size(FONT_META)
                 .font(ui_font_semibold())
                 .color(chrome.text_primary),
-            text("·").size(FONT_META).color(chrome.text_muted),
             text(hint).size(FONT_META).color(chrome.text_secondary),
         ]
         .spacing(6)

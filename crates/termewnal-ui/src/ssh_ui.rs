@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use iced::futures::SinkExt;
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{Id, button, column, container, row, scrollable, text, text_input};
 use iced::{Alignment, Background, Border, Element, Length, Task, Theme};
 use termewnal_core::{
     AppConfig, OpenSshHost, Profile, ThemePalette, VaultSession, vault::SecretStore,
@@ -20,7 +20,15 @@ use tokio::sync::{mpsc, oneshot};
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::app::{Message, SessionId};
-use crate::ui_theme::{ChromePalette, PillTone, pill_button_style, status_dot, styled_input_style};
+use crate::ui_theme::{
+    ChromePalette, PillTone, pill_button_style, status_dot, styled_input_style,
+    tabby_scrollable_style,
+};
+
+/// Returns a deterministic widget focus [`Id`] for `session_id`'s SSH auth prompt field `index`.
+pub fn auth_prompt_input_id(session_id: SessionId, index: usize) -> Id {
+    Id::from(format!("ssh-auth-{}-{}", session_id.0, index))
+}
 
 /// Shared oneshot responder resolving a TOFU unknown-host prompt.
 pub type HostKeyResponder = Arc<Mutex<Option<oneshot::Sender<HostKeyDecision>>>>;
@@ -324,6 +332,28 @@ impl SshUiState {
         self.auth_queue.front().map(|entry| entry.session_id)
     }
 
+    /// Returns a pending TOFU host-key prompt owned specifically by `session_id`, if any.
+    pub fn host_key_prompt_for_session(&self, session_id: SessionId) -> Option<&HostKeyPrompt> {
+        self.host_key_queue
+            .iter()
+            .find(|entry| entry.session_id == session_id)
+            .map(|entry| &entry.prompt)
+    }
+
+    /// Returns a pending interactive auth prompt owned specifically by `session_id`, if any.
+    pub fn auth_prompt_for_session(&self, session_id: SessionId) -> Option<&SshAuthPrompt> {
+        self.auth_queue
+            .iter()
+            .find(|entry| entry.session_id == session_id)
+            .map(|entry| &entry.prompt)
+    }
+
+    /// Returns `true` when `session_id` has an active TOFU or interactive auth prompt blocking input.
+    pub fn session_has_blocking_prompt(&self, session_id: SessionId) -> bool {
+        self.host_key_prompt_for_session(session_id).is_some()
+            || self.auth_prompt_for_session(session_id).is_some()
+    }
+
     /// Returns the active MITM hard-block alert for `session_id`, if present.
     pub fn mitm_alert(&self, session_id: SessionId) -> Option<&MitmAlert> {
         self.mitm_alerts.get(&session_id)
@@ -471,48 +501,58 @@ impl SshUiState {
         if self.mitm_alerts.is_empty() {
             return None;
         }
-        let chrome = ChromePalette::from_palette(palette);
-
         let mut list = column![].spacing(6).width(Length::Fill);
-        for alert in self.mitm_alerts.values() {
-            let summary = format!(
-                "HOST KEY VERIFICATION FAILED (POSSIBLE MITM ATTACK) for {}:{} (known_hosts line {}, {}) — Expected {}, Received {}",
-                alert.host,
-                alert.port,
-                alert.line,
-                alert.key_type,
-                alert.expected_fingerprint,
-                alert.received_fingerprint
-            );
-            let banner = container(
-                row![
-                    status_dot(chrome.danger),
-                    text(summary).size(12).color(chrome.text_primary),
-                    button(text("Dismiss").size(11))
-                        .padding([4, 10])
-                        .style(pill_button_style(chrome, PillTone::Subtle))
-                        .on_press(Message::DismissMitmAlert(alert.session_id)),
-                ]
-                .spacing(10)
-                .wrap()
-                .vertical_spacing(6),
-            )
-            .width(Length::Fill)
-            .padding([8, 12])
-            .style(move |_| container::Style {
-                background: Some(Background::Color(chrome.danger_soft)),
-                border: Border {
-                    color: chrome.danger,
-                    width: 1.0,
-                    radius: 0.0.into(),
-                },
-                text_color: Some(chrome.text_primary),
-                ..Default::default()
-            });
-            list = list.push(banner);
+        for &sid in self.mitm_alerts.keys() {
+            if let Some(banner) = self.view_mitm_alert_for_session(sid, palette) {
+                list = list.push(banner);
+            }
         }
-
         Some(list.into())
+    }
+
+    /// Renders a MITM hard-block alert banner scoped specifically to `session_id`.
+    pub fn view_mitm_alert_for_session(
+        &self,
+        session_id: SessionId,
+        palette: &ThemePalette,
+    ) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
+        let alert = self.mitm_alerts.get(&session_id)?;
+        let chrome = ChromePalette::from_palette(palette);
+        let summary = format!(
+            "HOST KEY VERIFICATION FAILED (POSSIBLE MITM ATTACK) for {}:{} (known_hosts line {}, {}) — Expected {}, Received {}",
+            alert.host,
+            alert.port,
+            alert.line,
+            alert.key_type,
+            alert.expected_fingerprint,
+            alert.received_fingerprint
+        );
+        let banner = container(
+            row![
+                status_dot(chrome.danger),
+                text(summary).size(12).color(chrome.text_primary),
+                button(text("Dismiss").size(11))
+                    .padding([4, 10])
+                    .style(pill_button_style(chrome, PillTone::Subtle))
+                    .on_press(Message::DismissMitmAlert(alert.session_id)),
+            ]
+            .spacing(10)
+            .wrap()
+            .vertical_spacing(6),
+        )
+        .width(Length::Fill)
+        .padding([8, 12])
+        .style(move |_| container::Style {
+            background: Some(Background::Color(chrome.danger_soft)),
+            border: Border {
+                color: chrome.danger,
+                width: 1.0,
+                radius: 0.0.into(),
+            },
+            text_color: Some(chrome.text_primary),
+            ..Default::default()
+        });
+        Some(banner.into())
     }
 
     /// Renders the interactive Trust On First Use (TOFU) host key confirmation panel.
@@ -521,11 +561,28 @@ impl SshUiState {
         palette: &ThemePalette,
     ) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
         let entry = self.host_key_queue.front()?;
+        self.view_tofu_modal_for_session(entry.session_id, 560.0, palette)
+    }
+
+    /// Renders a scrollable TOFU host-key confirmation card scoped to `session_id` and clamped to `pane_avail_w`.
+    pub fn view_tofu_modal_for_session(
+        &self,
+        session_id: SessionId,
+        pane_avail_w: f32,
+        palette: &ThemePalette,
+    ) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
+        let entry = self
+            .host_key_queue
+            .iter()
+            .find(|entry| entry.session_id == session_id)?;
         let chrome = ChromePalette::from_palette(palette);
         let prompt = &entry.prompt;
         let sid = entry.session_id;
+        let card_w = (pane_avail_w - 16.0)
+            .clamp(200.0, 560.0)
+            .min(pane_avail_w.max(200.0));
 
-        let card = container(
+        let inner = scrollable(
             column![
                 row![
                     status_dot(chrome.warning),
@@ -563,18 +620,24 @@ impl SshUiState {
             ]
             .spacing(8),
         )
-        .width(Length::Fill)
-        .padding([10, 14])
-        .style(move |_| container::Style {
-            background: Some(Background::Color(chrome.panel_bg)),
-            border: Border {
-                color: chrome.accent,
-                width: 1.0,
-                radius: 0.0.into(),
-            },
-            text_color: Some(chrome.text_primary),
-            ..Default::default()
-        });
+        .height(Length::Shrink)
+        .style(tabby_scrollable_style(chrome));
+
+        let card = container(inner)
+            .id(Id::from(format!("ssh-tofu-card-{}", sid.0)))
+            .width(Length::Fixed(card_w))
+            .max_height(220.0)
+            .padding([10, 14])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(chrome.panel_bg)),
+                border: Border {
+                    color: chrome.accent,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                text_color: Some(chrome.text_primary),
+                ..Default::default()
+            });
 
         Some(card.into())
     }
@@ -585,8 +648,26 @@ impl SshUiState {
         palette: &ThemePalette,
     ) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
         let entry = self.auth_queue.front()?;
+        self.view_auth_prompt_for_session(entry.session_id, 560.0, palette)
+    }
+
+    /// Renders a scrollable interactive auth prompt card scoped to `session_id` and clamped to `pane_avail_w`.
+    pub fn view_auth_prompt_for_session(
+        &self,
+        session_id: SessionId,
+        pane_avail_w: f32,
+        palette: &ThemePalette,
+    ) -> Option<Element<'_, Message, Theme, iced::Renderer>> {
+        let entry = self
+            .auth_queue
+            .iter()
+            .find(|entry| entry.session_id == session_id)?;
         let chrome = ChromePalette::from_palette(palette);
         let sid = entry.session_id;
+        let card_w = (pane_avail_w - 16.0)
+            .clamp(220.0, 560.0)
+            .min(pane_avail_w.max(200.0));
+        let input_w = (card_w - 40.0).clamp(140.0, 260.0);
 
         let header = match &entry.prompt {
             SshAuthPrompt::Passphrase { key_path } => {
@@ -626,8 +707,9 @@ impl SshUiState {
                 .map(|z| z.as_str())
                 .unwrap_or_default();
             let input = text_input(item.prompt.trim(), val)
+                .id(auth_prompt_input_id(sid, idx))
                 .secure(!item.echo)
-                .width(Length::Fixed(240.0))
+                .width(Length::Fixed(input_w))
                 .size(12)
                 .padding([5, 8])
                 .style(styled_input_style(chrome))
@@ -666,20 +748,26 @@ impl SshUiState {
         );
 
         Some(
-            container(col)
-                .width(Length::Fill)
-                .padding([10, 14])
-                .style(move |_| container::Style {
-                    background: Some(Background::Color(chrome.panel_bg)),
-                    border: Border {
-                        color: chrome.accent,
-                        width: 1.0,
-                        radius: 0.0.into(),
-                    },
-                    text_color: Some(chrome.text_primary),
-                    ..Default::default()
-                })
-                .into(),
+            container(
+                scrollable(col)
+                    .height(Length::Shrink)
+                    .style(tabby_scrollable_style(chrome)),
+            )
+            .id(Id::from(format!("ssh-auth-card-{}", sid.0)))
+            .width(Length::Fixed(card_w))
+            .max_height(240.0)
+            .padding([10, 14])
+            .style(move |_| container::Style {
+                background: Some(Background::Color(chrome.panel_bg)),
+                border: Border {
+                    color: chrome.accent,
+                    width: 1.0,
+                    radius: 0.0.into(),
+                },
+                text_color: Some(chrome.text_primary),
+                ..Default::default()
+            })
+            .into(),
         )
     }
 

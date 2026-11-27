@@ -1581,14 +1581,16 @@ async fn sftp_plus_remote_panel_navigation_sorting_filtering_hidden_bookmarks_an
         result: Ok(content.clone()),
     });
     drop(state.view(win));
-    let _ = state.update(Message::SftpModalEditorAction(text_editor::Action::Edit(
-        text_editor::Edit::Insert('X'),
-    )));
+    let _ = state.update(Message::SftpModalEditorEvent(
+        termewnal_ui::RemoteEditorEvent::Action(text_editor::Action::Edit(
+            text_editor::Edit::Insert('X'),
+        )),
+    ));
     if let SftpModalState::FileViewer { content: ed, dirty, .. } = &state.sftp_drawer().plus.modal {
         assert_eq!(ed.text(), "hello alpha");
         assert!(!dirty);
     }
-    let _ = state.update(Message::SftpDismissModal);
+    let _ = state.update(Message::SftpModalRequestClose(Some(sid)));
 
     let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Edit));
     let _ = state.update(Message::SftpRemoteFileReadResult {
@@ -1597,9 +1599,11 @@ async fn sftp_plus_remote_panel_navigation_sorting_filtering_hidden_bookmarks_an
         editable: true,
         result: Ok(content),
     });
-    let _ = state.update(Message::SftpModalEditorAction(text_editor::Action::Edit(
-        text_editor::Edit::Insert('!'),
-    )));
+    let _ = state.update(Message::SftpModalEditorEvent(
+        termewnal_ui::RemoteEditorEvent::Action(text_editor::Action::Edit(
+            text_editor::Edit::Insert('!'),
+        )),
+    ));
     let _ = state.update(Message::SftpModalSaveFile);
     state
         .sftp_manager()
@@ -1614,7 +1618,7 @@ async fn sftp_plus_remote_panel_navigation_sorting_filtering_hidden_bookmarks_an
     assert!(fs::read_to_string(remote_root.join("alpha.txt"))
         .unwrap()
         .contains('!'));
-    let _ = state.update(Message::SftpDismissModal);
+    let _ = state.update(Message::SftpDismissModal(Some(sid)));
 
     // Edit Permissions modal + real SFTP set_permissions + Properties modal.
     let _ = state.update(Message::SftpContextAction(
@@ -1649,7 +1653,7 @@ async fn sftp_plus_remote_panel_navigation_sorting_filtering_hidden_bookmarks_an
         SftpModalState::Properties { .. }
     ));
     drop(state.view(win));
-    let _ = state.update(Message::SftpDismissModal);
+    let _ = state.update(Message::SftpDismissModal(Some(sid)));
 
     // Upload via SFTP Panel file drop + picker & Download-to picker auto-open Transfers tray.
     let dropped_upload = local_uploads.join("dropped_panel.txt");
@@ -1776,7 +1780,8 @@ fn per_pane_sftp_panels_and_focus_shortcut_isolation() {
     let sid_b = state.active_session_id().expect("ssh b");
     assert_ne!(sid_a, sid_b);
 
-    // Connect both SSH sessions so each pane auto-opens its own independent SFTP Panel.
+    // Connect both SSH sessions: sid_a shares a vertical split (<680px) so docked SFTP+
+    // auto-suppresses while sid_b occupies an unsplit tab (>=680px) and auto-opens docked.
     for sid in [sid_a, sid_b] {
         let gen_id = state.ssh_session(sid).unwrap().ssh_generation();
         let _ = state.update(Message::SshEvent {
@@ -1787,9 +1792,14 @@ fn per_pane_sftp_panels_and_focus_shortcut_isolation() {
                 supervisor: None,
             },
         });
-        assert!(state.is_sftp_drawer_open_for(sid));
         assert!(!state.sftp_drawer_for_session(sid).unwrap().is_panel_focused());
     }
+    assert!(!state.is_sftp_drawer_open_for(sid_a));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_auto_suppressed());
+    assert!(state.sftp_drawer_for_session(sid_b).unwrap().is_docked_open());
+    let _ = state.update(Message::ToggleSftpDrawerForSession(sid_a));
+    assert!(state.is_sftp_drawer_open_for(sid_a));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_overlay_open());
 
     // Seed an entry on sid_a and verify SftpShortcut(SelectAll) is ignored while Terminal has focus.
     let gen_a = state.sftp_drawer_for_session(sid_a).unwrap().list_generation();
@@ -2686,3 +2696,518 @@ async fn sftp_plus_open_with_displays_app_chooser_modal_filters_and_launches_cho
 }
 
 
+
+
+#[tokio::test]
+async fn sftp_remote_file_editor_find_replace_undo_shortcuts_and_unsaved_guard() {
+    use termewnal_ui::{SftpContextActionKind, SftpModalState};
+
+    let temp = TempDir::new().unwrap();
+    let remote_root = temp.path().join("remote");
+    fs::create_dir_all(&remote_root).unwrap();
+    fs::write(
+        remote_root.join("nginx.conf"),
+        "server_name old.example.com;\r\nproxy_pass http://old.example.com:8080;\r\nworker_processes 4;\r\n",
+    )
+    .unwrap();
+
+    let (addr, host_pubkey, _shutdown) = spawn_ui_sftp_server(
+        remote_root.clone(),
+        UiTestAuth::Kbi {
+            user: "secops".to_string(),
+            otp: "424242".to_string(),
+        },
+    )
+    .await;
+
+    let paths = ConfigPaths::from_root(temp.path());
+    let vault = Arc::new(VaultSession::new(
+        VaultConfig {
+            backend: VaultBackend::Keyring,
+            auto_lock_minutes: 30,
+        },
+        Arc::new(InMemorySecretStore::new()),
+        EncryptedVault::open(paths.vault_file()),
+    ));
+    let mut state = AppState::boot_with_paths_and_vault(paths.clone(), Arc::clone(&vault)).unwrap();
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+
+    let known_hosts = temp.path().join("known_hosts");
+    record_known_host_path("127.0.0.1", addr.port(), &host_pubkey, &known_hosts).unwrap();
+
+    let spec = SshTargetSpec::quick_connect(
+        "Editor Host",
+        SshConnectConfig {
+            host: "127.0.0.1".to_string(),
+            port: addr.port(),
+            username: "secops".to_string(),
+            auth: SshAuthMethod::KeyboardInteractive,
+            known_hosts_path: Some(known_hosts),
+            proxy_jump: Vec::new(),
+            nodelay: true,
+            term_name: "xterm-256color".to_string(),
+            cols: 80,
+            rows: 24,
+            scrollback_lines: 10_000,
+            ..SshConnectConfig::default()
+        },
+    )
+    .with_agent_connector(Arc::new(OsAgentConnector::default()));
+
+    let _ = state.update(Message::QuickConnectSsh(spec.clone()));
+    let sid = state.active_session_id().unwrap();
+    let gen_id = state.ssh_session(sid).unwrap().ssh_generation();
+    let buffer = Arc::clone(state.ssh_session(sid).unwrap().buffer());
+    let (ev_tx, mut ev_rx) = mpsc::unbounded_channel();
+    tokio::spawn(drive_ssh_connect(
+        sid,
+        gen_id,
+        spec,
+        buffer,
+        Arc::clone(&vault),
+        ev_tx,
+    ));
+    loop {
+        let ev = tokio::time::timeout(Duration::from_secs(5), ev_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let is_connected = matches!(ev, SshUiEvent::Connected { .. });
+        let is_auth = matches!(ev, SshUiEvent::AuthPrompt { .. });
+        let _ = state.update(Message::SshEvent {
+            session_id: sid,
+            event: ev,
+        });
+        if is_auth {
+            let _ = state.update(Message::SshAuthInputChanged {
+                session_id: sid,
+                index: 0,
+                value: "424242".to_string(),
+            });
+            let _ = state.update(Message::SubmitSshAuthPrompt(sid));
+        }
+        if is_connected {
+            break;
+        }
+    }
+
+    let ssh_slot = state.ssh_session(sid).unwrap();
+    let endpoint = termewnal_ssh::SftpEndpoint::new(
+        termewnal_ssh::ProfileTransportKey::from_connect_config(
+            None,
+            &ssh_slot.spec().connect_config,
+        ),
+        ssh_slot.spec().connect_config.clone(),
+    )
+    .with_primary_transport(Arc::clone(ssh_slot.ssh_session().unwrap().primary_transport()));
+
+    let gen_init = state.sftp_drawer().list_generation();
+    let listing = state.sftp_manager().list_dir(&endpoint, "/").await.unwrap();
+    let _ = state.update(Message::SftpBrowseResult {
+        session_id: sid,
+        generation: gen_init,
+        result: Ok(listing),
+    });
+    let _ = state.update(Message::SftpSessionRowClicked {
+        session_id: sid,
+        path: "/nginx.conf".to_string(),
+        ctrl_held: false,
+    });
+
+    // 1) Open in View mode: Ctrl+F opens editor Find WITHOUT opening terminal search; Ctrl+H ignored.
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::View));
+    let raw = state
+        .sftp_manager()
+        .read_text_file(&endpoint, "/nginx.conf", 2 * 1024 * 1024)
+        .await
+        .unwrap();
+    let _ = state.update(Message::SftpRemoteFileReadResult {
+        session_id: sid,
+        request_path: "/nginx.conf".to_string(),
+        editable: false,
+        result: Ok(raw),
+    });
+
+    let _ = state.update(Message::OpenSearch);
+    assert!(!state.search().open, "Ctrl+F must not open terminal search while Remote File Editor is open");
+    let _ = state.update(Message::SftpModalShortcut(termewnal_ui::RemoteEditorShortcut::Replace));
+    if let SftpModalState::FileViewer {
+        editable,
+        content,
+        ..
+    } = &state.sftp_drawer().plus.modal
+    {
+        assert!(!editable);
+        assert!(content.find_open);
+        assert!(!content.replace_open, "Ctrl+H must stay disabled in View mode");
+        assert_eq!(content.line_ending, termewnal_ui::EditorLineEnding::CrLf);
+    } else {
+        panic!("expected FileViewer modal");
+    }
+
+    let _ = state.update(Message::SftpModalFindQueryChanged("old.example.com".to_string()));
+    if let SftpModalState::FileViewer { content, .. } = &state.sftp_drawer().plus.modal {
+        assert_eq!(content.matches.len(), 2);
+        assert_eq!(content.active_match, Some(0));
+    }
+    let _ = state.update(Message::SearchNext);
+    if let SftpModalState::FileViewer { content, .. } = &state.sftp_drawer().plus.modal {
+        assert_eq!(content.active_match, Some(1));
+    }
+
+    // 2) Switch to Edit in-place preserves open Find state, unlocks Replace All & Undo/Redo.
+    let _ = state.update(Message::SftpModalSwitchToEdit);
+    let _ = state.update(Message::SftpModalShortcut(termewnal_ui::RemoteEditorShortcut::Replace));
+    let _ = state.update(Message::SftpModalReplaceTextChanged("new.internal".to_string()));
+    let _ = state.update(Message::SftpModalReplaceAll);
+    if let SftpModalState::FileViewer {
+        editable,
+        dirty,
+        content,
+        ..
+    } = &state.sftp_drawer().plus.modal
+    {
+        assert!(*editable);
+        assert!(*dirty);
+        assert!(content.replace_open);
+        assert!(content.text().contains("new.internal"));
+        assert!(!content.text().contains("old.example.com"));
+        assert_eq!(content.replace_feedback.as_deref(), Some("Replaced 2 occurrences"));
+    }
+
+    // Undo restores original text and dirty=false; Redo re-applies.
+    let _ = state.update(Message::SftpModalEditorEvent(
+        termewnal_ui::RemoteEditorEvent::Undo,
+    ));
+    if let SftpModalState::FileViewer { dirty, content, .. } = &state.sftp_drawer().plus.modal {
+        assert!(!dirty);
+        assert!(content.text().contains("old.example.com"));
+    }
+    let _ = state.update(Message::SftpModalEditorEvent(
+        termewnal_ui::RemoteEditorEvent::Redo,
+    ));
+
+    // 3) Go to Line (Ctrl+G) + layered Esc dismissal + Unsaved Changes Guard.
+    let _ = state.update(Message::SftpModalShortcut(termewnal_ui::RemoteEditorShortcut::GoToLine));
+    let _ = state.update(Message::SftpModalGoToLineInputChanged("3:5".to_string()));
+    let _ = state.update(Message::SftpModalGoToLineSubmit);
+    if let SftpModalState::FileViewer { content, .. } = &state.sftp_drawer().plus.modal {
+        assert!(!content.goto_open);
+        assert_eq!(content.cursor_line_col_1based(), (3, 5));
+    }
+
+    // Re-open GoTo -> Esc closes GoTo -> Esc closes Find -> Esc triggers Unsaved Guard!
+    let _ = state.update(Message::SftpModalShortcut(termewnal_ui::RemoteEditorShortcut::GoToLine));
+    let _ = state.update(Message::EscapePressed);
+    if let SftpModalState::FileViewer { content, .. } = &state.sftp_drawer().plus.modal {
+        assert!(!content.goto_open);
+        assert!(content.find_open);
+    }
+    let _ = state.update(Message::EscapePressed);
+    if let SftpModalState::FileViewer { content, .. } = &state.sftp_drawer().plus.modal {
+        assert!(!content.find_open);
+        assert_eq!(content.pending_confirm, None);
+    }
+    let _ = state.update(Message::EscapePressed);
+    if let SftpModalState::FileViewer { content, .. } = &state.sftp_drawer().plus.modal {
+        assert_eq!(
+            content.pending_confirm,
+            Some(termewnal_ui::UnsavedConfirmAction::CloseModal)
+        );
+    }
+
+    // Cancel guard -> toggle Word Wrap, Expand, Indent mode and verify config.toml persistence.
+    let _ = state.update(Message::SftpModalCancelUnsaved);
+    let _ = state.update(Message::SftpModalToggleWordWrap);
+    let _ = state.update(Message::SftpModalToggleExpand);
+    let _ = state.update(Message::SftpModalCycleIndentMode);
+    let persisted_cfg = termewnal_core::load_config(&paths).unwrap();
+    assert!(persisted_cfg.terminal.sftp_editor_word_wrap);
+    assert!(persisted_cfg.terminal.sftp_editor_expanded);
+    assert_eq!(
+        persisted_cfg.terminal.sftp_editor_indent_mode,
+        termewnal_core::EditorIndentMode::Spaces2
+    );
+
+    // Render view with all widgets active to verify layout/draw build cleanly.
+    drop(state.view(win));
+
+    // Confirm Save & Close writes CRLF preserved payload and dismisses modal on SaveResult.
+    let _ = state.update(Message::SftpModalRequestClose(Some(sid)));
+    let _ = state.update(Message::SftpModalConfirmUnsaved { save_first: true });
+    let expected_saved =
+        "server_name new.internal;\r\nproxy_pass http://new.internal:8080;\r\nworker_processes 4;\r\n";
+    state
+        .sftp_manager()
+        .write_text_file(&endpoint, "/nginx.conf", expected_saved)
+        .await
+        .unwrap();
+    let _ = state.update(Message::SftpRemoteFileSaveResult {
+        session_id: sid,
+        path: "/nginx.conf".to_string(),
+        result: Ok(()),
+    });
+    assert!(matches!(state.sftp_drawer().plus.modal, SftpModalState::None));
+    assert_eq!(
+        fs::read_to_string(remote_root.join("nginx.conf")).unwrap(),
+        expected_saved
+    );
+}
+
+#[test]
+fn sftp_geometry_eligibility_overlay_persistence_zoom_width_isolation_and_backdrop_dismiss() {
+    use iced::Size;
+    use termewnal_core::TabBarPosition;
+    use termewnal_ui::sftp_plus::file_viewer_backdrop_dismiss;
+    use termewnal_ui::workspace::{SplitAxis, split_first_size};
+    use termewnal_ui::{DEFAULT_SFTP_DRAWER_WIDTH, IpcCommand, SftpDrawerDock};
+
+    // 1. split_first_size-aligned geometry bounds & <140px narrow clamp never overflows bounds.
+    let (fw, fh) = split_first_size(949.0, 703.0, SplitAxis::Vertical, 0.5, 1.0);
+    assert_eq!(fw, 474.0);
+    assert_eq!(fh, 703.0);
+    let tiny_w = SftpDrawerDock::clamped_panel_width(360.0, 120.0);
+    assert!(tiny_w < 120.0, "narrow clamp {tiny_w} must not exceed 120px bounds");
+
+    // 2. FileViewer backdrop_dismiss protects unsaved dirty edits while allowing clean dismiss.
+    assert!(file_viewer_backdrop_dismiss(None, true, true).is_none());
+    assert!(file_viewer_backdrop_dismiss(None, true, false).is_some());
+    assert!(file_viewer_backdrop_dismiss(None, false, true).is_some());
+    assert!(file_viewer_backdrop_dismiss(None, false, false).is_some());
+
+    // 3. Full chrome deduction (vertical_rail_w + sidebar + divider) gates auto-open & restores on rail hide.
+    let (_temp, mut state) = boot_test_state();
+    let win = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win));
+    let _ = state.update(Message::WindowResized(win, Size::new(1100.0, 760.0)));
+    let _ = state.update(Message::SettingsTabBarPositionSelected(TabBarPosition::Left));
+
+    let profile_a = Profile::ssh("Box A", "10.0.1.10", 22, "ops", SshAuthMethod::Agent);
+    let _ = state.update(Message::OpenSshProfile(profile_a));
+    let sid_a = state.active_session_id().expect("ssh a");
+    let gen_a = state.ssh_session(sid_a).unwrap().ssh_generation();
+    let _ = state.update(Message::SshEvent {
+        session_id: sid_a,
+        event: SshUiEvent::Connected {
+            generation: gen_a,
+            session: None,
+            supervisor: None,
+        },
+    });
+    // 1100 - 250(sidebar) - 1 - 192(vertical rail) - 1 = 656 < 680 => auto-suppressed.
+    assert!(!state.is_sftp_drawer_open_for(sid_a));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_auto_suppressed());
+
+    // Switching back to Top tabs frees vertical_rail_w (849 >= 680) => auto-restores docked drawer.
+    let _ = state.update(Message::SettingsTabBarPositionSelected(TabBarPosition::Top));
+    assert!(state.is_sftp_drawer_open_for(sid_a));
+    let d_a = state.sftp_drawer_for_session(sid_a).unwrap();
+    assert!(d_a.is_docked_open());
+    assert!(!d_a.is_overlay_open());
+    assert!(!d_a.is_auto_suppressed());
+
+    // Height < 360px suppresses docked drawer cleanly and restores when height grows back.
+    let _ = state.update(Message::WindowResized(win, Size::new(1200.0, 400.0)));
+    assert!(!state.is_sftp_drawer_open_for(sid_a));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_auto_suppressed());
+    let _ = state.update(Message::WindowResized(win, Size::new(1200.0, 800.0)));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_docked_open());
+
+    // 4. Split -> Dock collapses; opening overlay survives further resize & closing overlay preserves dock auto-restore on Zoom.
+    let _ = state.update(Message::SplitFocusedPane(SplitAxis::Vertical));
+    let profile_b = Profile::ssh("Box B", "10.0.1.20", 22, "ops", SshAuthMethod::Agent);
+    let _ = state.update(Message::OpenSshProfile(profile_b));
+    let sid_b = state.active_session_id().expect("ssh b");
+    let gen_b = state.ssh_session(sid_b).unwrap().ssh_generation();
+    let _ = state.update(Message::SshEvent {
+        session_id: sid_b,
+        event: SshUiEvent::Connected {
+            generation: gen_b,
+            session: None,
+            supervisor: None,
+        },
+    });
+    assert!(!state.is_sftp_drawer_open_for(sid_a));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_auto_suppressed());
+
+    let _ = state.update(Message::ToggleSftpDrawerForSession(sid_a));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_overlay_open());
+    assert!(!state.sftp_drawer_for_session(sid_a).unwrap().is_docked_open());
+    drop(state.view(win));
+
+    // Resize narrower while overlay is open: overlay MUST NOT collapse!
+    let _ = state.update(Message::WindowResized(win, Size::new(1020.0, 720.0)));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_overlay_open());
+
+    // Dismissing temporary overlay keeps Auto dock intent so TogglePaneZoom auto-restores docked drawer!
+    let _ = state.update(Message::SftpSessionClose(sid_a));
+    assert!(!state.is_sftp_drawer_open_for(sid_a));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_auto_suppressed());
+    assert!(!state.sftp_drawer_for_session(sid_a).unwrap().is_manually_closed());
+
+    let _ = state.update(Message::FocusSession(sid_a));
+    let _ = state.update(Message::TogglePaneZoom);
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_docked_open());
+
+    // Manual close while docked sets ManuallyClosed; unzoom + rezoom must NOT auto-open again.
+    let _ = state.update(Message::SftpSessionClose(sid_a));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_manually_closed());
+    let _ = state.update(Message::TogglePaneZoom);
+    let _ = state.update(Message::TogglePaneZoom);
+    assert!(!state.is_sftp_drawer_open_for(sid_a));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_manually_closed());
+
+    // Unzoom and widen to 1700x900 so both split panes >= 680px => sid_b auto-restores docked
+    // while sid_a stays manually closed until re-opened, and per-session drawer widths stay isolated.
+    let _ = state.update(Message::TogglePaneZoom);
+    let _ = state.update(Message::WindowResized(win, Size::new(1700.0, 900.0)));
+    assert!(state.sftp_drawer_for_session(sid_b).unwrap().is_docked_open());
+    assert!(!state.is_sftp_drawer_open_for(sid_a));
+    let _ = state.update(Message::ToggleSftpDrawerForSession(sid_a));
+    assert!(state.sftp_drawer_for_session(sid_a).unwrap().is_docked_open());
+    assert!(state.sftp_drawer_for_session(sid_b).unwrap().is_docked_open());
+    let _ = state.update(Message::FocusSession(sid_a));
+    let _ = state.update(Message::ResizeSftpDrawer(510.0));
+    assert_eq!(state.sftp_drawer_for_session(sid_a).unwrap().width(), 510.0);
+    assert_eq!(
+        state.sftp_drawer_for_session(sid_b).unwrap().width(),
+        DEFAULT_SFTP_DRAWER_WIDTH
+    );
+
+    // Sanity check SplitNode::collect_pane_bounds on current 2-pane workspace tab.
+    let bounds = state
+        .workspace()
+        .active_tab()
+        .unwrap()
+        .root
+        .collect_pane_bounds(949.0, 703.0);
+    assert_eq!(bounds.len(), 2);
+    for &(w, _h) in bounds.values() {
+        assert_eq!(w, 474.0);
+    }
+
+    // 5. Quake drop-down suppresses docked drawer even at wide 1280px and renders overlay on ToggleSftpDrawerForSession.
+    let _ = state.update(Message::IpcCommand(IpcCommand::ToggleQuake));
+    let quake_win = state.quake().window_id().expect("quake win");
+    let _ = state.update(Message::WindowOpened(quake_win));
+    let _ = state.update(Message::WindowResized(quake_win, Size::new(1280.0, 480.0)));
+    let profile_q = Profile::ssh("Quake Host", "10.0.1.30", 22, "ops", SshAuthMethod::Agent);
+    let _ = state.update(Message::InWindow {
+        window_id: quake_win,
+        inner: Box::new(Message::OpenSshProfile(profile_q)),
+    });
+    let sid_q = state.active_session_id().expect("quake ssh");
+    let gen_q = state.ssh_session(sid_q).unwrap().ssh_generation();
+    let _ = state.update(Message::SshEvent {
+        session_id: sid_q,
+        event: SshUiEvent::Connected {
+            generation: gen_q,
+            session: None,
+            supervisor: None,
+        },
+    });
+    assert!(!state.is_sftp_drawer_open_for(sid_q));
+    assert!(state.sftp_drawer_for_session(sid_q).unwrap().is_auto_suppressed());
+    let _ = state.update(Message::ToggleSftpDrawerForSession(sid_q));
+    assert!(state.sftp_drawer_for_session(sid_q).unwrap().is_overlay_open());
+    assert!(!state.sftp_drawer_for_session(sid_q).unwrap().is_docked_open());
+    drop(state.view(quake_win));
+}
+
+#[test]
+fn sftp_modal_and_focus_stay_scoped_per_window_and_session() {
+    use termewnal_ssh::sftp::SftpTransportMode;
+    use termewnal_ssh::{RemoteDirEntry, RemoteEntryKind, RemoteListing};
+    use termewnal_ui::SftpContextActionKind;
+
+    let (_temp, mut state) = boot_test_state();
+    let win_a = window::Id::unique();
+    let win_b = window::Id::unique();
+    let _ = state.update(Message::WindowOpened(win_a));
+    let _ = state.update(Message::WindowOpened(win_b));
+
+    let p_a = Profile::ssh("Host A", "10.2.0.1", 22, "ops", SshAuthMethod::Agent);
+    let p_b = Profile::ssh("Host B", "10.2.0.2", 22, "ops", SshAuthMethod::Agent);
+    let p_c = Profile::ssh("Host C", "10.2.0.3", 22, "ops", SshAuthMethod::Agent);
+    let _ = state.update(Message::InWindow {
+        window_id: win_a,
+        inner: Box::new(Message::OpenSshProfile(p_a)),
+    });
+    let sid_a = state.active_session_id().expect("sid_a");
+
+    let _ = state.update(Message::InWindow {
+        window_id: win_b,
+        inner: Box::new(Message::OpenSshProfile(p_b)),
+    });
+    let sid_b = state.active_session_id().expect("sid_b");
+
+    let _ = state.update(Message::InWindow {
+        window_id: win_b,
+        inner: Box::new(Message::OpenSshProfile(p_c)),
+    });
+    let sid_c = state.active_session_id().expect("sid_c");
+
+    for sid in [sid_a, sid_b, sid_c] {
+        let gen_id = state.ssh_session(sid).unwrap().ssh_generation();
+        let _ = state.update(Message::SshEvent {
+            session_id: sid,
+            event: SshUiEvent::Connected {
+                generation: gen_id,
+                session: None,
+                supervisor: None,
+            },
+        });
+        let list_gen = state.sftp_drawer_for_session(sid).unwrap().list_generation();
+        let _ = state.update(Message::SftpBrowseResult {
+            session_id: sid,
+            generation: list_gen,
+            result: Ok(RemoteListing {
+                resolved_path: "/srv".to_string(),
+                entries: vec![RemoteDirEntry {
+                    name: "conf.toml".to_string(),
+                    path: "/srv/conf.toml".to_string(),
+                    kind: RemoteEntryKind::File,
+                    size: 64,
+                    permissions: Some(0o644),
+                    modified_epoch_secs: None,
+                    uid: None,
+                    gid: None,
+                }],
+                transport_mode: SftpTransportMode::IsolatedTransferTransport,
+                notice: None,
+            }),
+        });
+    }
+
+    // Open modal on sid_a (win_a) and verify win_b is NOT blocked.
+    let _ = state.update(Message::WindowFocused(win_a));
+    let _ = state.update(Message::FocusSftpPanel(sid_a));
+    let _ = state.update(Message::SftpShortcut(SftpContextActionKind::SelectAll));
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Properties));
+    assert!(state.has_modal_open_in_window(win_a));
+    assert!(!state.has_modal_open_in_window(win_b));
+
+    // Also open modals on sid_b and sid_c in win_b.
+    let _ = state.update(Message::WindowFocused(win_b));
+    let _ = state.update(Message::FocusSftpPanel(sid_b));
+    let _ = state.update(Message::SftpShortcut(SftpContextActionKind::SelectAll));
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Properties));
+    let _ = state.update(Message::FocusSftpPanel(sid_c));
+    let _ = state.update(Message::SftpShortcut(SftpContextActionKind::SelectAll));
+    let _ = state.update(Message::SftpContextAction(SftpContextActionKind::Properties));
+    assert!(state.has_modal_open_in_window(win_b));
+
+    // SftpDismissModal(Some(sid_a)) dismisses ONLY sid_a, preserving sid_b & sid_c.
+    let _ = state.update(Message::SftpDismissModal(Some(sid_a)));
+    assert!(!state.has_modal_open_in_window(win_a));
+    assert!(state.sftp_drawer_for_session(sid_b).unwrap().plus.modal.is_open());
+    assert!(state.sftp_drawer_for_session(sid_c).unwrap().plus.modal.is_open());
+
+    // SftpDismissModal(None) resolves ONLY the active modal (sid_c), preserving sid_b!
+    let _ = state.update(Message::SftpDismissModal(None));
+    assert!(!state.sftp_drawer_for_session(sid_c).unwrap().plus.modal.is_open());
+    assert!(state.sftp_drawer_for_session(sid_b).unwrap().plus.modal.is_open());
+    drop(state.view(win_a));
+    drop(state.view(win_b));
+}

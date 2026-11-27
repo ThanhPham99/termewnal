@@ -485,3 +485,136 @@ fn file_dropped_inserts_shell_escaped_path_and_classifies_sftp_routing() {
         }));
     }
 }
+
+#[test]
+fn selection_extend_auto_scroll_clear_on_input_word_separators_and_copy_badge_work() {
+    let (_temp, mut state) = boot_fast_test_state();
+    let session_id = state.active_session_id().expect("active session");
+    let _ = state.update(Message::ViewportResized {
+        session_id,
+        cols: 40,
+        rows: 5,
+    });
+
+    let pty = state.session(session_id).unwrap().pty().clone();
+    let mut payload = Vec::new();
+    for i in 0..12 {
+        payload.extend_from_slice(format!("ROW_{i:02} alpha-beta gamma\r\n").as_bytes());
+    }
+    payload.extend_from_slice(b"BOTTOM_LINE alpha-beta");
+    pty.buffer().feed_bytes(&payload);
+    let _ = state.update(Message::PtyEvent {
+        session_id,
+        event: PtyEvent::Output,
+    });
+
+    // 1. Drag to select "alpha", Shift+Click (SelectionExtend) to "alpha-beta", CopySelection shows badge.
+    let _ = state.update(Message::SelectionStart {
+        session_id,
+        col: 12,
+        row: 4,
+        side: Side::Left,
+        selection_type: SelectionType::Simple,
+    });
+    let _ = state.update(Message::SelectionUpdate {
+        session_id,
+        col: 16,
+        row: 4,
+        side: Side::Right,
+    });
+    assert_eq!(pty.selection_text().as_deref(), Some("alpha"));
+    let _ = state.update(Message::SelectionExtend {
+        session_id,
+        col: 21,
+        row: 4,
+        side: Side::Right,
+    });
+    assert_eq!(
+        pty.selection_text().as_deref(),
+        Some("alpha-beta")
+    );
+    assert!(!state.is_copy_feedback_visible(session_id));
+    let _ = state.update(Message::CopySelection { session_id });
+    assert_eq!(state.last_copied_text(), Some("alpha-beta"));
+    assert!(state.is_copy_feedback_visible(session_id));
+
+    // 2. Typing (TerminalInput) automatically clears active selection.
+    let _ = state.update(Message::TerminalInput {
+        session_id,
+        bytes: b"a".to_vec(),
+    });
+    assert_eq!(pty.selection_text(), None);
+    assert!(state.session(session_id).unwrap().snapshot().selection.is_none());
+
+    // 3. Pasting (PasteText) automatically clears active selection too.
+    let _ = state.update(Message::SelectionStart {
+        session_id,
+        col: 0,
+        row: 4,
+        side: Side::Left,
+        selection_type: SelectionType::Simple,
+    });
+    let _ = state.update(Message::SelectionUpdate {
+        session_id,
+        col: 10,
+        row: 4,
+        side: Side::Right,
+    });
+    assert!(state.session(session_id).unwrap().snapshot().selection.is_some());
+    let _ = state.update(Message::PasteText {
+        session_id,
+        text: "ok".to_string(),
+    });
+    assert!(state.session(session_id).unwrap().snapshot().selection.is_none());
+
+    // 4. Out-of-bounds drag auto-scrolls up into scrollback and updates selection endpoint.
+    let _ = state.update(Message::SelectionStart {
+        session_id,
+        col: 0,
+        row: 4,
+        side: Side::Left,
+        selection_type: SelectionType::Simple,
+    });
+    let _ = state.update(Message::SelectionDragScroll {
+        session_id,
+        col: 5,
+        row: 0,
+        side: Side::Right,
+        delta_lines: 3,
+    });
+    let _ = state.update(Message::SelectionAutoScrollTick);
+    let scrolled_snap = state.session(session_id).unwrap().snapshot().clone();
+    assert!(scrolled_snap.display_offset >= 3);
+    assert!(scrolled_snap.selection.is_some());
+    let _ = state.update(Message::SelectionFinish { session_id });
+    // After finish, further ticks do not scroll because drag scroll state was cleared.
+    let offset_after_finish = state.session(session_id).unwrap().snapshot().display_offset;
+    let _ = state.update(Message::SelectionAutoScrollTick);
+    assert_eq!(
+        state.session(session_id).unwrap().snapshot().display_offset,
+        offset_after_finish
+    );
+
+    // 5. word_separators in TerminalConfig propagates live to active session.
+    let _ = state.update(Message::ScrollToBottom(session_id));
+    let mut cfg = state.config().terminal.clone();
+    cfg.word_separators = " ".to_string();
+    let _ = state.update(Message::ApplyTerminalConfig(cfg));
+    let bottom_snap = state.session(session_id).unwrap().snapshot().clone();
+    let row11 = (0..bottom_snap.rows as usize)
+        .find(|&r| bottom_snap.row_text(r).contains("ROW_11 alpha-beta"))
+        .expect("find ROW_11 row");
+    let word_col = bottom_snap
+        .row_text(row11)
+        .find("alpha-beta")
+        .expect("find alpha-beta col")
+        + 1;
+    let _ = state.update(Message::SelectionStart {
+        session_id,
+        col: word_col,
+        row: row11,
+        side: Side::Left,
+        selection_type: SelectionType::Semantic,
+    });
+    assert_eq!(pty.selection_text().as_deref(), Some("alpha-beta"));
+}

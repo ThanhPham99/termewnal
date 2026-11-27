@@ -72,6 +72,7 @@ pub struct TerminalBuffer {
     logger: Mutex<Option<SessionLogger>>,
     output_interceptor: Mutex<Option<OutputInterceptor>>,
     dimensions: Mutex<TermDimensions>,
+    word_separators: Mutex<String>,
     write_sink: SharedWriter,
     update_signal: Arc<(Mutex<(u64, bool, Option<i32>)>, Condvar)>,
     async_notify: Arc<Notify>,
@@ -104,6 +105,25 @@ impl TerminalBuffer {
         cursor_shape: CursorShape,
         cursor_blink: bool,
     ) -> Self {
+        Self::new_with_full_options(
+            cols,
+            rows,
+            scrollback_lines,
+            cursor_shape,
+            cursor_blink,
+            None,
+        )
+    }
+
+    /// Creates a new [`TerminalBuffer`] with explicit cursor options and semantic `word_separators`.
+    pub fn new_with_full_options(
+        cols: u16,
+        rows: u16,
+        scrollback_lines: usize,
+        cursor_shape: CursorShape,
+        cursor_blink: bool,
+        word_separators: Option<&str>,
+    ) -> Self {
         let dims = TermDimensions::new(cols, rows);
         let (events_tx, events_rx) = mpsc::unbounded_channel();
         let write_sink: SharedWriter = Arc::new(Mutex::new(None));
@@ -111,13 +131,18 @@ impl TerminalBuffer {
             events_tx: events_tx.clone(),
             write_sink: Arc::clone(&write_sink),
         };
+        let default_cfg = TermConfig::default();
+        let resolved_separators = word_separators
+            .map(str::to_string)
+            .unwrap_or_else(|| default_cfg.semantic_escape_chars.clone());
         let term_config = TermConfig {
             scrolling_history: scrollback_lines,
             default_cursor_style: VteCursorStyle {
                 shape: cursor_shape,
                 blinking: cursor_blink,
             },
-            ..TermConfig::default()
+            semantic_escape_chars: resolved_separators.clone(),
+            ..default_cfg
         };
 
         Self {
@@ -128,6 +153,7 @@ impl TerminalBuffer {
             logger: Mutex::new(None),
             output_interceptor: Mutex::new(None),
             dimensions: Mutex::new(dims),
+            word_separators: Mutex::new(resolved_separators),
             write_sink,
             update_signal: Arc::new((Mutex::new((0_u64, false, None)), Condvar::new())),
             async_notify: Arc::new(Notify::new()),
@@ -393,6 +419,27 @@ impl TerminalBuffer {
         cursor_shape: CursorShape,
         cursor_blink: bool,
     ) {
+        self.apply_options_full(scrollback_lines, cursor_shape, cursor_blink, None);
+    }
+
+    /// Applies updated scrollback capacity, cursor options, and optional `word_separators`.
+    pub fn apply_options_full(
+        &self,
+        scrollback_lines: usize,
+        cursor_shape: CursorShape,
+        cursor_blink: bool,
+        word_separators: Option<&str>,
+    ) {
+        let resolved_separators = {
+            let mut guard = self
+                .word_separators
+                .lock()
+                .expect("word_separators mutex poisoned");
+            if let Some(ws) = word_separators {
+                *guard = ws.to_string();
+            }
+            guard.clone()
+        };
         let mut term = self.term.lock().expect("term mutex poisoned");
         term.set_options(TermConfig {
             scrolling_history: scrollback_lines,
@@ -400,6 +447,7 @@ impl TerminalBuffer {
                 shape: cursor_shape,
                 blinking: cursor_blink,
             },
+            semantic_escape_chars: resolved_separators,
             ..TermConfig::default()
         });
     }
@@ -455,6 +503,50 @@ impl TerminalBuffer {
         if let Some(sel) = term.selection.as_mut() {
             sel.update(point, side);
         }
+    }
+
+    /// Extends the active selection to viewport `(col, row)` from its farther anchor,
+    /// or starts a fresh `Simple` selection when no selection is currently active.
+    pub fn extend_or_start_selection(&self, col: usize, row: usize, side: Side) {
+        let mut term = self.term.lock().expect("term mutex poisoned");
+        let point = clamp_viewport_point(&term, col, row);
+        let existing = term
+            .selection
+            .as_ref()
+            .filter(|sel| !sel.is_empty())
+            .and_then(|sel| sel.to_range(&term).map(|range| (sel.ty, range)));
+
+        let Some((ty, range)) = existing else {
+            term.selection = Some(Selection::new(SelectionType::Simple, point, side));
+            return;
+        };
+
+        let (anchor_point, anchor_side) = match ty {
+            SelectionType::Block => {
+                let anchor_line = if point.line < range.start.line {
+                    range.end.line
+                } else {
+                    range.start.line
+                };
+                let (anchor_col, a_side) = if point.column < range.start.column {
+                    (range.end.column, Side::Right)
+                } else {
+                    (range.start.column, Side::Left)
+                };
+                (GridPoint::new(anchor_line, anchor_col), a_side)
+            }
+            SelectionType::Simple | SelectionType::Semantic | SelectionType::Lines => {
+                if point < range.start {
+                    (range.end, Side::Right)
+                } else {
+                    (range.start, Side::Left)
+                }
+            }
+        };
+
+        let mut sel = Selection::new(ty, anchor_point, anchor_side);
+        sel.update(point, side);
+        term.selection = Some(sel);
     }
 
     /// Finalizes the active selection, clearing degenerate click-only selections and returning text.
@@ -560,6 +652,9 @@ pub fn snapshot_from_term<L: EventListener>(term: &Term<L>, dims: TermDimensions
         end_col: sel.end.column.0,
         is_block: sel.is_block,
     });
+    let selection_type = selection
+        .as_ref()
+        .and_then(|_| term.selection.as_ref().map(|sel| sel.ty));
 
     let cols = dims.cols as usize;
     let rows = dims.rows as usize;
@@ -601,6 +696,7 @@ pub fn snapshot_from_term<L: EventListener>(term: &Term<L>, dims: TermDimensions
         history_size,
         top_line: -(display_offset as i32),
         selection,
+        selection_type,
         bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
         mouse_mode: mode.intersects(TermMode::MOUSE_MODE),
         mouse_sgr: mode.contains(TermMode::SGR_MOUSE),

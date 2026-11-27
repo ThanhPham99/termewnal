@@ -394,3 +394,36 @@ fn layout_widths_and_sftp_defaults_round_trip_with_legacy_config_compat() {
         Some(temp.path().join("custom-dl"))
     );
 }
+
+#[test]
+fn sftp_remote_editor_prefs_default_and_round_trip_with_legacy_compat() {
+    let temp = TempDir::new().expect("create temp root");
+    let paths = ConfigPaths::from_root(temp.path());
+    std::fs::create_dir_all(paths.config_dir()).expect("create config dir");
+    std::fs::write(
+        paths.config_file(),
+        "schema_version = 1\n\n[terminal]\nfont_size = 14.0\n",
+    )
+    .expect("write legacy config");
+
+    let mut cfg = load_config(&paths).expect("load legacy config");
+    assert!(!cfg.terminal.sftp_editor_word_wrap);
+    assert!(!cfg.terminal.sftp_editor_expanded);
+    assert_eq!(
+        cfg.terminal.sftp_editor_indent_mode,
+        termewnal_core::EditorIndentMode::Spaces4
+    );
+
+    cfg.terminal.sftp_editor_word_wrap = true;
+    cfg.terminal.sftp_editor_expanded = true;
+    cfg.terminal.sftp_editor_indent_mode = termewnal_core::EditorIndentMode::Tab;
+    save_config(&paths, &cfg).expect("save editor prefs");
+
+    let reloaded = load_config(&paths).expect("reload editor prefs");
+    assert!(reloaded.terminal.sftp_editor_word_wrap);
+    assert!(reloaded.terminal.sftp_editor_expanded);
+    assert_eq!(
+        reloaded.terminal.sftp_editor_indent_mode,
+        termewnal_core::EditorIndentMode::Tab
+    );
+}

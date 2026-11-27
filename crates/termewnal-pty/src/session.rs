@@ -29,6 +29,7 @@ pub struct PtySpawnConfig {
     pub cursor_shape: CursorShape,
     pub cursor_blink: bool,
     pub working_dir: Option<PathBuf>,
+    pub word_separators: Option<String>,
 }
 
 impl Default for PtySpawnConfig {
@@ -41,6 +42,7 @@ impl Default for PtySpawnConfig {
             cursor_shape: CursorShape::Block,
             cursor_blink: false,
             working_dir: None,
+            word_separators: None,
         }
     }
 }
@@ -156,6 +158,7 @@ pub struct TerminalSnapshot {
     pub history_size: usize,
     pub top_line: i32,
     pub selection: Option<GridRange>,
+    pub selection_type: Option<SelectionType>,
     pub bracketed_paste: bool,
     pub mouse_mode: bool,
     pub mouse_sgr: bool,
@@ -190,6 +193,68 @@ impl TerminalSnapshot {
         self.cell(col, row)
             .is_some_and(|cell| cell.flags.contains(CellFlags::WIDE_CHAR))
             && sel.contains(line, col + 1)
+    }
+
+    /// Returns the inclusive rightmost visual highlight column for multi-line/`Lines` selections on `row`.
+    ///
+    /// Non-empty rows extend to `(last_non_space_col + 1)` clamped to `cols - 1` (representing the
+    /// trailing newline cell), soft-wrapped rows extend to `cols - 1`, and blank rows highlight col `0`.
+    pub fn row_visual_selection_end_col(&self, row: usize) -> usize {
+        if row >= self.rows as usize || self.cols == 0 {
+            return 0;
+        }
+        let cols = self.cols as usize;
+        if self
+            .cell(cols - 1, row)
+            .is_some_and(|cell| cell.flags.contains(CellFlags::WRAPLINE))
+        {
+            return cols - 1;
+        }
+        let start = row * cols;
+        let mut last_non_space = None;
+        for col in 0..cols {
+            let cell = &self.cells[start + col];
+            if cell.flags.contains(CellFlags::WIDE_CHAR_SPACER) {
+                if last_non_space == col.checked_sub(1) {
+                    last_non_space = Some(col);
+                }
+            } else if !cell.flags.contains(CellFlags::LEADING_WIDE_CHAR_SPACER)
+                && cell.c != ' '
+                && cell.c != '\0'
+            {
+                last_non_space = Some(col);
+            }
+        }
+        match last_non_space {
+            Some(c) => (c + 1).min(cols - 1),
+            None => 0,
+        }
+    }
+
+    /// Returns `true` when `(col, row)` should be highlighted visually for the active selection.
+    ///
+    /// Single-line `Simple` and rectangular `Block` selections highlight exact grid bounds, while
+    /// multi-line `Simple`, `Lines`, and multi-line `Semantic` selections clamp trailing blank screen
+    /// padding on each row to [`Self::row_visual_selection_end_col`].
+    pub fn is_cell_visually_selected(&self, col: usize, row: usize) -> bool {
+        let Some(sel) = self.selection else {
+            return false;
+        };
+        if !self.is_cell_selected(col, row) {
+            return false;
+        }
+        if sel.is_block
+            || (self.selection_type == Some(SelectionType::Simple)
+                && sel.start_line == sel.end_line)
+        {
+            return true;
+        }
+        let max_col = self.row_visual_selection_end_col(row);
+        if col <= max_col {
+            return true;
+        }
+        let (line, _) = self.viewport_to_grid(col, row);
+        line == sel.start_line && col == sel.start_col
     }
 
     /// Returns the cell at `(col, row)` if within visible viewport bounds.
@@ -305,12 +370,13 @@ impl PtySession {
 
         let writer: Arc<Mutex<Option<Box<dyn Write + Send>>>> =
             Arc::new(Mutex::new(Some(raw_writer)));
-        let buffer = Arc::new(TerminalBuffer::new_with_options(
+        let buffer = Arc::new(TerminalBuffer::new_with_full_options(
             dims.cols,
             dims.rows,
             config.scrollback_lines,
             config.cursor_shape,
             config.cursor_blink,
+            config.word_separators.as_deref(),
         ));
         buffer.set_write_sink(Some(Box::new(SharedPtyWriter(Arc::clone(&writer)))));
         let last_working_dir = Arc::new(Mutex::new(config.working_dir.clone()));
@@ -468,6 +534,18 @@ impl PtySession {
         self.buffer.apply_options(scrollback_lines, cursor_shape);
     }
 
+    /// Applies updated scrollback capacity, cursor style, blink flag, and semantic word separators.
+    pub fn apply_options_full(
+        &self,
+        scrollback_lines: usize,
+        cursor_shape: CursorShape,
+        cursor_blink: bool,
+        word_separators: Option<&str>,
+    ) {
+        self.buffer
+            .apply_options_full(scrollback_lines, cursor_shape, cursor_blink, word_separators);
+    }
+
     /// Returns `true` when the active terminal application has enabled bracketed paste mode.
     pub fn is_bracketed_paste(&self) -> bool {
         self.buffer.is_bracketed_paste()
@@ -496,6 +574,11 @@ impl PtySession {
     /// Extends the active terminal selection to viewport `(col, row)`.
     pub fn update_selection(&self, col: usize, row: usize, side: Side) {
         self.buffer.update_selection(col, row, side);
+    }
+
+    /// Extends an active selection to viewport `(col, row)`, or starts a new `Simple` selection.
+    pub fn extend_or_start_selection(&self, col: usize, row: usize, side: Side) {
+        self.buffer.extend_or_start_selection(col, row, side);
     }
 
     /// Finalizes the active selection, clearing degenerate click-only selections and returning text.

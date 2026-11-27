@@ -726,8 +726,8 @@ impl ProtocolLauncherState {
                     let total = self.containers.len();
                     for (idx, c) in self.containers.iter().enumerate() {
                         let runtime_badge = match c.runtime {
-                            DockerRuntime::Docker => "docker",
-                            DockerRuntime::Podman => "podman",
+                            DockerRuntime::Docker => "Docker",
+                            DockerRuntime::Podman => "Podman",
                         };
                         let rt = c.runtime;
                         let cname = c.name.clone();

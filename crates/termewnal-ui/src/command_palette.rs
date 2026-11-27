@@ -47,15 +47,15 @@ pub enum PaletteCategory {
 }
 
 impl PaletteCategory {
-    /// Returns a concise uppercase badge label for this category.
+    /// Returns a concise title-cased badge label for this category.
     pub fn badge(self) -> &'static str {
         match self {
-            Self::QuickConnect => "CONNECT",
-            Self::Command => "CMD",
-            Self::Session => "SESSION",
-            Self::Profile => "PROFILE",
-            Self::SystemSsh => "SSH CFG",
-            Self::Tunnel => "TUNNEL",
+            Self::QuickConnect => "Connect",
+            Self::Command => "Command",
+            Self::Session => "Session",
+            Self::Profile => "Profile",
+            Self::SystemSsh => "SSH Config",
+            Self::Tunnel => "Tunnel",
         }
     }
 }
@@ -430,7 +430,7 @@ impl CommandPaletteState {
                 id: format!("qcmd:{}", qc.id),
                 category: PaletteCategory::Command,
                 title: format!("Run Quick Command: {}", qc.name),
-                subtitle: format!("{group_desc} · {}", qc.command),
+                subtitle: format!("{group_desc} - {}", qc.command),
                 keywords: vec![
                     "quick".to_string(),
                     "command".to_string(),
@@ -499,7 +499,7 @@ impl CommandPaletteState {
                 id: format!("profile:{}", profile.id),
                 category: PaletteCategory::Profile,
                 title: format!("Launch Profile: {}", profile.name),
-                subtitle: format!("{kind} · {} · {group_label}", profile_target_summary(profile)),
+                subtitle: format!("{kind} - {} ({group_label})", profile_target_summary(profile)),
                 keywords,
                 shortcut: None,
                 action: PaletteAction::LaunchProfile {
@@ -809,6 +809,21 @@ fn workspace_command_items() -> Vec<PaletteItem> {
             action: PaletteAction::ToggleBroadcastInput,
         },
         PaletteItem {
+            id: "cmd:toggle-sidebar".to_string(),
+            category: PaletteCategory::Command,
+            title: "Toggle Profiles Sidebar".to_string(),
+            subtitle: "Show or collapse the navigation sidebar in the active window".to_string(),
+            keywords: vec![
+                "sidebar".to_string(),
+                "profiles".to_string(),
+                "navigation".to_string(),
+                "toggle".to_string(),
+                "drawer".to_string(),
+            ],
+            shortcut: Some("Ctrl+Shift+S".to_string()),
+            action: PaletteAction::ToggleSidebar,
+        },
+        PaletteItem {
             id: "cmd:toggle-sftp-drawer".to_string(),
             category: PaletteCategory::Command,
             title: "Toggle SFTP+ Panel".to_string(),
@@ -1053,7 +1068,7 @@ fn render_search_mode<'a>(
                 row_items = row_items.push(keycap_pill(shortcut_text, chrome));
             }
             if is_selected && card_w >= 460.0 {
-                row_items = row_items.push(keycap_pill("ENTER", chrome));
+                row_items = row_items.push(keycap_pill("Enter", chrome));
             }
 
             let main_btn = button(row_items)

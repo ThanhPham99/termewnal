@@ -11,12 +11,13 @@ use iced::{
 };
 
 use crate::app::{Message, shortcut_for_key_event_with_palette};
-use crate::ui_theme::{DividerDragState, DividerPress, draw_interactive_divider};
+use crate::ui_theme::{ChromePalette, DividerDragState, DividerPress, draw_interactive_divider};
 use crate::workspace::{
-    DEFAULT_SPLIT_RATIO, MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, PaneId, SplitAxis, SplitId, TabId,
+    DEFAULT_SPLIT_RATIO, MAX_SPLIT_RATIO, MIN_SPLIT_RATIO, PaneId,
+    SPLIT_DIVIDER_THICKNESS as DIVIDER_THICKNESS, SplitAxis, SplitId, TabId,
+    split_first_size as workspace_split_first_size,
 };
 
-const DIVIDER_THICKNESS: f32 = 1.0;
 const DIVIDER_HIT_PADDING: f32 = 5.0;
 const PANE_BORDER_WIDTH: f32 = 1.0;
 
@@ -25,6 +26,7 @@ pub struct SplitView<'a> {
     split_id: SplitId,
     axis: SplitAxis,
     ratio: f32,
+    chrome: ChromePalette,
     children: [Element<'a, Message, Theme, iced::Renderer>; 2],
 }
 
@@ -34,6 +36,7 @@ impl<'a> SplitView<'a> {
         split_id: SplitId,
         axis: SplitAxis,
         ratio: f32,
+        chrome: ChromePalette,
         first: Element<'a, Message, Theme, iced::Renderer>,
         second: Element<'a, Message, Theme, iced::Renderer>,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
@@ -41,6 +44,7 @@ impl<'a> SplitView<'a> {
             split_id,
             axis,
             ratio: ratio.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO),
+            chrome,
             children: [first, second],
         })
     }
@@ -72,18 +76,7 @@ impl<'a> SplitView<'a> {
 }
 
 fn split_first_size(total: Size, axis: SplitAxis, ratio: f32) -> (f32, f32) {
-    match axis {
-        SplitAxis::Vertical => {
-            let available = (total.width - DIVIDER_THICKNESS).max(2.0);
-            let first_w = (available * ratio).round().clamp(1.0, available - 1.0);
-            (first_w, total.height.max(1.0))
-        }
-        SplitAxis::Horizontal => {
-            let available = (total.height - DIVIDER_THICKNESS).max(2.0);
-            let first_h = (available * ratio).round().clamp(1.0, available - 1.0);
-            (total.width.max(1.0), first_h)
-        }
-    }
+    workspace_split_first_size(total.width, total.height, axis, ratio, DIVIDER_THICKNESS)
 }
 
 impl Widget<Message, Theme, iced::Renderer> for SplitView<'_> {
@@ -316,7 +309,7 @@ impl Widget<Message, Theme, iced::Renderer> for SplitView<'_> {
         let state = tree.state.downcast_ref::<DividerDragState>();
         let (visual_rect, _) = self.divider_rects(layout.bounds());
         if visual_rect.intersects(viewport) {
-            draw_interactive_divider(renderer, theme, visual_rect, state, 0.42);
+            draw_interactive_divider(renderer, self.chrome, visual_rect, state, 0.42);
         }
     }
 
@@ -345,6 +338,7 @@ pub struct PaneFrame<'a> {
     focused: bool,
     broadcast: bool,
     show_border: bool,
+    chrome: ChromePalette,
     content: Element<'a, Message, Theme, iced::Renderer>,
 }
 
@@ -355,6 +349,7 @@ impl<'a> PaneFrame<'a> {
         focused: bool,
         broadcast: bool,
         show_border: bool,
+        chrome: ChromePalette,
         content: Element<'a, Message, Theme, iced::Renderer>,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
         Element::new(Self {
@@ -362,6 +357,7 @@ impl<'a> PaneFrame<'a> {
             focused,
             broadcast,
             show_border,
+            chrome,
             content,
         })
     }
@@ -504,13 +500,12 @@ impl Widget<Message, Theme, iced::Renderer> for PaneFrame<'_> {
         let bounds = layout.bounds();
         let pad = self.border_pad();
         if pad > 0.0 && bounds.intersects(viewport) {
-            let ext = theme.extended_palette();
             let border_color = if self.broadcast {
-                Color::from_rgb8(220, 38, 38)
+                self.chrome.danger
             } else if self.focused {
-                ext.primary.strong.color
+                self.chrome.accent
             } else {
-                ext.background.strong.color
+                self.chrome.hairline
             };
             renderer.fill_quad(
                 Quad {
@@ -560,12 +555,24 @@ impl Widget<Message, Theme, iced::Renderer> for PaneFrame<'_> {
     }
 }
 
+/// Modal-scoped shortcuts intercepted while the SFTP+ Remote File Editor is open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoteEditorShortcut {
+    Find,
+    Replace,
+    GoToLine,
+    Save,
+    FindNext,
+    FindPrev,
+}
+
 /// Top-level wrapper intercepting workspace keyboard shortcuts before terminal panes consume them.
 pub struct ShortcutInterceptor<'a> {
     active_tab: Option<TabId>,
     active_session: Option<crate::app::SessionId>,
     palette_open: bool,
     capturing_shortcut: bool,
+    remote_editor_open: bool,
     resolver: std::sync::Arc<termewnal_core::KeybindingResolver>,
     pending_chords: Vec<termewnal_core::KeyChord>,
     content: Element<'a, Message, Theme, iced::Renderer>,
@@ -608,11 +615,36 @@ impl<'a> ShortcutInterceptor<'a> {
         resolver: std::sync::Arc<termewnal_core::KeybindingResolver>,
         pending_chords: Vec<termewnal_core::KeyChord>,
     ) -> Element<'a, Message, Theme, iced::Renderer> {
+        Self::with_keybindings_and_modal(
+            content,
+            active_tab,
+            active_session,
+            palette_open,
+            capturing_shortcut,
+            false,
+            resolver,
+            pending_chords,
+        )
+    }
+
+    /// Wraps `content` with dynamic [`KeybindingResolver`], multi-chord prefix, capture, and Remote File Editor isolation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_keybindings_and_modal(
+        content: Element<'a, Message, Theme, iced::Renderer>,
+        active_tab: Option<TabId>,
+        active_session: Option<crate::app::SessionId>,
+        palette_open: bool,
+        capturing_shortcut: bool,
+        remote_editor_open: bool,
+        resolver: std::sync::Arc<termewnal_core::KeybindingResolver>,
+        pending_chords: Vec<termewnal_core::KeyChord>,
+    ) -> Element<'a, Message, Theme, iced::Renderer> {
         Element::new(Self {
             active_tab,
             active_session,
             palette_open,
             capturing_shortcut,
+            remote_editor_open,
             resolver,
             pending_chords,
             content,
@@ -670,6 +702,7 @@ impl Widget<Message, Theme, iced::Renderer> for ShortcutInterceptor<'_> {
         if let Event::Keyboard(keyboard::Event::KeyPressed {
             key,
             modified_key,
+            physical_key,
             modifiers,
             ..
         }) = event
@@ -693,7 +726,15 @@ impl Widget<Message, Theme, iced::Renderer> for ShortcutInterceptor<'_> {
                 }
             }
 
-            if !self.palette_open
+            if self.remote_editor_open {
+                if let Some(shortcut) =
+                    remote_editor_shortcut_for_key(key, *physical_key, *modifiers)
+                {
+                    shell.publish(Message::SftpModalShortcut(shortcut));
+                    shell.capture_event();
+                    return;
+                }
+            } else if !self.palette_open
                 && let Some(chord) = crate::keybinding_bridge::iced_key_to_chord(
                     key,
                     Some(modified_key),
@@ -944,5 +985,88 @@ impl Widget<Message, Theme, iced::Renderer> for CapturedEventGate<'_> {
             viewport,
             translation,
         )
+    }
+}
+
+
+fn remote_editor_shortcut_for_key(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+    modifiers: keyboard::Modifiers,
+) -> Option<RemoteEditorShortcut> {
+    if modifiers.command()
+        && !modifiers.alt()
+        && !modifiers.shift()
+        && let Some(ch) = key.to_latin(physical_key)
+    {
+        return match ch {
+            'f' => Some(RemoteEditorShortcut::Find),
+            'h' => Some(RemoteEditorShortcut::Replace),
+            'g' => Some(RemoteEditorShortcut::GoToLine),
+            's' => Some(RemoteEditorShortcut::Save),
+            _ => None,
+        };
+    }
+    if matches!(key, keyboard::Key::Named(keyboard::key::Named::F3))
+        && !modifiers.control()
+        && !modifiers.alt()
+        && !modifiers.logo()
+    {
+        return Some(if modifiers.shift() {
+            RemoteEditorShortcut::FindPrev
+        } else {
+            RemoteEditorShortcut::FindNext
+        });
+    }
+    None
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_editor_shortcut_mapping_handles_ctrl_and_f3() {
+        let ctrl = keyboard::Modifiers::CTRL;
+        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let phys_f = keyboard::key::Physical::Code(keyboard::key::Code::KeyF);
+        let phys_h = keyboard::key::Physical::Code(keyboard::key::Code::KeyH);
+        let phys_g = keyboard::key::Physical::Code(keyboard::key::Code::KeyG);
+        let phys_s = keyboard::key::Physical::Code(keyboard::key::Code::KeyS);
+        let f3 = keyboard::Key::Named(keyboard::key::Named::F3);
+
+        assert_eq!(
+            remote_editor_shortcut_for_key(&keyboard::Key::Character("f".into()), phys_f, ctrl),
+            Some(RemoteEditorShortcut::Find)
+        );
+        assert_eq!(
+            remote_editor_shortcut_for_key(&keyboard::Key::Character("h".into()), phys_h, ctrl),
+            Some(RemoteEditorShortcut::Replace)
+        );
+        assert_eq!(
+            remote_editor_shortcut_for_key(&keyboard::Key::Character("g".into()), phys_g, ctrl),
+            Some(RemoteEditorShortcut::GoToLine)
+        );
+        assert_eq!(
+            remote_editor_shortcut_for_key(&keyboard::Key::Character("s".into()), phys_s, ctrl),
+            Some(RemoteEditorShortcut::Save)
+        );
+        assert_eq!(
+            remote_editor_shortcut_for_key(
+                &keyboard::Key::Character("f".into()),
+                phys_f,
+                ctrl_shift
+            ),
+            None
+        );
+        assert_eq!(
+            remote_editor_shortcut_for_key(&f3, phys_f, keyboard::Modifiers::empty()),
+            Some(RemoteEditorShortcut::FindNext)
+        );
+        assert_eq!(
+            remote_editor_shortcut_for_key(&f3, phys_f, keyboard::Modifiers::SHIFT),
+            Some(RemoteEditorShortcut::FindPrev)
+        );
     }
 }
