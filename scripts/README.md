@@ -14,7 +14,7 @@ Packaging and developer-tooling scripts for Termewnal. This directory contains t
   - `[build-linux.sh:functions]` None defined.
 - **Windows NSIS Installer ([`./termewnal.nsi`](./termewnal.nsi))**:
   - `[termewnal.nsi:Unicode True]` Enables Unicode NSIS installer compilation and includes `[termewnal.nsi:MUI2.nsh]`.
-  - `[termewnal.nsi:VERSION]` Overridable preprocessor define (`!ifndef VERSION`, statically defaulted to `"1.0.2"` rather than parsed from `Cargo.toml`).
+  - `[termewnal.nsi:VERSION]` Overridable preprocessor define (`!ifndef VERSION`, statically defaulted to `"1.0.3"` rather than parsed from `Cargo.toml`).
   - `[termewnal.nsi:BIN_PATH]` Overridable preprocessor define (`!ifndef BIN_PATH`, defaults to `"..\target\release\termewnal.exe"`).
   - `[termewnal.nsi:OUT_FILE]` Overridable preprocessor define (`!ifndef OUT_FILE`, defaults to `"..\dist\termewnal-${VERSION}-windows-x86_64-setup.exe"`).
   - `[termewnal.nsi:APP_NAME]`, `[termewnal.nsi:APP_PUBLISHER]`, `[termewnal.nsi:APP_URL]`, `[termewnal.nsi:UNINSTALL_KEY]` Preprocessor constants (`"Termewnal"`, `"ThanhPham99"`, `"https://thanhpham99.github.io/apps/termewnal/"`, `"Software\Microsoft\Windows\CurrentVersion\Uninstall\${APP_NAME}"`).

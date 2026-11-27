@@ -5303,7 +5303,7 @@ dependencies = [
 
 [[package]]
 name = "termewnal-core"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "aes-gcm",
  "argon2",
@@ -5329,7 +5329,7 @@ dependencies = [
 
 [[package]]
 name = "termewnal-protocols"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "serial2",
  "tempfile",
@@ -5342,7 +5342,7 @@ dependencies = [
 
 [[package]]
 name = "termewnal-pty"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "alacritty_terminal",
  "portable-pty",
@@ -5357,7 +5357,7 @@ dependencies = [
 
 [[package]]
 name = "termewnal-ssh"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "chrono",
  "data-encoding",
@@ -5380,7 +5380,7 @@ dependencies = [
 
 [[package]]
 name = "termewnal-ui"
-version = "1.0.2"
+version = "1.0.3"
 dependencies = [
  "arboard",
  "chrono",
